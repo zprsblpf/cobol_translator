@@ -1,0 +1,46 @@
+# COBOL COPY 记录名 → Java 类名映射
+# 格式: COPY_NAME: JavaClassName
+
+records:
+  # 日期转换
+  DATCON1REC: "Datcon1Params"
+  DATCON2REC: "Datcon2Params"
+  DATCON3REC: "Datcon3Params"
+  DATCON6REC: "Datcon6Params"
+
+  # 保险覆盖率
+  COVRSKM:    "CovrRecord"
+  COVRMJASKM: "CovrmjaRecord"
+
+  # 保单头
+  CHDRENQSKM: "ChdrenqRecord"
+  CHDRPSNSKM: "ChdrpsnRecord"
+
+  # 项目管理
+  ITEMSKM:    "ItemRecord"
+  ITEMKEY:    "ItemKey"
+
+  # 模板管理
+  TMLCLSTSKM: "TmlclstRecord"
+  TMLCPKYSKM: "TmlcpkyRecord"
+
+  # 欧洲模块
+  EUFKPKYSKM: "EufkpkyRecord"
+  EUABCHRSKM: "EuabchrRecord"
+  EUAAPKYSKM: "EuaapkyRecord"
+
+  # 台湾特定表（TW系列）
+  TW001REC: "Tw001Record"
+  TW003REC: "Tw003Record"
+  TW033REC: "Tw033Record"
+  TW038REC: "Tw038Record"
+
+  # 通用表
+  T3721REC: "T3721Record"
+  TC002REC: "Tc002Record"
+  T5675REC: "T5675Record"
+  T3609REC: "T3609Record"
+
+  # 入参出参（LINKAGE SECTION）
+  LETCMNTSKM: "LetcmntParams"
+  PMSPNTSKM:  "PmspntParams"

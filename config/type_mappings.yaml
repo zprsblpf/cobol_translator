@@ -1,0 +1,59 @@
+# COBOL PIC type to Java type mapping rules
+# Match order: first match wins
+
+pic_rules:
+  - pattern: "S9\\(\\d+\\)V9\\(\\d+\\)"
+    java_type: "BigDecimal"
+    note: "Signed decimal amount"
+
+  - pattern: "9\\(\\d+\\)V9\\(\\d+\\)"
+    java_type: "BigDecimal"
+
+  - pattern: "S9\\(\\d+\\).*COMP-3"
+    java_type: "long"
+    note: "COMP-3 signed integer"
+
+  - pattern: "9\\(\\d+\\).*COMP-3"
+    java_type: "long"
+
+  - pattern: "S9\\([1-9]\\d*\\)"
+    max_digits: 9
+    java_type: "int"
+
+  - pattern: "S9\\(\\d+\\)"
+    java_type: "long"
+
+  - pattern: "9\\([1-9]\\d*\\)"
+    max_digits: 9
+    java_type: "int"
+
+  - pattern: "9\\(\\d+\\)"
+    java_type: "long"
+
+  - pattern: "X\\(\\d+\\)"
+    java_type: "String"
+
+  - pattern: "^X$"
+    java_type: "String"
+
+  - pattern: "^9$"
+    java_type: "int"
+
+  - pattern: ".*"
+    java_type: "String"
+
+# COBOL constant to Java equivalent
+cobol_constants:
+  SPACES: '""'
+  ZEROS: "0"
+  ZERO: "0"
+  LOW-VALUES: '""'
+  HIGH-VALUES: '"\\uFFFF"'
+  O-K: '"O-K"'
+
+# Status codes
+status_constants:
+  O-K: "OK"
+  MRNF: "RECORD_NOT_FOUND"
+  MDUP: "DUPLICATE"
+  ENDP: "END_OF_FILE"

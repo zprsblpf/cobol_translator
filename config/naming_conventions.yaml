@@ -1,0 +1,22 @@
+# 命名范式（翻译规则的"约定"，Python 只读取、不写死）
+#
+# COBOL 拷贝簿 COPY <名><后缀> 定义一个结构体/记录，其字段统一以 <名>- 为前缀
+# （如 COPY ZSOSCLTSKM → 结构体 ZSOSCLT，字段 ZSOSCLT-XXX）。
+# 翻译时按 <名> 识别为结构体前缀：字段读 → 对象.getXxx()，字段写 → 对象.setXxx(v)，
+# 整体 → new 对象类()。绝不把未加引号的数据名当字符串字面量。
+#
+# 真实项目中拷贝簿源可用时，其字段会进入 field_type_map 并优先命中，
+# 此处范式仅作为"拷贝簿未展开"时的兜底，两种情况输出一致。
+
+copybook_suffixes:        # 这些后缀表示"对象/记录定义"，剥离后即结构体名
+  - SKM                   # subschema map（数据库记录布局）
+  - REC                   # 记录区 / 子程序参数区
+  - KEY                   # 键结构
+
+struct_access:
+  getter_prefix: get      # 字段读取访问器前缀
+  setter_prefix: set      # 字段写入访问器前缀
+  default_class_suffix: Params   # copy_mappings 未显式配置类名时，结构体 Java 类后缀
+
+# 命名常量（无上述后缀的拷贝簿，如 VARCOM 定义的状态/功能码）保持为字符串字面量，
+# 不在此列出——凡不匹配 copybook_suffixes 的前缀即按常量处理。
