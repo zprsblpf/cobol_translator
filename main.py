@@ -263,7 +263,14 @@ def main():
     parser.add_argument("--skeleton-only", action="store_true",
                         help="仅生成控制流/调用骨架（叶子保留原 COBOL 占位，不调 LLM）")
     parser.add_argument("--output", default="./output", help="输出目录")
+    parser.add_argument("--verbose", "-v", action="store_true",
+                        help="处理流程日志输出到 DEBUG 级别")
     args = parser.parse_args()
+
+    # 初始化日志：处理流程(flow) 与 LLM 沟通(llm) 两个独立通道
+    import logging
+    from log_utils import setup_logging
+    setup_logging(level=logging.DEBUG if args.verbose else logging.INFO)
 
     cob_file = args.cob_file
     if not Path(cob_file).exists():

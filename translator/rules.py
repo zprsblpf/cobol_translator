@@ -644,13 +644,14 @@ def _rewrite_begn_loops(paras: list[tuple], ctx: Ctx) -> list[tuple]:
     for i, (_lbl, _stmts) in enumerate(norm):
         if result[i][1] and result[i][1][0].kind == "raw":
             continue   # 已被 Pass 1 处理为循环
-        info = _match_begn_single(_stmts, ctx)
+        current = result[i][1]                              # Pass 1 可能已剥离本段其他 pfx 的 setup
+        info = _match_begn_single(current, ctx)             # 在已修改的列表上检测，索引与切分自洽
         if not info:
             continue
         raw = Stmt(kind="raw", tokens=[])
         raw.lines = _render_begn_single(info, ctx)
-        before = _stmts[:info["setup_start"]]
-        after = _stmts[info["call_idx"] + 2:]   # 跳过 CALL + IF
+        before = current[:info["setup_start"]]
+        after  = current[info["call_idx"] + 2:]   # 跳过 CALL + IF
         result[i] = (paras[i][0], before + [raw] + after)
         changed = True
 

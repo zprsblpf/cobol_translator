@@ -10,6 +10,15 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+try:  # 大模型配置：url/key/模型名/温度等参数化（兼容不同运行方式）
+    from cobol_translator.config.llm_config import (
+        get_llm, get_llm_config, resolve_model, auth_headers,
+    )
+except ImportError:
+    from config.llm_config import (
+        get_llm, get_llm_config, resolve_model, auth_headers,
+    )
+
 from graph.state import TranslationState
 from parser.cobol_parser import parse as parse_cobol, CobolSection
 from parser.variable_resolver import (
@@ -20,6 +29,11 @@ from analyzer.callgraph import build_call_graph
 from analyzer.dataflow import analyze_dataflow, writers_context
 from translator.segmenter import segment, split_paragraphs
 from translator import rules as _rules
+from log_utils import (
+    get_flow_logger, log_llm_request, log_llm_response, log_llm_error,
+)
+
+log = get_flow_logger()
 
 CONFIG_DIR = Path(__file__).parent.parent / "config"
 KNOWLEDGE_DIR = Path(__file__).parent.parent / "knowledge"
@@ -95,58 +109,52 @@ _llm = None
 def _get_llm():
     global _llm
     if _llm is None:
-        from langchain_openai import ChatOpenAI
-        import subprocess, json as _json
-        try:
-            resp = subprocess.run(
-                ["curl", "-s", "http://localhost:8000/v1/models"],
-                capture_output=True, text=True, timeout=5
-            )
-            models = _json.loads(resp.stdout).get("data", [])
-            model_id = models[0]["id"] if models else "qwen3-8b-GPTQ"
-        except Exception:
-            model_id = "qwen3-8b-GPTQ"
-        print(f"[LLM] 使用本地模型: {model_id}")
-        _llm = ChatOpenAI(
-            model=model_id,
-            base_url="http://localhost:8000/v1",
-            api_key="dummy",
-            temperature=0,
-            max_tokens=4096,
-        )
+        _llm = get_llm()
+        log.info("LLM 使用模型: %s（%s）", resolve_model(), get_llm_config()["base_url"])
     return _llm
 
 
 # ── LLM 调用（DeepSeek-R1-Qwen3，vLLM 自动剥离 <think> 块）───────────────────
 
-def _call_llm_no_think(system_prompt: str, user_prompt: str) -> str:
+def _call_llm_no_think(system_prompt: str, user_prompt: str, scene: str = "") -> str:
     """
     调用本地 DeepSeek-R1-Qwen3 模型。
     vLLM 的 chat completions API 会自动剥离 <think>...</think>，
     message.content 只包含最终输出。关键：max_tokens 要足够大，
     让模型在思考完毕后仍有空间输出 Java 代码。
+
+    入参（system/user prompt）与出参（response）走独立的 LLM 日志通道，
+    便于与处理流程日志分开审查。`scene` 标注本次调用归属（如 SECTION 名）。
     """
     import requests as _req
 
+    cfg = get_llm_config()
+    model = _get_current_model()
+    started = log_llm_request(scene, system_prompt, user_prompt, model)
+
     payload = {
-        "model": _get_current_model(),
+        "model": model,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user",   "content": user_prompt},
         ],
-        "temperature": 0,
-        "max_tokens": 4096,
-        "max_thinking_tokens": 2048,
+        "temperature": cfg["temperature"],
+        "max_tokens": cfg["max_tokens"],
+        "max_thinking_tokens": cfg["max_thinking_tokens"],
     }
 
-    resp = _req.post(
-        "http://localhost:8000/v1/chat/completions",
-        json=payload,
-        headers={"Authorization": "Bearer dummy"},
-        timeout=120,
-    )
-    resp.raise_for_status()
-    content = resp.json()["choices"][0]["message"]["content"]
+    try:
+        resp = _req.post(
+            f"{cfg['base_url']}/chat/completions",
+            json=payload,
+            headers=auth_headers(cfg),
+            timeout=cfg["timeout"],
+        )
+        resp.raise_for_status()
+        content = resp.json()["choices"][0]["message"]["content"]
+    except Exception as e:
+        log_llm_error(scene, e, started)
+        raise
 
     # 防御：若 vLLM 未剥离（旧版本），手动清除 thinking 块
     content = re.sub(r"<think>[\s\S]*?</think>", "", content)
@@ -154,18 +162,15 @@ def _call_llm_no_think(system_prompt: str, user_prompt: str) -> str:
     # 清理 markdown 代码块标记
     content = re.sub(r"```java\s*", "", content)
     content = re.sub(r"\s*```", "", content)
-    return content.strip()
+    content = content.strip()
+
+    log_llm_response(scene, content, started)
+    return content
 
 
 def _get_current_model() -> str:
-    """从 vLLM 获取当前加载的模型名。"""
-    import requests as _req
-    try:
-        resp = _req.get("http://localhost:8000/v1/models", timeout=5)
-        models = resp.json().get("data", [])
-        return models[0]["id"] if models else "qwen3-8b-GPTQ"
-    except Exception:
-        return "qwen3-8b-GPTQ"
+    """当前模型名：LLM_MODEL 配置优先，留空则从 {LLM_BASE_URL}/models 探测。"""
+    return resolve_model()
 
 
 # ── RAG 向量库（复用 Spring Boot 生成器的基础设施）───────────────────────────
@@ -223,11 +228,11 @@ def _rag_retrieve(query: str, k: int = 4) -> str:
 # ── 节点 1：解析 COBOL 文件 ───────────────────────────────────────────────────
 
 def parse_cobol_node(state: TranslationState) -> dict:
-    print(f"\n[节点1] 解析 COBOL 文件: {state['cobol_file']}")
+    log.info("━━ ① 解析节点 ━━ 文件: %s", state["cobol_file"])
     try:
         prog = parse_cobol(state["cobol_file"])
         s = prog.summary()
-        print(f"[节点1] {s}")
+        log.info("① PROGRAM-ID=%s 解析摘要: %s", prog.program_id, s)
 
         # 变量解析
         all_vars = prog.working_storage + prog.linkage_vars
@@ -265,7 +270,8 @@ def parse_cobol_node(state: TranslationState) -> dict:
                     f"⚠️ REDEFINES: {var.name} REDEFINES {var.redefines}"
                 )
 
-        print(f"[节点1] {len(sections_meta)} 个 SECTION，{len(fields)} 个字段，{len(review_items)} 个高风险点")
+        log.info("① 解析完成: %d 个 SECTION，%d 个字段，%d 个 COPY 引用，%d 个高风险点",
+                 len(sections_meta), len(fields), len(prog.copy_refs), len(review_items))
         return {
             "program_id": prog.program_id,
             "sections_meta": sections_meta,
@@ -281,13 +287,14 @@ def parse_cobol_node(state: TranslationState) -> dict:
             "errors": [],
         }
     except Exception as e:
+        log.error("① 解析失败: %s", e)
         return {"errors": [f"解析失败: {e}"], "status": "error"}
 
 
 # ── 节点 2：构建 IO/COPY 上下文 + 生成 Java 骨架 ─────────────────────────────
 
 def build_context_and_skeleton_node(state: TranslationState) -> dict:
-    print(f"\n[节点2] 构建上下文 + 生成 Java 骨架...")
+    log.info("━━ ② 上下文+骨架节点 ━━ 构建 IO/COPY 上下文并生成 Java 骨架...")
 
     with open(CONFIG_DIR / "io_mappings.yaml", encoding="utf-8") as f:
         io_cfg = yaml.safe_load(f)
@@ -337,9 +344,14 @@ def build_context_and_skeleton_node(state: TranslationState) -> dict:
     base = _class_base(prog_id)
     sections_meta = state["sections_meta"]
 
+    log.info("② IO 调用: 收集到 %d 个唯一 CALL，映射 %d 个 Repository",
+             len(all_calls), len(repositories))
+
     # ── 跨段分析（确定性）──────────────────────────────────────────────
     cg = build_call_graph(sections_meta)
     df = analyze_dataflow(sections_meta, state.get("field_type_map", {}))
+    log.info("② 跨段分析: 入口段=%s，调用链最大深度=%d，调用环 %d 个",
+             cg.get("entry_section", "?"), cg.get("max_depth", 0), len(cg.get("cycles", [])))
 
     # ── 大框架：分模块 ────────────────────────────────────────────────
     module_assignment, modules = _assign_sections_to_modules(sections_meta, base)
@@ -368,12 +380,14 @@ def build_context_and_skeleton_node(state: TranslationState) -> dict:
         cg.get("entry_section", ""),
     )
 
+    struct_reg = build_struct_registry(state)
+
     review_items = list(df.get("review_items", []))
     for c in cg.get("cycles", []):
         review_items.append(f"⚠️ 调用环: {c}（需人工确认控制流）")
 
-    print(f"[节点2] 骨架生成完成：{len(modules)} 个模块类 + State + 门面；"
-          f"调用链最大深度 {cg.get('max_depth', 0)}")
+    log.info("② 骨架生成完成: %d 个模块类 + State + 门面；结构体注册表 %d 个前缀",
+             len(modules), len(struct_reg.get("prefixes", [])))
     return {
         "io_context": io_context,
         "module_assignment": module_assignment,
@@ -386,7 +400,7 @@ def build_context_and_skeleton_node(state: TranslationState) -> dict:
         "var_lifecycle": df.get("var_lifecycle", {}),
         "review_items": review_items,
         # 结构体命名注册表：程序级算一次，各 SECTION 复用
-        "struct_registry": build_struct_registry(state),
+        "struct_registry": struct_reg,
         # IO 子程序映射：程序级算一次，供各 SECTION 的 _t_call 固化复用
         "io_mappings": {
             "io_programs": all_io,
@@ -495,7 +509,7 @@ _VALUE_IMPORTS = [
 
 def _build_state_class(base: str, prog_id: str, cobol_file: str, grouped_decls: str) -> str:
     imports = _VALUE_IMPORTS + ["import org.springframework.stereotype.Component;"]
-    return f"""package {PACKAGE};
+    return f"""package {PACKAGE}.service;
 
 {chr(10).join(imports)}
 
@@ -552,7 +566,7 @@ def _build_module_skeleton(mod: dict, base: str, prog_id: str, meta_by_name: dic
             f"    }}"
         )
 
-    return f"""package {PACKAGE};
+    return f"""package {PACKAGE}.service;
 
 {chr(10).join(sorted(set(imports)))}
 
@@ -608,7 +622,7 @@ def _build_facade_skeleton(base, prog_id, cobol_file, modules, linkage_using,
     )
     entry_call = f'        perform("{entry_section}");' if entry_section else "        // TODO: 无入口段"
 
-    return f"""package {PACKAGE};
+    return f"""package {PACKAGE}.service;
 
 {chr(10).join(imports)}
 
@@ -648,14 +662,23 @@ public class {class_name} {{
 
 
 def _section_to_method(section_name: str) -> str:
-    """1000-INIT → init1000 / 0000-STARTUP → startup0000"""
+    """1000-INIT → init1000 / 8040A-ACMV-INF → acmvInf8040a / 0000-STARTUP → startup0000"""
     parts = section_name.lower().replace("-", "_").split("_")
-    # 找第一个数字段和文字段
-    num_parts = [p for p in parts if p.isdigit()]
-    word_parts = [p for p in parts if not p.isdigit() and p not in ("exit", "section")]
+    # 数字标号段：纯数字或"数字+字母后缀"（如 8040a、2090b），统一作为方法名后缀，
+    # 避免出现以数字开头的非法 Java 标识符（如 8040A-... 旧实现会得到 8040aAcmvInf）。
+    def _is_label(p: str) -> bool:
+        return bool(re.match(r"^\d+[a-z]*$", p))
+
+    num_parts = [p for p in parts if _is_label(p)]
+    word_parts = [p for p in parts if not _is_label(p) and p not in ("exit", "section")]
     if word_parts and num_parts:
-        return word_parts[0] + "".join(w.capitalize() for w in word_parts[1:]) + num_parts[0]
-    return "".join(parts[0:1]) + "".join(p.capitalize() for p in parts[1:])
+        name = word_parts[0] + "".join(w.capitalize() for w in word_parts[1:]) + num_parts[0]
+    else:
+        name = "".join(parts[0:1]) + "".join(p.capitalize() for p in parts[1:])
+    # 兜底：Java 标识符不能以数字开头
+    if name and name[0].isdigit():
+        name = "sec" + name
+    return name
 
 
 # ── IO 调用模板生成器（确定性，不依赖 LLM）─────────────────────────────────────
@@ -820,7 +843,8 @@ def translate_section_node(state: TranslationState) -> dict:
     sec_lines = sec.get("lines", [])
     method_name = _section_to_method(sec_name)
 
-    print(f"  [翻译] {sec_name} ({len(sec_lines)} 行)...")
+    log.info("━━ ③ 翻译节点 ━━ SECTION [%s] (%d 行) → %s()",
+             sec_name, len(sec_lines), method_name)
 
     field_type_map = state.get("field_type_map", {})
     module_assignment = state.get("module_assignment", {})
@@ -863,8 +887,11 @@ def translate_section_node(state: TranslationState) -> dict:
                  for lbl, body_lines in split_paragraphs(sec_lines)]
         skel_lines = _rules.build_section(paras, ctx)
         body = "\n".join(skel_lines)
+        log.info("③ [%s] 第1遍骨架完成: %d 个 paragraph，%d 个待填叶子",
+                 sec_name, len(paras), len(ctx.leaves))
     except Exception as e:
         # 切分/规则异常 → 整段退化为一个叶子交 LLM
+        log.warning("③ [%s] 骨架构建异常，整段退化为 LLM 叶子: %s", sec_name, e)
         body = "/*__LEAF_0__*/"
         ctx.leaves = [(0, _rules.Stmt(kind="simple", raw="\n".join(sec_lines)))]
 
@@ -884,6 +911,13 @@ def translate_section_node(state: TranslationState) -> dict:
         else:
             raw = (leaf.raw or " ".join(leaf.tokens)).strip()
             llm_pending.append((lid, raw))
+
+    if skeleton_only:
+        log.info("③ [%s] 第2遍叶子: 仅骨架模式，%d 条叶子保留原 COBOL 占位（不调 LLM）",
+                 sec_name, len(leaf_fills))
+    else:
+        log.info("③ [%s] 第2遍叶子: 规则命中 %d 条，LLM 兜底 %d 条",
+                 sec_name, len(leaf_fills), len(llm_pending))
 
     if llm_pending:
         fills = _translate_leaves_llm(sec, llm_pending, state)
@@ -961,9 +995,12 @@ def _translate_leaves_llm(sec: dict, pending: list[tuple[int, str]],
 
 输出：逐条 [编号] Java 语句"""
 
+    log.info("③ [%s] 调用 LLM 兜底翻译 %d 条叶子（详见 LLM 通道日志）",
+             sec_name, len(pending))
     try:
-        resp = _call_llm_no_think(system_prompt, user_prompt)
+        resp = _call_llm_no_think(system_prompt, user_prompt, scene=f"SECTION {sec_name}")
     except Exception as e:
+        log.error("③ [%s] LLM 兜底失败，%d 条叶子置 TODO: %s", sec_name, len(pending), e)
         return {lid: f"// TODO: 翻译失败({e}) 原COBOL: {raw}" for lid, raw in pending}
 
     fills: dict[int, str] = {}
@@ -1007,7 +1044,7 @@ def _fill_stubs(skeleton: str, sections: list[str], translated: dict,
 
 
 def assemble_node(state: TranslationState) -> dict:
-    print(f"\n[节点4] 组装多文件 Java 输出...")
+    log.info("━━ ④ 组装节点 ━━ 组装多文件 Java 输出...")
     import os
 
     translated = state.get("translated_sections", {})
@@ -1050,7 +1087,7 @@ def assemble_node(state: TranslationState) -> dict:
             f"- **{mod['class_name']}.java**（桶 {mod['prefix']}，{len(mod['sections'])} 段）: {secs_desc}"
         )
 
-    print(f"[节点4] 写出 {len(written)} 个文件；填充 {total_replaced}/{len(sections_meta)} 个方法")
+    log.info("④ 写出 %d 个文件；填充 %d/%d 个方法", len(written), total_replaced, len(sections_meta))
 
     # 调用链产物
     cg = state.get("call_graph", {})
@@ -1079,5 +1116,8 @@ def assemble_node(state: TranslationState) -> dict:
         f.write(f"- 已填充方法: {total_replaced}\n")
         f.write(f"- 调用链最大深度: {cg.get('max_depth', 0)}\n")
 
-    print(f"[节点4] 输出目录: {output_dir}；审查清单: {review_path}")
+    if size_warnings:
+        for w in size_warnings:
+            log.warning("④ %s", w)
+    log.info("④ 组装完成: 输出目录=%s；审查清单=%s", output_dir, review_path)
     return {"final_java": state.get("facade_skeleton", ""), "status": "done"}
