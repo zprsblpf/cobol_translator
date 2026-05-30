@@ -39,7 +39,7 @@ def _llm_available() -> bool:
 # ══════════════════════════════════════════════════════════════════════════════
 class TestPostprocessJavaBody(unittest.TestCase):
     def setUp(self):
-        from graph.nodes import _postprocess_java_body
+        from translator.postprocess import _postprocess_java_body
         self.fn = _postprocess_java_body
 
     def test_setter_call_not_converted(self):
@@ -150,7 +150,7 @@ class TestVariableResolver(unittest.TestCase):
 # ══════════════════════════════════════════════════════════════════════════════
 class TestSectionToMethod(unittest.TestCase):
     def setUp(self):
-        from graph.nodes import _section_to_method
+        from translator.skeleton import _section_to_method
         self.fn = _section_to_method
 
     def test_num_word(self):
@@ -291,7 +291,8 @@ class TestLocalModel(unittest.TestCase):
 
     def test_translate_section_produces_java(self):
         """完整跑一遍 translate_section_node，断言关键翻译规则被遵守。"""
-        from graph.nodes import translate_section_node, _section_to_method
+        from graph.nodes import translate_section_node
+        from translator.skeleton import _section_to_method
 
         state = {
             "current_section": {

@@ -7,7 +7,7 @@
 - 叶子层 translate_leaf(): 对单条叶子语句（MOVE/算术/SET…）尝试固化；命中返回 Java，
   未命中 matched=False，交 LLM 兜底。
 
-字段名一律输出"裸名"，由 nodes._postprocess_java_body 统一加 `st.` 前缀并做跨模块路由。
+字段名一律输出"裸名"，由 translator.postprocess._postprocess_java_body 统一加 `st.` 前缀并做跨模块路由。
 """
 from __future__ import annotations
 
