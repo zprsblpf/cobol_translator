@@ -529,12 +529,101 @@ def _render_begn_foreach(info: dict, ctx: Ctx) -> list[str]:
     return lines
 
 
+def _stmt_touches_pfx(st: Stmt, pfx: str) -> bool:
+    """检查语句 token 中是否包含 <pfx>- 前缀的标识符。"""
+    if st.kind != "simple" or not st.tokens:
+        return False
+    for t in st.tokens:
+        if t.upper().startswith(f"{pfx}-"):
+            return True
+    return False
+
+
+def _match_begn_single(stmts: list[Stmt], ctx: Ctx):
+    """识别单次 BEGN 等值定位（无 NEXTR 回跳）：INITIALIZE → MOVE keys → MOVE BEGN → CALL → IF。
+    返回 {pfx,name,keys,then_stmts,call_idx,setup_start} 或 None。"""
+    if not stmts:
+        return None
+
+    # 1. 定位 CALL 'xxxIO' USING pfx-PARAMS（前序须有 MOVE BEGN TO pfx-FUNCTION）
+    call_idx = None
+    call_info = None
+    for i, st in enumerate(stmts):
+        ci = _stmt_call_io(st, ctx)
+        if ci:
+            name, pfx = ci
+            for s in stmts[:i]:
+                if s.kind == "simple" and s.tokens:
+                    tu = [t.upper() for t in s.tokens]
+                    if tu[:1] == ["MOVE"] and "BEGN" in tu and f"{pfx}-FUNCTION" in tu:
+                        call_idx = i
+                        call_info = ci
+                        break
+            if call_idx is not None:
+                break
+    if call_idx is None:
+        return None
+
+    name, pfx = call_info
+
+    # 2. 紧随 CALL 后须有 IF（then 分支不含 GO TO 回跳）
+    if call_idx + 1 >= len(stmts):
+        return None
+    if_stmt = stmts[call_idx + 1]
+    if if_stmt.kind != "if":
+        return None
+
+    # then 分支含 GO TO 回跳 → 属于 loop pattern，不在 single-shot 处理
+    if _contains_goto(if_stmt):
+        return None
+
+    # 从 IF 条件提取等值键（复用 loop 的 breakout keys 解析）
+    keys = _begn_breakout_keys(if_stmt.tokens, pfx)
+    if not keys:
+        return None
+
+    # 3. 从 CALL 向前找 setup 起始（首个不涉及 pfx 的语句的下一位置）
+    setup_start = call_idx
+    for i in range(call_idx - 1, -1, -1):
+        if _stmt_touches_pfx(stmts[i], pfx):
+            setup_start = i
+        else:
+            break
+
+    return {
+        "pfx": pfx, "name": name, "keys": keys,
+        "then_stmts": if_stmt.children,
+        "call_idx": call_idx, "setup_start": setup_start,
+    }
+
+
+def _render_begn_single(info: dict, ctx: Ctx) -> list[str]:
+    """渲染单次 BEGN → findBy...Begn() + List.isEmpty() 检查。"""
+    pfx, name = info["pfx"], info["name"]
+    io = resolve_io_info(name, ctx.io_programs, ctx.io_default_pattern)
+    repo = io["field_name"] if io else _java(pfx) + "Repository"
+    rec_cls = _pascal(pfx) + "Record"
+    list_var = _java(pfx) + "List"
+    finder = "findBy" + "And".join(_pascal(k) for k, _ in info["keys"]) + "Begn"
+    vals = ", ".join(_operand(v, ctx) for _, v in info["keys"])
+
+    lines = [f"List<{rec_cls}> {list_var} = {repo}.{finder}({vals});"]
+    then_lines = build_skeleton(info["then_stmts"], ctx, 1)
+    if then_lines:
+        lines.append(f"if ({list_var}.isEmpty()) {{")
+        lines.extend(then_lines)
+        lines.append("}")
+    return lines
+
+
 def _rewrite_begn_loops(paras: list[tuple], ctx: Ctx) -> list[tuple]:
-    """把 BEGN+NEXTR 自跳循环段改写为 List+for-each；未匹配则原样返回。"""
+    """把 BEGN+NEXTR 自跳循环 / 单次 BEGN 等值定位 改写为 List+for-each / findBy…Begn()。"""
     norm = [(lbl or f"__ENTRY_{i}", list(stmts)) for i, (lbl, stmts) in enumerate(paras)]
     labels = [l for l, _ in norm]
     result = [(paras[i][0], norm[i][1]) for i in range(len(paras))]   # (原标签, stmts副本)
     changed = False
+
+    # ── Pass 1：BEGN + NEXTR 自跳循环 ──────────────────────────────────
     for i, (lbl, stmts) in enumerate(norm):
         info = _match_begn_loop(lbl, stmts, ctx)
         if not info:
@@ -550,6 +639,21 @@ def _rewrite_begn_loops(paras: list[tuple], ctx: Ctx) -> list[tuple]:
         for k in range(i):                             # 剥除前序段里该 pfx 的 setup
             result[k] = (result[k][0], _strip_struct_setup(result[k][1], info["pfx"]))
         changed = True
+
+    # ── Pass 2：单次 BEGN 等值定位（同段内 setup + CALL + IF，无回跳）──
+    for i, (_lbl, _stmts) in enumerate(norm):
+        if result[i][1] and result[i][1][0].kind == "raw":
+            continue   # 已被 Pass 1 处理为循环
+        info = _match_begn_single(_stmts, ctx)
+        if not info:
+            continue
+        raw = Stmt(kind="raw", tokens=[])
+        raw.lines = _render_begn_single(info, ctx)
+        before = _stmts[:info["setup_start"]]
+        after = _stmts[info["call_idx"] + 2:]   # 跳过 CALL + IF
+        result[i] = (paras[i][0], before + [raw] + after)
+        changed = True
+
     return result if changed else paras
 
 
