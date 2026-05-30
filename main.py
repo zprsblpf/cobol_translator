@@ -48,8 +48,8 @@ def cmd_translate_section(cob_file: str, section_name: str, output_dir: str):
     from graph.nodes import (
         build_context_and_skeleton_node,
         translate_section_node,
-        _section_to_method,
     )
+    from translator.skeleton import _section_to_method
 
     prog = parse(cob_file)
     sec = prog.get_section(section_name)
