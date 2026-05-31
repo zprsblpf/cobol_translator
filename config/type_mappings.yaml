@@ -1,44 +1,39 @@
 # COBOL PIC type to Java type mapping rules
-# Match order: first match wins
+# 首个命中生效（match order: first match wins）。匹配文本 = "<PIC> <COMP>"。
+# max_digits：整数位数上限（9 的总个数，由 parser/ws/pic.py _digits 统计，含 9(n) 与裸 9）。
+# 数字编辑 PIC（Z/*）与 PIC 1（INDICATOR）由 parser/ws/pic.py 提前判定，表内规则为兜底。
+# byte_len（字符宽度）按显示位数在 pic.py char_width 算，不入本表（算法量，非查表）。
 
 pic_rules:
-  - pattern: "S9\\(\\d+\\)V9\\(\\d+\\)"
+  # 小数（隐含小数点 V，含 COMP-3 带 V）→ BigDecimal。覆盖 V99 / V9(n) 各种写法。
+  - pattern: "V9"
     java_type: "BigDecimal"
-    note: "Signed decimal amount"
+    note: "Implied-decimal amount"
 
-  - pattern: "9\\(\\d+\\)V9\\(\\d+\\)"
-    java_type: "BigDecimal"
+  # 数字编辑（零抑制 Z / 浮动 *）→ 显示格式串
+  - pattern: "[Z*]"
+    java_type: "String"
+    note: "Numeric-edited (display) field"
 
-  - pattern: "S9\\(\\d+\\).*COMP-3"
+  # COMP / COMP-3 整数（无 V）→ long
+  - pattern: "COMP"
     java_type: "long"
-    note: "COMP-3 signed integer"
+    note: "Packed/binary integer"
 
-  - pattern: "9\\(\\d+\\).*COMP-3"
-    java_type: "long"
-
-  - pattern: "S9\\([1-9]\\d*\\)"
-    max_digits: 9
-    java_type: "int"
-
-  - pattern: "S9\\(\\d+\\)"
-    java_type: "long"
-
-  - pattern: "9\\([1-9]\\d*\\)"
-    max_digits: 9
-    java_type: "int"
-
-  - pattern: "9\\(\\d+\\)"
-    java_type: "long"
-
-  - pattern: "X\\(\\d+\\)"
+  # 字符
+  - pattern: "X"
+    java_type: "String"
+  - pattern: "A"
     java_type: "String"
 
-  - pattern: "^X$"
-    java_type: "String"
-
-  - pattern: "^9$"
+  # 纯数字整数：位数≤9 → int，否则 long（含 9(n) 与裸 999/99 写法）
+  - pattern: "9"
+    max_digits: 9
     java_type: "int"
+  - pattern: "9"
+    java_type: "long"
 
+  # 兜底
   - pattern: ".*"
     java_type: "String"
 
