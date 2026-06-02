@@ -8,6 +8,8 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from parser import cobol_columns
+
 
 # ── 数据结构 ──────────────────────────────────────────────────────────────────
 
@@ -71,16 +73,14 @@ class CobolProgram:
 # ── 工具函数 ──────────────────────────────────────────────────────────────────
 
 def _strip_cobol_line(raw: str) -> str:
-    """去掉 AS/400 COBOL 行号（前6列）和注释标记，返回代码部分。"""
-    if len(raw) < 7:
-        return raw.strip()
-    indicator = raw[6] if len(raw) > 6 else " "
-    if indicator in ("*", "/"):  # 注释行
+    """净化一物理行：停用('!!!!!!')/注释('* /')/调试('D')行返回 ''，其余取代码区（第7列起）。
+
+    列处理复用单一正本 parser.cobol_columns（步骤06）：clean_line 自第7列起，修正代码异常起于
+    第7列时首字母被吞的问题；同时识别 '!!!!!!' 停用行并丢弃（修停用旧段被误纳）。
+    """
+    if cobol_columns.is_deactivated(raw) or cobol_columns.is_comment(raw) or cobol_columns.is_debug(raw):
         return ""
-    if indicator == "D":         # DEBUG 行，忽略
-        return ""
-    code = raw[7:72] if len(raw) > 72 else raw[7:]
-    return code.rstrip()
+    return cobol_columns.clean_line(raw)
 
 
 def _clean_lines(raw_lines: list[str]) -> list[tuple[int, str]]:
@@ -293,8 +293,10 @@ def parse(cob_file: str | Path) -> CobolProgram:
     # 7. 收集 COPY 引用
     copy_refs: list[str] = []
     for line in upper_lines:
+        if cobol_columns.is_deactivated(line):   # 跳过 '!!!!!!' 停用行的 COPY
+            continue
         m = re.search(r"\bCOPY\s+(\S+)", line)
-        if m and not line.strip().startswith("!"):
+        if m:
             copy_refs.append(m.group(1).rstrip("."))
 
     return CobolProgram(

@@ -3,23 +3,19 @@
 
 对应设计：docs/详细设计/步骤03-WSAA块翻译设计.md。
 
-设计思路（固化用户 WORKING-STORAGE 规范）：
-- 标量：`private <类型> 驼峰名 = <初值>;`，初值取 VALUE 子句或类型默认值；
-- 数组：OCCURS 维度由祖先链累计（dims），渲染 `T[]…`、`new T[d1][d2]…`；
-- 名字 = cob名驼峰（复用 parser.variable_resolver._cobol_to_java_name，规范：cob名+wsaa）。
+设计思路（规范驱动，步骤05 §6.3）：
+- 标量：`private <类型> 驼峰名 = <初值>;`，类型/初值/命名/样式串均经 config.spec_loader 取；
+- 数组：OCCURS 维度由祖先链累计（dims），渲染 `T[]…`、`new T[d1][d2]…`（算法型，留在引擎）；
+- 名字、初值、字段样式串：spec_loader.field_name / init_of / FIELD_DECL（删除原硬编码）。
 """
 from __future__ import annotations
 
-from parser.variable_resolver import _cobol_to_java_name
 from parser.ws.model import WsNode
-from parser.ws import value as _value
-
-_DEFAULTS = {"String": '""', "int": "0", "long": "0",
-             "BigDecimal": "BigDecimal.ZERO", "boolean": "false"}
+from config import spec_loader
 
 
 def java_name(cobol: str) -> str:
-    return _cobol_to_java_name(cobol)
+    return spec_loader.field_name(cobol)
 
 
 def _short(raw: str, n: int = 64) -> str:
@@ -34,9 +30,7 @@ def render_field(node: WsNode, dims: list[int]) -> list[str]:
     if dims:
         atype = jt + "[]" * len(dims)
         init = "new " + jt + "".join(f"[{d}]" for d in dims)
-        return [f"    private {atype} {jn} = {init};{cm}"]
-    if node.has_value and node.value_raw:
-        init = _value.java_init(node.value_raw, jt)
     else:
-        init = _DEFAULTS.get(jt, '""')
-    return [f"    private {jt} {jn} = {init};{cm}"]
+        atype = jt
+        init = spec_loader.init_of(node)
+    return [spec_loader.FIELD_DECL.format(type=atype, name=jn, init=init, comment=cm)]

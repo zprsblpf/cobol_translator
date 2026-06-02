@@ -1,0 +1,366 @@
+# ════════════════════════════════════════════════════════════════════════
+# COBOL → Java 翻译规范（正本）
+# ════════════════════════════════════════════════════════════════════════
+# 定位：本文件是「翻译模板 / 样式」的**单一正本**（config 层）。规则散落在
+#       wsaa_type_catalog.yaml / knowledge/wsaa_translation_decisions.md /
+#       步骤03·04 设计中，统一收口到此；其余文件降为「样例」「概念知识」「代码实现思路」。
+# 原则：抽象、可扩展——后续新增 COBOL 类型/构造，只在此**加一条**，不写死、不改代码。
+# 详尽度要求：每条都要讲清「COBOL 端是什么/怎么存/取值范围」「翻成什么 Java/为什么」
+#             「初值/宽度怎么算」「代码里怎么用（样例）」，不许一句话带过。
+# 关系：
+#   - 标量 PIC→Java 类型的机器匹配规则：type_mappings.yaml（pic.py 首命中消费）。
+#   - 命名（类/字段/COPY 角色）：naming_conventions.yaml。
+# ════════════════════════════════════════════════════════════════════════
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# 〇、整体：一个 cob → 一套 Java（骨架要素）
+# ═════════════════════════════════════════════════════════════════════════
+program_skeleton:
+
+  program_id:
+    cobol: "PROGRAM-ID. ZPOLDWNM."
+    rule: "程序名 → 新建主类名，首字母大写、其余小写驼峰。"
+    detail: |
+      PROGRAM-ID 是整个 cob 程序的标识，对应一个 Java 主类。
+      ZPOLDWNM → class Zpoldwnm。该类承载 PROCEDURE DIVISION 的入口与各 SECTION 方法。
+    sample: "PROGRAM-ID. ZPOLDWNM.  →  public class Zpoldwnm { ... }"
+
+  working_storage:
+    cobol: "WORKING-STORAGE SECTION."
+    rule: "全局参数定义块 → 状态容器类，类名 = cob 名 + Wsaa。"
+    detail: |
+      WORKING-STORAGE 里的变量在 COBOL 中是**全局**的：所有 SECTION（方法）都能读写。
+      翻译为一个状态容器类 ZpoldwnmWsaa，块内每个 01 级变量 → 该类的一个字段。
+      字段命名：COBOL 名去掉前缀连字符、转小驼峰（WSAA-PROG → wsaaProg）。
+    java_principle: |
+      Java 端尽量**不使用全局/静态变量**：
+      - 容器类不做 static 单例；每次调用程序时 new 一个实例。
+      - 该实例作为「上下文对象」在各 SECTION 方法间**显式传参**（方法签名带 wsaa 参数），
+        而不是靠全局可见。
+      - 多线程场景：每线程/每请求各持一个实例（线程封闭），从而天然线程安全，
+        避免共享可变全局带来的竞态。
+    sample: "WORKING-STORAGE SECTION  →  class ZpoldwnmWsaa { private String wsaaProg = \"ZPOLDWN\"; ... }"
+
+  copy:
+    cobol: "COPY ITEMKEY. / COPY GETDESCREC. / COPY AGLFSKM. / COPY VARCOM."
+    rule: "COPY = 引用其它 cob 文件（拷贝簿）。不同后缀/名代表不同角色，分别翻译。"
+    detail: |
+      COPY 把另一个 cob 的定义/逻辑「引入」当前程序，相当于 import。按角色区分：
+    roles:
+      entity:
+        match: "名以 REC / SKM / KEY 结尾"
+        meaning: "实体类的字段定义（记录区 / 数据库记录布局 / 键结构）。"
+        java: "→ 实体类（DTO）。字段读 obj.getXxx()、字段写 obj.setXxx(v)、整体 new 类()。"
+      service:
+        match: "VARCOM 等含处理逻辑的拷贝簿"
+        meaning: "提供处理逻辑（方法），当前 cob 会调用它的方法。"
+        java: "→ 服务类依赖（成员/注入），当前类调它的方法。"
+      constant:
+        match: "其余前缀（不属上两类）"
+        meaning: "状态码 / 功能码等命名常量。"
+        java: "→ 常量，保持字符串字面量，不当数据名。"
+
+  procedure_using:
+    cobol: |
+      PROCEDURE DIVISION USING LETCMNT-PARAMS
+                               PMSPNT-PARAMS.
+    rule: "PROCEDURE DIVISION = 程序主体入口；USING 列表 = 入参。"
+    detail: |
+      USING 后列出的每个参数 → 主入口方法的一个入参；参数类型按其 COPY 角色定
+      （多为实体类 Params）。这是调用方传入、被本程序读写的数据区。
+    sample: "USING A B  →  public void main(AParams a, BParams b) { ... }"
+
+  section:
+    cobol: "xxxx-yyyy SECTION."
+    rule: "每个 SECTION → 一个方法（拆解阶段：每个 SECTION 截成一个 .cob 片段文件）。"
+    detail: |
+      SECTION 是 COBOL 的一段可被 PERFORM 调用的过程体，对应一个 Java 方法。
+      拆解器已把每个 SECTION 单独存为一个 .cob（如 1000-INITIALISE.cob）。
+      方法间通过参数传递数据（上下文容器 + 业务对象），尽量不靠全局变量。
+    perform: "PERFORM 1000-INITIALISE  →  initialise(wsaa, ...);（段名 → 方法名）"
+    java_elements: "产物三要素：类型（容器/实体类）、方法（每 SECTION 一个）、方法间传参。"
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# 一、标量类型（PIC → Java）。机器匹配见 type_mappings.yaml；此处讲透语义与样例。
+# ═════════════════════════════════════════════════════════════════════════
+scalars:
+
+  - id: char
+    cobol: "PIC X(n) / A(n)"
+    java: "String"
+    meaning: |
+      X(n)/A(n) 是 n 个字符的定长字符串。X 任意字符、A 仅字母。
+      定长：不足右补空格、超长右截断（参与定宽切片时按此对齐）。
+    width: "n（字符数）"
+    init: |
+      VALUE 'str' → = "str"；VALUE SPACES → = ""；无 VALUE → = ""。
+    naming: "WSAA-PROG → wsaaProg"
+    sample:
+      - { cobol: "01 WSAA-PROG PIC X(07) VALUE 'ZPOLDWN'.", java: 'private String wsaaProg = "ZPOLDWN";' }
+      - { cobol: "01 WSAA-SKIP-COMP PIC X(01) VALUE SPACES.", java: 'private String wsaaSkipComp = "";' }
+
+  - id: int
+    cobol: "PIC 9(n) / S9(n) / 999，n≤9，无 V"
+    java: "int"
+    meaning: |
+      纯整数。9(n) 与 999 都表示 n 位数字、每位 0-9。
+      无 S → 无符号（仅 0 及正数）；S9(n) → 可正可负，但 S 不占字符宽度。
+      位数 ≤9 用 int（int 最大约 21 亿，够 9 位）。
+      例：PIC 999 VALUE 0 = 可存 3 位数字（000~999）、默认值 0。
+    width: "n（S 符号不占位）"
+    init: "VALUE 数字 → = 该数字；无 VALUE → = 0"
+    sample:
+      - { cobol: "01 WSAA-CSV-RIDER-SEQ PIC 9(03).", java: "private int wsaaCsvRiderSeq = 0;" }
+      - { cobol: "01 WSAA-NUM PIC 999 VALUE 0.",      java: "private int wsaaNum = 0;" }
+
+  - id: long
+    cobol: "PIC 9(n) / S9(n)，n>9，无 V"
+    java: "long"
+    meaning: |
+      位数 >9 的整数（超出 int 范围）用 long。语义同 int，只是更宽。
+    width: "n"
+    init: "VALUE 数字 → = 数字；无 → = 0"
+    sample:
+      - { cobol: "01 WSAA-STR-IN PIC 9(13).", java: "private long wsaaStrIn = 0;" }
+
+  - id: decimal
+    cobol: "PIC 9(m)V9(k) / S9(m)V9(k)（隐含小数点 V，无 COMP）"
+    java: "BigDecimal（scale = k）"
+    meaning: |
+      带小数的定点数，逐位拆解：
+        S    —— 符号位，可存正号或负号（无 S 则无符号、恒非负）；
+        9(m) —— 整数部分最多 m 位；
+        V    —— **隐式小数点**，实际不占存储，只是标记整数/小数的分界位置；
+        9(k) —— 小数部分 k 位。
+      总数字位数 = m + k。用 BigDecimal 保留精度（金额/费率，不能用 double）。
+      取值范围举例：
+        S9(15)V9(2) → ±999,999,999,999,999.99（17 位数字，约 ±1 千万亿）；
+        9(15)V99    → 0 ~ 999,999,999,999,999.99（无符号，恒非负）。
+    width: "m+k（V 不占位、S 不占位）"
+    init: "无 VALUE → = BigDecimal.ZERO；有数字 VALUE → = new BigDecimal(\"...\")"
+    sample:
+      - { cobol: "01 WSAA-PREM-TOTAL PIC S9(15)V9(2).", java: "private BigDecimal wsaaPremTotal = BigDecimal.ZERO;" }
+      - { cobol: "01 WSAA-ORIGAMT PIC 9(15)V99.",        java: "private BigDecimal wsaaOrigamt = BigDecimal.ZERO;" }
+
+  - id: comp3_int
+    cobol: "PIC S9(n) COMP-3（压缩十进制，无 V）"
+    java: "long"
+    meaning: |
+      COMP-3（压缩/打包十进制）：**每个字节存 2 个数字，最后半个字节存符号**。
+      存储字节数 = (数字位数 + 1) / 2，向上取整。
+      符号半字节（十六进制）：C = 正、D = 负、F = 无符号。
+      例 S9(03) COMP-3：存储 (3+1)/2 = 2 字节
+        字节1 = 第 1-2 位数字；字节2 = 第 3 位数字 + 符号半字节。
+        值 123  → 字节 X'12' X'3C'（数字 3 + 正号 C）；
+        值 -456 → 字节 X'45' X'6D'（数字 6 + 负号 D）。
+      无 V 的 COMP-3 是整数 → long。
+    width: "ceil((n+1)/2) 打包字节（视图切片用；非显示位数）"
+    init: "无 → = 0"
+    sample:
+      - { cobol: "01 WS003-PREM-UNIT PIC S9(03) COMP-3.", java: "private long ws003PremUnit = 0;" }
+
+  - id: comp3_decimal
+    cobol: "PIC S9(m)V9(k) COMP-3"
+    java: "BigDecimal（scale = k）"
+    meaning: |
+      带 V 的 COMP-3：打包十进制 + 隐式小数点 → BigDecimal。
+      存储字节 = ceil((m+k+1)/2)，符号半字节规则同上（C/D/F）。
+    width: "ceil((m+k+1)/2) 打包字节"
+    init: "无 → = BigDecimal.ZERO"
+    sample:
+      - { cobol: "01 WSAA-CURR-YEARS PIC S9(11)V9(07) COMP-3.", java: "private BigDecimal wsaaCurrYears = BigDecimal.ZERO;" }
+
+  - id: edited
+    cobol: "数字编辑 PIC（零抑制 Z、浮动 *、插入 . ,）"
+    java: "String（显示格式串，不建模数值语义）"
+    meaning: |
+      编辑型是**输出格式**，不是参与算术的数值。Z = 前导零抑制为空格，
+      . , 是插入字符，9 是必显数字位。它常被切片取子串拼显示，故当字符串最安全。
+      例 Z(11)9.99：最多 11 位零抑制 + 1 位必显 + 小数点 + 2 位小数。
+    width: "显示位数（含插入字符各 1；近似，编辑字段极少参与切片）"
+    init: '无 → = ""'
+    sample:
+      - { cobol: "05 WSXX-INSTPREM PIC Z(11)9.99.", java: 'private String wsxxInstprem = "";' }
+
+  - id: indicator
+    cobol: "PIC 1（INDICATOR）"
+    java: "boolean（OCCURS 上 → boolean[]）"
+    meaning: |
+      INDICATOR 是单个开关位（0/1）→ boolean。挂 OCCURS 时为开关数组。
+    width: "0（不参与字符切片）"
+    init: "无 → = false"
+    sample:
+      - { cobol: "03 INDIC-TABLE OCCURS 99 PIC 1 INDICATOR.", java: "private boolean[] indicTable = new boolean[99];" }
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# 二、聚合 / 结构构造
+# ═════════════════════════════════════════════════════════════════════════
+structures:
+
+  - id: group
+    cobol: "组项（无 PIC，含子项）"
+    java: "子项各自平铺为字段 + 组头注释 `// ── 组名 ──`；组本身不生成独立字段。"
+    meaning: |
+      组（无 PIC 的层级项）把若干子项聚成一个连续存储区。
+      组长度 = 各子项宽度之和。组与子项**共享同一块存储**，因此双向同步：
+        - 改组（整体赋值）会改写其覆盖区段内所有子项；
+        - 改某子项会改写组中对应位置的字节。
+      例 WSAA-LETOKEYS（长度 = 1+8+8+13 = 30）：
+        WSAA-TSALEUNT 是该组**第 9 位起、8 字节**的截取；
+        改 WSAA-TSALEUNT 会改 WSAA-LETOKEYS 第 9~16 位；
+        改 WSAA-LETOKEYS 第 9~16 位也会改 WSAA-TSALEUNT。
+      FILLER 是占位符（见下），只占长度、不生成字段。
+    usage: |
+      子项 = 父组的定宽切片视图（无独立存储，读写都落到同一 backing），保证双向同步。
+    sample:
+      cobol: |
+        01 WSAA-LETOKEYS.                  (长度 1+8+8+13 = 30)
+           03 WSAA-LANGUAGE  PIC X(01).
+           03 WSAA-TSALEUNT  PIC X(08).    (第 9 位起 8 字节)
+           03 WSAA-B-CHDRNUM PIC X(08).
+           03 FILLER         PIC X(13).
+      java: "// ── WSAA-LETOKEYS（len=30）── + 各子项字段 + 定宽切片双向同步视图"
+
+  - id: filler
+    cobol: "FILLER"
+    java: "不生成字段。"
+    meaning: |
+      FILLER 是匿名占位符，没有名字、程序不直接引用。它只**占据长度**，
+      用于在组/重定义中把后续子项推到正确的字节偏移。翻译时仅计长度/偏移，不建字段。
+
+  - id: occurs_1d
+    cobol: "OCCURS n（一维）"
+    java: "T[] = new T[n]"
+    meaning: |
+      OCCURS 表示该项重复 n 次，相当于数组/集合。
+      下标换算：COBOL 是 1 基（1..n），Java 是 0 基 → 访问用 i-1。
+    usage: |
+      MOVE CRAT-CYRETENT01 TO WS001-CVALUE(100)  →  ws001Cvalue[99] = ...;
+      （WS001-CVALUE 类似一个长度 200 的集合，下标 100 → java[99]）
+    sample:
+      cobol: |
+        01 WS001-CVALUES.
+           03 WS001-CVALUE PIC S9(12) COMP-3 OCCURS 200.
+      java: "private long[] ws001Cvalue = new long[200];"
+
+  - id: occurs_2d
+    cobol: "嵌套 OCCURS（二维，如外层 27 × 内层 4）"
+    java: "T[][] = new T[d1][d2]（祖先链累计维度）"
+    meaning: |
+      OCCURS 嵌套 OCCURS → 二维。外层组 OCCURS d1、内层组 OCCURS d2，
+      内层组里的字段就成了二维数组，按 (外下标, 内下标) 访问。
+      若 OCCURS 元素本身是组（非基础类型），相当于「自定义类的数组」——
+      该组的每个字段都随外层下标二维化。
+    usage: |
+      WSAA-CP-AMOUNT(CSV-L, CSV-R)：CSV-L≤27（外）、CSV-R≤4（内）→ wsaaCpAmount[L-1][R-1]。
+      切片赋值：MOVE CSV-AMT-TEMP(1:15) TO WSAA-CP-AMOUNT(L,R)(1:15) 等
+      → 对二维元素再做字符定宽切片写入。
+    sample:
+      cobol: |
+        01 WSAA-CPB-INF.
+           03 WSAA-CPB-LINE OCCURS 27 TIMES.        (外层 27)
+              05 FILLER          PIC X(3) VALUE 'CP'.
+              05 WSAA-CPB-R.
+                 07 WSAA-CPB-ROW OCCURS 4 TIMES.    (内层 4，元素是组=自定义类)
+                    09 WSAA-CP-AGETAG PIC X    VALUE '#'.
+                    09 WSAA-CP-AGE    PIC X(03).
+                    09 WSAA-CP-AMTTAG PIC X    VALUE '#'.
+                    09 WSAA-CP-AMOUNT PIC X(18).
+      structure_note: |
+        WSAA-CPB-INF(01) → 子 05：FILLER、WSAA-CPB-R、WSAA-CP-ROW-STR。
+        WSAA-CPB-R(05) → 07 WSAA-CPB-ROW OCCURS 4：长度 4 的集合，元素是「自定义类」，
+        含 4 个字段：WSAA-CP-AGETAG / WSAA-CP-AGE / WSAA-CP-AMTTAG / WSAA-CP-AMOUNT。
+
+  - id: cond_values
+    cobol: "88 名 VALUES 'V1' 'V2' …"
+    java: "判断条件 → 布尔方法：public boolean 名(){ return 父字段.equals(\"V1\") || …; }"
+    meaning: |
+      88 级不是字段，而是对其**父字段取值的命名判断**。
+      它定义「父字段等于某值（或在某组值中）时为真」。
+      不会为它生成存储；赋值/比较都作用在父字段上。
+    usage: |
+      IF IS-6PWB ...  =  IF WSAA-VAL28-PRD == '6PWB'。
+      IF IS-6PWB THEN MOVE 'Y' ...：判断 WSAA-VAL28-PRD 是否为 6PWB，是则执行。
+    sample:
+      cobol: |
+        03 WSAA-VAL28-PRD PIC X(04).
+        88 IS-6PWB VALUES '6PWB'.
+        88 IS-WPDH VALUES 'WPDH'.
+      java: 'public boolean is6pwb(){ return wsaaVal28Prd.equals("6PWB"); }'
+
+  - id: cond_indicator
+    cobol: "88 名 VALUE B'0' / B'1'（挂在 OCCURS PIC 1 上）"
+    java: "带下标布尔：indOn(int i){ return arr[i-1]; }（B'1'）/ !arr[i-1]（B'0'）"
+    meaning: |
+      挂在 INDICATOR 数组上的 88：B'1' 判断该开关为开、B'0' 为关。
+      因 backing 是 boolean[]，生成带下标的布尔访问器。
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# 三、REDEFINES（重新定义同一存储；视图无独立存储，落到 backing，双向同步）
+# ═════════════════════════════════════════════════════════════════════════
+# 含义：REDEFINES 把**同一块存储**「换一种定义来看」。常见是把一组字段整体看成一个
+#       字符串（组↔串互转），或把一个数值/字符区按另一种结构解读。它不新增存储。
+redefines:
+
+  - id: char_over_char
+    cobol: "字符别名 / 字符数组 over 字符（含 OCCURS 子项）"
+    java: "对目标做定宽切片 get/set；数组子项 → getX(int i)/setX(int i, String)。"
+    meaning: |
+      把目标字符区（或字符组）按别名结构切片读写。视图无独立存储，
+      读 = 从目标定宽串切子串，写 = 把值写回目标对应区段 → 与目标双向同步。
+    usage: |
+      WSAA-CP-ROW-STR REDEFINES WSAA-CPB-R：把 4 行结构（每行 1+3+1+18=23，×4=92）
+      整体当成 92 字节字符串看（集合 ↔ 字符串互转）。
+    sample:
+      cobol: |
+        05 WSAA-CPB-R.                          (4 行 × 23 = 92)
+           07 WSAA-CPB-ROW OCCURS 4 TIMES. ...
+        05 WSAA-CP-ROW-STR REDEFINES WSAA-CPB-R.
+           07 FILLER PIC X(92).
+
+  - id: chars_over_numeric
+    cobol: "字符/数值子项 over 数值 backing（DISPLAY）"
+    java: "backing 数值 ↔ 定宽数字串；子项按类型切片 get/set。"
+    meaning: |
+      别名把一个数值字段的存储按字符/数值子项重解读。读 = 把 backing 数值转成
+      定宽数字串再切片；写 = 切片改后解析回 backing 数值。双向同步。
+
+  - id: numeric_over_char
+    cobol: "数值别名 over 字符组"
+    java: "数值 = parse(目标组存储串)；set 写回定宽数字串。"
+    meaning: |
+      把一个字符组整体当成一个数值看。读 = 解析组存储串为数值；
+      写 = 数值转定宽数字串写回组。
+
+  - id: target_missing
+    cobol: "REDEFINES 目标被 !!!!!! 停用 / 不在块内（拆解已丢弃）"
+    java: "别名是该存储唯一存活定义 → 按其自身 PIC 当普通字段/组渲染，去掉 REDEFINES 语义。"
+    meaning: |
+      若目标定义已被停用/不在块内，程序实际只用存活的别名，
+      则按别名自身 PIC 当主定义渲染，附注释「原 REDEFINES 目标已停用，按主定义渲染」，不报 TODO。
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# 四、暂留 TODO（不臆测，标明原因；能确定性还原才生成，否则退化为人工核对）
+# ═════════════════════════════════════════════════════════════════════════
+todo_kept:
+  - id: in_occurs_context
+    why: "REDEFINES 处于 OCCURS 元素内，定宽标量视图不适用，需按下标参数化 → 人工核对。"
+  - id: malformed_level
+    why: "注释掉组头导致孤儿子项，层级歧义，需人工重建组 → 人工核对。"
+  - id: comp3_backing
+    why: "REDEFINES backing 为 COMP-3：打包字节非干净数字串，_toDigits 不适用 → 人工核对。"
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# 五、固化假设（写进产物注释，如实标注）
+# ═════════════════════════════════════════════════════════════════════════
+assumptions:
+  - id: signed_display_abs
+    text: "有符号 DISPLAY 数值（S9..）存储串取绝对值零填充，不建模负号 overpunch（语义为日期/金额，恒非负）。"
+  - id: cobol_move_align
+    text: "定宽串超宽高位截断、不足右补空格 / 高位补 0（对齐 COBOL MOVE 截断语义）。"
