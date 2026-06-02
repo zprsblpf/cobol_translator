@@ -25,6 +25,7 @@ class SectionModel:
     line_start: int          # 原文件起始行
     line_end: int            # 原文件结束行
     go_tos: list[str]        # GO TO 目标（高风险，渲染时标注）
+    body_lines: list[str]    # 段体原始代码行（去行号前缀），步骤07 方法体翻译用
 
 
 @dataclass
@@ -50,6 +51,7 @@ def build_model(program) -> SkeletonModel:
             line_start=s.line_start,
             line_end=s.line_end,
             go_tos=list(s.go_tos),
+            body_lines=list(s.lines),
         )
         for s in program.sections
     ]

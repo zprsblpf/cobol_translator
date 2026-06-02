@@ -23,6 +23,22 @@ def _is_java_method_call(name: str) -> bool:
     return any(name.startswith(pfx) for pfx in _JAVA_METHOD_PREFIXES)
 
 
+def fix_array_subscripts(text: str) -> str:
+    """COBOL 风格下标 name(idx) → Java name[idx-1]；跳过 Java 方法调用与 obj.method() 形式。
+
+    模块级公共函数：graph 的 `_postprocess_java_body` 与主线 skeleton_gen 的瘦后处理共用（步骤07）。
+    """
+    def _fix(m: "re.Match") -> str:
+        full, name, idx = m.group(0), m.group(1), m.group(2)
+        if m.start() > 0 and text[m.start() - 1] == ".":
+            return full
+        if _is_java_method_call(name):
+            return full
+        return f"{name}[{idx} - 1]"
+
+    return re.sub(r"(\w+)\((\w+)\)", _fix, text)
+
+
 def _postprocess_java_body(java_body: str, current_module: str = "",
                            module_assignment: dict | None = None,
                            java_field_names: list | None = None,
@@ -44,16 +60,7 @@ def _postprocess_java_body(java_body: str, current_module: str = "",
     java_body = re.sub(r"(\w+)\.setLength\(0\);", r'\1 = "";', java_body)
 
     # (1) 数组下标
-    def _fix_subscript(m: re.Match) -> str:
-        full, name, idx = m.group(0), m.group(1), m.group(2)
-        start = m.start()
-        if start > 0 and java_body[start - 1] == ".":
-            return full
-        if _is_java_method_call(name):
-            return full
-        return f"{name}[{idx} - 1]"
-
-    java_body = re.sub(r"(\w+)\((\w+)\)", _fix_subscript, java_body)
+    java_body = fix_array_subscripts(java_body)
 
     # 修正多余尾部 }
     java_body = java_body.rstrip()
@@ -83,8 +90,8 @@ def _postprocess_java_body(java_body: str, current_module: str = "",
     return java_body
 
 
-def _prefix_fields_outside_strings(text: str, field_re: re.Pattern) -> str:
-    """对字符串字面量之外的字段名加 st. 前缀。"""
+def _prefix_fields_outside_strings(text: str, field_re: re.Pattern, prefix: str = "st.") -> str:
+    """对字符串字面量之外的字段名加前缀（graph 用 `st.`，主线 skeleton_gen 用 `wsaa.`，步骤07）。"""
     out = []
     i, n = 0, len(text)
     while i < n:
@@ -104,6 +111,6 @@ def _prefix_fields_outside_strings(text: str, field_re: re.Pattern) -> str:
         while j < n and text[j] not in ("'", '"'):
             j += 1
         segment = text[i:j]
-        out.append(field_re.sub(lambda m: "st." + m.group(1), segment))
+        out.append(field_re.sub(lambda m: prefix + m.group(1), segment))
         i = j
     return "".join(out)
