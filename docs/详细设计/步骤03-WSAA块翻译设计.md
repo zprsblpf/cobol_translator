@@ -79,12 +79,14 @@
 
 ## 5. 已知限制（如实标注，输出内含 TODO）
 
-- **数值/编辑型 REDEFINES**（如 `WSAA-AMOUNT1-CHAR` over `9(15)V99`）：目标非字符型，
-  退化为普通字段 + `// TODO`（未做数值↔定宽串的零位视图）。共约 8 处。
-- **OCCURS 数组上下文内的 REDEFINES**（`WSXX-PCESTRM-R` 等）：定宽标量视图不适用 → TODO + 标量占位。
-- **外部 REDEFINES 目标**（`WSAA-CVCP-AMOUNT` 在 copybook）：普通字段 + TODO。
-- **畸形层级区**（源 295–327，父 01 被注释、层级跳变）：尽力平铺 + `// TODO 畸形层级`。
-- **INDICATOR 88**（`IND-OFF/IND-ON`）：需结合数组下标，留 TODO。
+> 注：本节原列的多数 TODO 已在 **[步骤04-WSAA遗留补全设计](步骤04-WSAA遗留补全设计.md)**（2026-06-03）
+> 确定性补全，产物 TODO 由 27→10。下表标注现状。
+
+- ~~**数值/编辑型 REDEFINES**~~：✅ 已补全（步骤04 A/B：数值↔定宽串视图 `_toDigits/_fromDigits`）。
+- **OCCURS 数组上下文内的 REDEFINES**（`WSXX-PCESTRM-R` 等，×4）：定宽标量视图不适用 → **保留 TODO**（D13）。
+- ~~**外部 REDEFINES 目标**（`WSAA-CVCP-AMOUNT`）~~：✅ 改为按 alias 主定义渲染（步骤04 D12，已确认是停用而非 copybook）。
+- **畸形层级区**（源 295–327，×6）：层级歧义 → **保留 TODO**（D14），尽力平铺。
+- ~~**INDICATOR 88**（`IND-OFF/IND-ON`）~~：✅ 已补全为 `indOn(int i)/indOff(int i)`（步骤04 D 类）。
 - 编辑 PIC 的 `byte_len` 不计插入字符（. ,），仅近似（编辑字段为显示串，极少参与切片）。
 
 ## 6. 验证结果（2026-05-31）

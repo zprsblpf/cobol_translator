@@ -9,11 +9,12 @@ WsNode 森林 → 完整 Java 类（确定性组装）。
 """
 from __future__ import annotations
 
-from translator.skeleton import _class_base
+from config import spec_loader
 from parser.ws.model import WsNode
 from translator.wsaa.render_field import java_name, render_field
 from translator.wsaa.render_condition import render_conditions
 from translator.wsaa import render_view as _view
+from translator.wsaa import storage as _storage
 
 
 def _index_and_groups(roots: list[WsNode]):
@@ -52,9 +53,14 @@ class _Acc:
 
 def _handle(node: WsNode, dims: list[int], acc: _Acc, idx: dict, vg: set, arr: set):
     if node.conditions:
-        acc.conds.extend(render_conditions(node))
+        indexed = bool(dims) or bool(node.occurs)
+        acc.conds.extend(render_conditions(node, indexed))
     if node.redefines:
-        acc.views.extend(_view.render_redefines(node, idx, vg, arr))
+        # 目标被停用/不在块内：alias 是唯一存活定义，按主定义渲染并入 fields（D12）
+        if node.redefines.upper() not in idx:
+            acc.fields.extend(_view.render_primary(node))
+        else:
+            acc.views.extend(_view.render_redefines(node, idx, vg, arr))
         return
     if node.is_group:
         if node.children:
@@ -82,7 +88,7 @@ def _handle(node: WsNode, dims: list[int], acc: _Acc, idx: dict, vg: set, arr: s
 
 def render_wsaa(roots: list[WsNode], program: str) -> str:
     """森林 → Java 源码字符串。"""
-    base = _class_base(program)            # ZPOLDWNM → Zpoldwnm
+    base = spec_loader.class_name(program)  # ZPOLDWNM → Zpoldwnm（经规范访问层）
     class_name = f"{base}Wsaa"             # 协作规范：{PROGRAM}WSAA
     package = program.lower()
     idx, vg, arr = _index_and_groups(roots)
@@ -106,6 +112,9 @@ def render_wsaa(roots: list[WsNode], program: str) -> str:
         out += ["", "    // ── 重叠组 / REDEFINES 派生视图（双向同步）──"]
         out += acc.views
         out += [""] + _view.PAD_HELPER
+        # 仅当用到数值定宽串视图时输出 _toDigits/_fromDigits（避免无用私有方法）
+        if any("_toDigits" in ln or "_fromDigits" in ln for ln in acc.views):
+            out += _storage.NUM_HELPER
     if acc.conds:
         out += ["", "    // ── 88 条件 → 布尔方法 ──"]
         out += acc.conds

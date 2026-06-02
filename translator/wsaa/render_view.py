@@ -1,19 +1,24 @@
 """
 重叠组 / REDEFINES → 派生视图方法（普通字段 + 视图，保证双向同步）。
 
-对应设计：docs/详细设计/步骤03-WSAA块翻译设计.md。
+对应设计：docs/详细设计/步骤03-WSAA块翻译设计.md、步骤04-WSAA遗留补全设计.md。
 
-设计思路（用户决定：普通字段 + REDEFINES 派生视图方法）：
-- 叶子字段为 backing（真实存储）；
-- 「重叠组」（子项即父缓冲分段，全为字符型、无 OCCURS）→ 生成 getX()/setX(String)
-  按定宽拼接 / 切分，改子↔改父双向同步；
-- 「REDEFINES」→ 别名字段不单独存储，而是对被重定义目标的字符视图做切片 get/set；
-  目标非字符型 / 含 OCCURS / 不在本块（copybook）→ 退化为普通字段 + TODO（如实标注）。
+设计思路（普通字段 + REDEFINES 派生视图方法，建在「定宽存储串」上，见 storage.py）：
+- 叶子字段为 backing（真实存储）；视图无独立存储，get/set 均落到 backing → 天然同步。
+- 「重叠组」（子项全字符、无 OCCURS）→ getX()/setX(String) 定宽拼接/切分（render_group_view）。
+- 「REDEFINES」→ 对目标定宽存储串切片，按 alias 子项类型生成 get/set：
+  字符子项→String 切片；数值子项→int/long/BigDecimal 解析回写；字符数组子项→带下标访问器；
+  alias 自身为标量（如 9(03) over 组）→ 整段视图。
+- 目标被停用 / 不在块内（拆解丢弃 !!!!!! 目标）→ render_primary 按 alias 自身 PIC 当主定义渲染。
+- 数组上下文 / 目标含 OCCURS/编辑型/COMP-3 / 嵌套子组 → 退化 TODO（标明原因，不臆测）。
 """
 from __future__ import annotations
 
 from parser.ws.model import WsNode
 from translator.wsaa.render_field import java_name, render_field
+from translator.wsaa.storage import storage_accessor, scale_of, num_to_digits, num_from_digits
+
+_NUMERIC = ("int", "long", "BigDecimal")
 
 PAD_HELPER = [
     "    /** 定宽右填充空格（视图切片用）：截断或补足到 n 字符。 */",
@@ -65,21 +70,8 @@ def render_group_view(node: WsNode) -> list[str]:
     return lines
 
 
-def _string_accessor(tnode: WsNode, view_groups: set[str]):
-    """目标 → (读表达式, 写模板含{v}, 总宽)；不可用返回 None。"""
-    tn = java_name(tnode.name)
-    if tnode.is_group:
-        if tn in view_groups:
-            p = _pascal(tn)
-            return f"get{p}()", f"set{p}({{v}});", tnode.byte_len
-        return None
-    if tnode.java_type == "String":
-        return tn, f"{tn} = {{v}};", tnode.byte_len
-    return None
-
-
 def _todo_plain(node: WsNode, msg: str) -> list[str]:
-    """退化：普通字段（非真正别名）+ TODO 标注。"""
+    """退化：普通字段（非真正别名）+ TODO 标注（数组上下文 / 不支持目标）。"""
     out = [f"    // TODO {msg}"]
     if node.is_group and node.children:
         for ch in node.children:
@@ -97,43 +89,98 @@ def _todo_plain(node: WsNode, msg: str) -> list[str]:
     return out
 
 
+def render_primary(node: WsNode) -> list[str]:
+    """目标被停用/不在块内：alias 是该存储唯一存活定义，按其自身 PIC 当主定义渲染（D12）。"""
+    out = [f"    // 原 REDEFINES 目标 {node.redefines} 已停用/不在块内，按主定义渲染（D12）"]
+    if node.is_group and node.children:
+        for ch in node.children:
+            if not ch.is_filler:
+                out += render_field(ch, [ch.occurs] if ch.occurs else [])
+    else:
+        out += render_field(node, [])
+    return out
+
+
+def _setter(p: str, vtype: str, read: str, W: int, rebuilt: str, wf) -> list[str]:
+    """统一 setter 骨架：取目标存储串 _s → 重建 _n → 经 wf 写回 backing。"""
+    return ([f"    public void set{p}({vtype} v) {{",
+             f"        String _s = _pad({read}, {W});",
+             f"        String _n = {rebuilt};"] + wf("_n") + ["    }"])
+
+
+def _slice_view(ch: WsNode, off: int, w: int, read: str, wf, W: int) -> list[str]:
+    """alias 标量子项（字符 / 数值）→ 按偏移 [off,off+w) 的 get/set 视图。"""
+    p = _pascal(java_name(ch.name))
+    seg = f"_pad({read}, {W}).substring({off}, {off + w})"
+    if ch.java_type in _NUMERIC:
+        sc = scale_of(ch.pic)
+        getter = f"    public {ch.java_type} get{p}() {{ return {num_from_digits(seg, ch.java_type, sc)}; }}"
+        vexpr, vtype = num_to_digits("v", ch.java_type, w, sc), ch.java_type
+    else:
+        getter = f"    public String get{p}() {{ return {seg}; }}"
+        vexpr, vtype = f"_pad(v, {w})", "String"
+    rebuilt = f"_s.substring(0, {off}) + {vexpr} + _s.substring({off + w})"
+    return [getter] + _setter(p, vtype, read, W, rebuilt, wf)
+
+
+def _array_view(ch: WsNode, off: int, w: int, read: str, wf, W: int) -> list[str]:
+    """alias 字符数组子项（X(w) OCCURS n，对齐）→ 带下标 get(i)/set(i,String)（D9）。"""
+    if ch.java_type != "String":
+        return [f"    // TODO REDEFINES 子项 {ch.name} 为数值数组，需人工核对"]
+    p = _pascal(java_name(ch.name))
+    base = f"{off} + (i - 1) * {w}"
+    getter = (f"    public String get{p}(int i) {{ "
+              f"return _pad({read}, {W}).substring({base}, {base} + {w}); }}")
+    rebuilt = f"_s.substring(0, {base}) + _pad(v, {w}) + _s.substring({base} + {w})"
+    setter = ([f"    public void set{p}(int i, String v) {{",
+               f"        String _s = _pad({read}, {W});",
+               f"        String _n = {rebuilt};"] + wf("_n") + ["    }"])
+    return [getter] + setter
+
+
+def _scalar_view(node: WsNode, read: str, wf, W: int) -> list[str]:
+    """alias 自身为标量（如 9(03) over 组）→ 整段 W 宽存储串视图。"""
+    p = _pascal(java_name(node.name))
+    if node.java_type in _NUMERIC:
+        sc = scale_of(node.pic)
+        getter = f"    public {node.java_type} get{p}() {{ return {num_from_digits(f'_pad({read}, {W})', node.java_type, sc)}; }}"
+        setter = ([f"    public void set{p}({node.java_type} v) {{",
+                   f"        String _n = {num_to_digits('v', node.java_type, W, sc)};"] + wf("_n") + ["    }"])
+    else:
+        getter = f"    public String get{p}() {{ return _pad({read}, {W}); }}"
+        setter = [f"    public void set{p}(String v) {{", f"        String _n = _pad(v, {W});"] + wf("_n") + ["    }"]
+    return [getter] + setter
+
+
 def render_redefines(node: WsNode, name_index: dict, view_groups: set[str],
                      arrayed: set[str]) -> list[str]:
-    """REDEFINES 节点 → 视图方法或退化普通字段。"""
+    """REDEFINES 节点 → 视图方法（或退化 TODO）。目标缺失由调用方走 render_primary。"""
     tnode = name_index.get(node.redefines.upper())
     if tnode is None:
-        return _todo_plain(node, f"REDEFINES 目标 {node.redefines} 未在本块定义（可能在 copybook）")
+        return render_primary(node)
     if node.redefines.upper() in arrayed or node.name.upper() in arrayed:
         return _todo_plain(node, f"REDEFINES {node.redefines}: 处于 OCCURS 数组上下文，"
                                  f"定宽视图不适用，需人工核对")
-    acc = _string_accessor(tnode, view_groups)
+    acc = storage_accessor(tnode)
     if acc is None:
-        return _todo_plain(node, f"REDEFINES {node.redefines}: 目标非字符型/无视图，需人工核对")
-    getexpr, setfmt, W = acc
-    out = [f"    // ── REDEFINES {node.name} → 视图 over {node.redefines} ──"]
-
-    def slice_view(ch: WsNode, off: int, w: int) -> list[str]:
-        p = _pascal(java_name(ch.name))
-        getter = (f"    public String get{p}() {{ "
-                  f"return _pad({getexpr}, {W}).substring({off}, {off + w}); }}")
-        rebuilt = f"_s.substring(0,{off})+_pad(v,{w})+_s.substring({off + w})"
-        setter = (f"    public void set{p}(String v) {{ String _s = _pad({getexpr}, {W}); "
-                  f"{setfmt.format(v=rebuilt)} }}")
-        return [getter, setter]
-
-    if node.is_group:
-        off = 0
-        for ch in node.children:
-            w = ch.byte_len
-            if ch.is_filler:
-                off += w
-                continue
-            if ch.is_group or ch.occurs:
-                out.append(f"    // TODO REDEFINES 子项 {ch.name} 含组/OCCURS，需人工核对")
-                off += w
-                continue
-            out += slice_view(ch, off, w)
+        return _todo_plain(node, f"REDEFINES {node.redefines}: 目标含 OCCURS/编辑型/COMP-3 "
+                                 f"或嵌套组，定宽视图不适用，需人工核对")
+    read, wf, W = acc
+    out = [f"    // ── REDEFINES {node.name} → 视图 over {node.redefines}（双向同步；数值假设 A1 取绝对值）──"]
+    if not node.is_group:
+        return out + _scalar_view(node, read, wf, W)
+    off = 0
+    for ch in node.children:
+        w = ch.byte_len
+        if ch.is_filler:
             off += w
-    else:
-        out += slice_view(node, 0, node.byte_len or W)
+        elif ch.is_group:
+            out.append(f"    // TODO REDEFINES 子项 {ch.name} 为嵌套组，需人工核对")
+            off += w * (ch.occurs or 1)
+        elif ch.occurs:
+            out += _array_view(ch, off, w, read, wf, W)
+            off += w * ch.occurs
+        else:
+            out += _slice_view(ch, off, w, read, wf, W)
+            off += w
     return out
