@@ -12,9 +12,9 @@
 from __future__ import annotations
 
 from config import spec_loader
-from translator.skeleton import _section_to_method as _perform_method
 from translator.skeleton_gen.program_model import build_model
 from translator.skeleton_gen.copy_resolver import resolve
+from translator.skeleton_gen.body_context import build_body_ctx, translate_section_body
 
 
 def _using_params(model) -> list[tuple[str, str]]:
@@ -79,23 +79,26 @@ def _entry(model, using) -> list[str]:
     return out
 
 
-def _section_method(model, using, s) -> list[str]:
-    """单个 SECTION → 方法签名（带 wsaa）+ 空体（TODO + PERFORM→调用注释）。"""
+def _section_method(model, using, s, ctx, ws_field_names, known_methods) -> list[str]:
+    """单个 SECTION → 方法签名（带 wsaa）+ 确定性翻译方法体（步骤07，接 rules 引擎，无 LLM）。"""
     out = ["", f"    void {s.method}({_sig(model.wsaa_class, using)}) {{",
            f"        // COBOL SECTION: {s.cobol_name} (行 {s.line_start}-{s.line_end})"]
     if s.go_tos:
         out.append("        // TODO-GOTO: 含 GO TO 语句，控制流需人工核对")
-    out.append("        // TODO 方法体待译")
-    out += [f"        // PERFORM {t} → {_perform_method(t)}({_args(using)});" for t in s.performs]
+    body = translate_section_body(s.body_lines, ctx, ws_field_names, _args(using), known_methods)
+    # 方法体缩进到方法内层（8 空格基准）
+    out += [("        " + ln if ln.strip() else "") for ln in body.split("\n")]
     out.append("    }")
     return out
 
 
 def render_skeleton(program) -> str:
-    """CobolProgram → 主类骨架 Java 源码字符串。"""
+    """CobolProgram → 主类骨架 Java 源码字符串（含确定性翻译的 SECTION 方法体，步骤07）。"""
     model = build_model(program)
     res = resolve(model.copies)
     using = _using_params(model)
+    ctx, ws_field_names = build_body_ctx(program)        # 程序级算一次，各 SECTION 复用
+    known_methods = {s.method for s in model.sections}   # 本类 SECTION 方法名集（B1 补实参用）
     lines = _header(model, res)
     lines += [f"public class {model.class_name} {{"]
     lines += _services_and_ctor(model, res)
@@ -107,6 +110,6 @@ def render_skeleton(program) -> str:
             lines += ["", f"    // 重复 SECTION 跳过（疑似停用/重定义）: {s.cobol_name} → {s.method}()"]
             continue
         seen.add(s.method)
-        lines += _section_method(model, using, s)
+        lines += _section_method(model, using, s, ctx, ws_field_names, known_methods)
     lines += ["}", ""]
     return "\n".join(lines)
