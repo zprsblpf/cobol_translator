@@ -10,6 +10,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
+from config import grammar_loader   # 切分文法正本（步骤08：词法/列模型/paragraph 判定）
+
 
 @dataclass
 class Stmt:
@@ -21,19 +23,11 @@ class Stmt:
     raw: str = ""                              # 原始 COBOL 文本（注释 / LLM 兜底用）
 
 
-# 语句起始动词（用于切分相邻无句点语句、判定条件结束）
-VERBS = {
-    "MOVE", "COMPUTE", "ADD", "SUBTRACT", "MULTIPLY", "DIVIDE", "PERFORM", "GO",
-    "IF", "EVALUATE", "CALL", "SET", "INITIALIZE", "STRING", "UNSTRING", "ACCEPT",
-    "DISPLAY", "OPEN", "CLOSE", "READ", "WRITE", "REWRITE", "DELETE", "START",
-    "CONTINUE", "NEXT", "EXIT", "STOP", "GOBACK", "RETURN", "SEARCH", "INSPECT",
-}
-
-# 块作用域关键字
-_TERMINATORS = {"END-IF", "END-PERFORM", "END-EVALUATE", "ELSE", "WHEN", "THEN"}
-
-# PERFORM 头部允许的内联循环关键字（这些不算"过程名"）
-_PERFORM_KW = {"VARYING", "UNTIL", "WITH", "TEST", "BEFORE", "AFTER", "TIMES", "THRU", "THROUGH", "FROM", "BY"}
+# 词法字典统一取自切分文法正本（config/segmentation_spec.yaml），不在本文件硬编码（步骤08 正本化）。
+# 语句起始动词 / 块作用域关键字 / PERFORM 内联循环关键字。
+VERBS = grammar_loader.verbs()
+_TERMINATORS = grammar_loader.scope_terminators()
+_PERFORM_KW = grammar_loader.perform_keywords()
 
 _DECIMAL_RE = re.compile(r"^[+-]?\d+\.\d+$")
 
@@ -201,14 +195,11 @@ class _Parser:
                     raw=" ".join(self.t[start:self.i]))
 
 
-# paragraph 标签：Area A（行首无缩进）的单 token + 句点，如 "2071-CALL-PS01."
-_LABEL_RE = re.compile(r"^([A-Za-z0-9][A-Za-z0-9-]*)\.\s*$")
-
-
 def split_paragraphs(lines: list[str]) -> list[tuple[str | None, list[str]]]:
     """
     按 paragraph 标签把 SECTION 行切成 [(label_or_None, body_lines), ...]。
-    COBOL paragraph 名写在 Area A（行首无缩进），语句在 Area B（有缩进），据此区分。
+    COBOL paragraph 名写在 Area A、语句在 Area B；标号识别一律委托
+    grammar_loader.paragraph_label（列模型驱动，步骤08 修 Bug 1：不再用 raw[:1] 魔数）。
     首块若无前导标签则 label=None。动词/块终止符不视为标签（如 EXIT. / CONTINUE.）。
     """
     paras: list[tuple[str | None, list[str]]] = []
@@ -216,16 +207,14 @@ def split_paragraphs(lines: list[str]) -> list[tuple[str | None, list[str]]]:
     cur_body: list[str] = []
     started = False
     for raw in lines:
-        stripped = raw.strip()
-        if stripped and raw[:1] not in (" ", "\t"):
-            m = _LABEL_RE.match(stripped)
-            if m and not _is_verb(m.group(1)) and m.group(1).upper() not in _TERMINATORS:
-                if started:
-                    paras.append((cur_label, cur_body))
-                cur_label = m.group(1).upper()
-                cur_body = []
-                started = True
-                continue
+        label = grammar_loader.paragraph_label(raw)
+        if label is not None:
+            if started:
+                paras.append((cur_label, cur_body))
+            cur_label = label
+            cur_body = []
+            started = True
+            continue
         cur_body.append(raw)
         started = True
     if started:

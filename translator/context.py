@@ -7,10 +7,7 @@ graph 侧只留薄包装做 state 适配。
 """
 from __future__ import annotations
 
-from pathlib import Path
-
-import yaml
-
+from config import spec_loader            # IO 映射访问层（步骤09：不再直读 io_mappings.yaml）
 from translator import rules as _rules
 from translator.skeleton import (
     _class_base, _assign_sections_to_modules, _calls_to_repos,
@@ -23,17 +20,16 @@ from log_utils import get_flow_logger
 
 log = get_flow_logger()
 
-CONFIG_DIR = Path(__file__).parent.parent / "config"
-
 
 def build_context_and_skeleton(state: dict) -> dict:
     """构建 IO/COPY 上下文并生成 Java 骨架。返回 state 增量。"""
     log.info("━━ ② 上下文+骨架 ━━ 构建 IO/COPY 上下文并生成 Java 骨架...")
 
-    with open(CONFIG_DIR / "io_mappings.yaml", encoding="utf-8") as f:
-        io_cfg = yaml.safe_load(f)
-    with open(CONFIG_DIR / "copy_mappings.yaml", encoding="utf-8") as f:
-        copy_cfg = yaml.safe_load(f)
+    # IO 映射经访问层取（步骤09：不再直读 io_mappings.yaml；io_programs2 兼容已收口在 spec_loader）
+    all_io = spec_loader.io_programs()
+    io_pattern = spec_loader.io_default_pattern()
+    date_progs = spec_loader.date_programs()
+    sys_progs = spec_loader.system_programs()
 
     # 收集本程序实际用到的所有 IO 调用
     all_calls: set[str] = set()
@@ -45,10 +41,6 @@ def build_context_and_skeleton(state: dict) -> dict:
     repositories: dict[str, dict] = {}
     date_services: list[str] = []
 
-    # 合并所有 IO 程序条目（io_programs + io_programs2 兼容旧 YAML 缩进 bug）
-    all_io = {**io_cfg.get("io_programs", {}), **io_cfg.get("io_programs2", {})}
-    io_pattern = io_cfg.get("io_default_pattern", {})
-
     for call_name in sorted(all_calls):
         # 派生范式做基底，io_programs 显式条目按增量覆盖（非 *IO 返回显式条目/None）
         info = _rules.resolve_io_info(call_name, all_io, io_pattern)
@@ -58,8 +50,8 @@ def build_context_and_skeleton(state: dict) -> dict:
                 f"  (字段: {info['field_name']})"
             )
             repositories[info["field_name"]] = info
-        elif call_name in io_cfg.get("date_programs", {}):
-            info = io_cfg["date_programs"][call_name]
+        elif call_name in date_progs:
+            info = date_progs[call_name]
             if "method" in info:
                 io_lines.append(f"CALL '{call_name}' → dateConversionService.{info['method']}")
                 if "DateConversionService" not in date_services:
@@ -68,8 +60,8 @@ def build_context_and_skeleton(state: dict) -> dict:
                 # date_programs 中意外混入的 IO 程序
                 io_lines.append(f"CALL '{call_name}' → {info['java_class']}.method()")
                 repositories[info["field_name"]] = info
-        elif call_name in io_cfg.get("system_programs", {}):
-            info = io_cfg["system_programs"][call_name]
+        elif call_name in sys_progs:
+            info = sys_progs[call_name]
             io_lines.append(f"CALL '{call_name}' → {info.get('java_code', 'TODO')}")
 
     io_context = "\n".join(io_lines)
@@ -90,7 +82,9 @@ def build_context_and_skeleton(state: dict) -> dict:
     # ── 大框架：分模块 ────────────────────────────────────────────────
     module_assignment, modules = _assign_sections_to_modules(sections_meta, base)
     meta_by_name = {s["name"].upper(): s for s in sections_meta}
-    all_io = {**io_cfg.get("io_programs", {}), **io_cfg.get("io_programs2", {})}
+
+    # _calls_to_repos 仅需 io_default_pattern + date_programs，组小字典传入
+    io_cfg = {"io_default_pattern": io_pattern, "date_programs": date_progs}
 
     # 每模块所需 Repository
     for mod in modules:
@@ -138,9 +132,9 @@ def build_context_and_skeleton(state: dict) -> dict:
         # IO 子程序映射：程序级算一次，供各 SECTION 的 _t_call 固化复用
         "io_mappings": {
             "io_programs": all_io,
-            "date_programs": io_cfg.get("date_programs", {}),
-            "system_programs": io_cfg.get("system_programs", {}),
-            "io_default_pattern": io_cfg.get("io_default_pattern", {}),
+            "date_programs": date_progs,
+            "system_programs": sys_progs,
+            "io_default_pattern": io_pattern,
         },
         "status": "translating",
     }

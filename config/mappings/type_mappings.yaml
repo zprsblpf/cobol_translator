@@ -36,19 +36,3 @@ pic_rules:
   # 兜底
   - pattern: ".*"
     java_type: "String"
-
-# COBOL constant to Java equivalent
-cobol_constants:
-  SPACES: '""'
-  ZEROS: "0"
-  ZERO: "0"
-  LOW-VALUES: '""'
-  HIGH-VALUES: '"\\uFFFF"'
-  O-K: '"O-K"'
-
-# Status codes
-status_constants:
-  O-K: "OK"
-  MRNF: "RECORD_NOT_FOUND"
-  MDUP: "DUPLICATE"
-  ENDP: "END_OF_FILE"

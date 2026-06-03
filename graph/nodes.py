@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import re
 import sys
-import yaml
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -30,22 +29,24 @@ from translator.postprocess import _postprocess_java_body
 from parser.pipeline import build_parse_result
 from translator.context import build_context_and_skeleton
 from translator.assemble import assemble_outputs
+from config import spec_loader   # IO 映射访问层（步骤09：不再直读 io_mappings.yaml）
 from log_utils import (
     get_flow_logger, log_llm_request, log_llm_response, log_llm_error,
 )
 
 log = get_flow_logger()
 
-CONFIG_DIR = Path(__file__).parent.parent / "config"
 KNOWLEDGE_DIR = Path(__file__).parent.parent / "knowledge"
 
 
-def _load_yaml(name: str) -> dict:
-    try:
-        with open(CONFIG_DIR / name, encoding="utf-8") as f:
-            return yaml.safe_load(f) or {}
-    except FileNotFoundError:
-        return {}
+def _io_maps_from_spec() -> dict:
+    """从访问层组装 io_maps 字典（单段调试路径就地用；与 context.py 形态一致）。"""
+    return {
+        "io_programs": spec_loader.io_programs(),
+        "date_programs": spec_loader.date_programs(),
+        "system_programs": spec_loader.system_programs(),
+        "io_default_pattern": spec_loader.io_default_pattern(),
+    }
 
 
 # ── LLM（本地 vLLM，OpenAI 兼容）─────────────────────────────────────────────
@@ -263,13 +264,7 @@ def translate_section_node(state: TranslationState) -> dict:
     # IO 子程序映射：优先用上游算好的；单段调试路径（--section）缺失时就地加载。
     io_maps = state.get("io_mappings")
     if not io_maps:
-        _io_cfg = _load_yaml("io_mappings.yaml")
-        io_maps = {
-            "io_programs": {**_io_cfg.get("io_programs", {}), **_io_cfg.get("io_programs2", {})},
-            "date_programs": _io_cfg.get("date_programs", {}),
-            "system_programs": _io_cfg.get("system_programs", {}),
-            "io_default_pattern": _io_cfg.get("io_default_pattern", {}),
-        }
+        io_maps = _io_maps_from_spec()
 
     # ── 第 1 遍：骨架（确定性）────────────────────────────────────────
     ctx = _rules.Ctx(
@@ -349,11 +344,12 @@ def _translate_leaves_llm(sec: dict, pending: list[tuple[int, str]],
                           state: TranslationState) -> dict[int, str]:
     """对未被规则命中的叶子做一次 LLM 调用，按编号回填。"""
     sec_name = sec["name"]
-    try:
-        with open(CONFIG_DIR / "io_mappings.yaml", encoding="utf-8") as f:
-            io_cfg = yaml.safe_load(f)
-    except Exception:
-        io_cfg = {}
+    # IO 映射经访问层取（io_programs 已合并 io_programs2；_build_io_call_template 兼容该形态）
+    io_cfg = {
+        "io_programs": spec_loader.io_programs(),
+        "date_programs": spec_loader.date_programs(),
+        "io_default_pattern": spec_loader.io_default_pattern(),
+    }
 
     calls = sec.get("calls", [])
     io_templates = [_build_io_call_template(c, io_cfg) for c in calls]

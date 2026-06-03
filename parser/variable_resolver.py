@@ -5,12 +5,11 @@
 from __future__ import annotations
 
 import re
-import yaml
-from pathlib import Path
 from dataclasses import dataclass
 from parser.cobol_parser import Variable
-
-CONFIG_DIR = Path(__file__).parent.parent / "config"
+from config import spec_loader   # PIC→Java 类型判定正本（步骤09 消冗余C）
+# 命名转换已下沉到 config.conversions（步骤09）；保留 _cobol_to_java_name 别名，下游(analyzer/dataflow)不破。
+from config.conversions import cobol_to_java_name as _cobol_to_java_name  # noqa: F401
 
 
 @dataclass
@@ -24,53 +23,13 @@ class JavaField:
     risk_note: str       # 高风险标注
 
 
-def _load_type_rules() -> list[dict]:
-    with open(CONFIG_DIR / "type_mappings.yaml", encoding="utf-8") as f:
-        cfg = yaml.safe_load(f)
-    return cfg.get("pic_rules", [])
-
-
-_TYPE_RULES: list[dict] = []
-
-
 def _get_java_type(pic: str, comp: str) -> str:
-    global _TYPE_RULES
-    if not _TYPE_RULES:
-        _TYPE_RULES = _load_type_rules()
+    """PIC→Java 标量类型：统一走 config.spec_loader.java_type_of（type_mappings.yaml 正本）。
 
-    pic_upper = pic.upper()
-    comp_upper = comp.upper()
-
-    # 带 COMP-3 的整数
-    if "COMP-3" in comp_upper or "COMP" in comp_upper:
-        if re.search(r"V9", pic_upper):
-            return "BigDecimal"
-        return "long"
-
-    # 有小数的数值
-    if re.search(r"V9", pic_upper):
-        return "BigDecimal"
-
-    # 字符类型
-    if pic_upper.startswith("X"):
-        return "String"
-
-    # 纯数字（估算位数）
-    m = re.search(r"9\((\d+)\)", pic_upper)
-    if m:
-        digits = int(m.group(1))
-        return "int" if digits <= 9 else "long"
-
-    if pic_upper.startswith("9"):
-        return "int"
-
-    return "String"
-
-
-def _cobol_to_java_name(cobol_name: str) -> str:
-    """WSAA-POLICY-NO → wsaaPolicyNo"""
-    parts = cobol_name.lower().replace("-", "_").split("_")
-    return parts[0] + "".join(p.capitalize() for p in parts[1:])
+    步骤09 消冗余C：原先此处硬编码 COMP/V9/X 分支、与 WSAA 渲染线（pic.py 走 pic_rules）
+    并行两套判定，存在漂移风险。现收口到同一正本，保证两线一致。
+    """
+    return spec_loader.java_type_of(pic, comp)
 
 
 def _make_field(var: Variable) -> JavaField:

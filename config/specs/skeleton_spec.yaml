@@ -1,0 +1,87 @@
+# config/skeleton_spec.yaml —— COBOL 骨架文法规范（正本，项目核心资产）
+#
+# 用途：把 COBOL 过程语法「格式化」成构造表 —— 段内块构造（IF/EVALUATE/PERFORM）的开块/头部边界/
+#       子区/闭合/对应 Java 骨架，外加段间控制流（GO TO/fall-through）的降级策略。
+#       translator.segmenter._Parser 是 block_grammar 的实现、translator.rules.build_section 是
+#       control_flow 的实现；代码服从本规范。引擎经 config.grammar_loader 取规范，不直读本文件。
+# 对应设计：docs/详细设计/步骤08-文法驱动骨架构建设计.md §3.1(b)。
+# 配套正本：config/segmentation_spec.yaml（物理切分：列模型 / 词法 / paragraph）。
+#
+# 原则：补 COBOL 语法 = 先在此加构造，再在实现补对应分支（config 先行、实现跟随）；不做读 yaml 的通用解释器。
+#
+# block_grammar 每条字段释义：
+#   id            —— 构造标识
+#   cobol         —— 该构造的 COBOL 语法形态
+#   meaning       —— 语义 + 切分要点（句点作用域、嵌套）
+#   trigger       —— 触发该构造的首关键字（_Parser 据此分派）
+#   opens_block   —— 是否开嵌套块
+#   header_until  —— 头部（条件/主语/循环头）收集到何类 token 停（verb/period/scope_terminator/具体词）
+#   regions       —— 子区名 → 该子区 parse_statements 的 stop 集（递归切块边界）
+#   closed_by     —— explicit: 显式终止符；implicit: period(句点) / none
+#   java_skeleton —— 对应 Java 骨架样式 id（实现侧据此渲染）
+#   sample        —— cobol → java 对照
+
+block_grammar:
+
+  - id: if
+    cobol: "IF cond [THEN] stmts... [ELSE stmts...] END-IF / ."
+    meaning: |
+      二分支。条件后可省略 THEN。then 区到 ELSE 或 END-IF 止；有 ELSE 则 else 区到 END-IF 止。
+      旧式无 END-IF 时由句点闭合，且一个句点可同时关掉多层嵌套 IF（句点作用域）。
+    trigger: IF
+    opens_block: true
+    header_until: [THEN, verb, period, scope_terminator]   # 条件 token 收集终点
+    regions:
+      then: [ELSE, END-IF]      # then 分支 stop 集（叠加外层 stop）
+      else: [END-IF]            # else 分支 stop 集
+    closed_by: { explicit: END-IF, implicit: period }
+    java_skeleton: if_else
+    sample:
+      - cobol: "IF WSAA-FOUND = 'Y' MOVE 1 TO WSAA-N ELSE MOVE 0 TO WSAA-N END-IF"
+        java:  'if (wsaaFound.equals("Y")) { wsaaN = 1; } else { wsaaN = 0; }'
+
+  - id: evaluate
+    cobol: "EVALUATE subject WHEN v1 stmts WHEN v2 stmts [WHEN OTHER stmts] END-EVALUATE"
+    meaning: |
+      多分支（含 EVALUATE TRUE 形态）。先收主语，再逐个 WHEN：每个 WHEN 收条件值、其后语句为该分支体。
+      WHEN OTHER 对应 default。各分支体到下一个 WHEN 或 END-EVALUATE 止。
+    trigger: EVALUATE
+    opens_block: true
+    header_until: [WHEN, END-EVALUATE, period]   # 主语收集终点
+    regions:
+      whens: [WHEN, END-EVALUATE]                # 每个 WHEN 体的 stop 集（重复区）
+    closed_by: { explicit: END-EVALUATE, implicit: period }
+    java_skeleton: switch
+    sample:
+      - cobol: "EVALUATE WSAA-CODE WHEN 'A' PERFORM 100-A WHEN OTHER CONTINUE END-EVALUATE"
+        java:  'switch (wsaaCode) { case "A": p100A(); break; default: break; }'
+
+  - id: perform
+    cobol: "PERFORM [para [THRU para2]] | PERFORM [VARYING..|UNTIL..|n TIMES] stmts END-PERFORM"
+    meaning: |
+      两形态：① out-of-line —— 头部为过程名(可带 THRU 范围)、无内联体 → 子程序调用；
+      ② inline —— 头部为循环子句(UNTIL/VARYING/TIMES)、其后语句为循环体到 END-PERFORM 止 → 循环。
+      头部遇到首个动词即认为内联体开始；遇句点/终止符/END-PERFORM 则无内联体。
+    trigger: PERFORM
+    opens_block: true
+    header_until: [verb, period, scope_terminator, END-PERFORM]   # 循环头/过程名收集终点
+    regions:
+      body: [END-PERFORM]        # 内联循环体 stop 集
+    closed_by: { explicit: END-PERFORM, implicit: none }
+    java_skeleton: loop_or_call  # 有 UNTIL/VARYING/TIMES → while/for；裸过程名 → method-call
+    sample:
+      - cobol: "PERFORM 2000-INIT THRU 2000-EXIT"
+        java:  "p2000Init();   // PERFORM 2000-INIT THRU 2000-EXIT"
+      - cobol: "PERFORM UNTIL WSAA-EOF = 'Y' READ ELPO-FILE END-PERFORM"
+        java:  'while (!wsaaEof.equals("Y")) { readElpoFile(); }'
+
+# ── 段间控制流降级策略（paragraph 级 CFG → 结构化/状态机，build_section 实现侧据此选路）──
+control_flow:
+  back_edge_to_state_machine: true   # 存在回跳 GO TO(目标段索引≤当前)→ FLOW:while(true)+switch(__pc)
+  fall_through: continue_next        # 段尾无 transfer(GO TO/EXIT/GOBACK) → 顺序流入下一段
+  flat_when_no_back_edge: true       # 无回跳 → 扁平拼接各段骨架 + `// paragraph <名>` 注释
+  idioms:                            # 可归约惯用式，优先于状态机降级（已有改写）
+    - id: begn_self_loop
+      cobol: "段内 CALL…BEGN…IF…GO TO 自身(NEXTR 取下一条)"
+      meaning: "BEGN+NEXTR 自跳读取循环 → 改写为 List + for-each，吸收 setFunction/跳出/NEXTR"
+      java_skeleton: foreach
