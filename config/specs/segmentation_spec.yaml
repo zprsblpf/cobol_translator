@@ -1,0 +1,33 @@
+# config/segmentation_spec.yaml —— COBOL 物理切分规范（正本）
+#
+# 用途：定义 COBOL 定列格式的「列模型 / 词法字典 / paragraph 标号模型」，是 segmenter / cobol_columns
+#       做行级清洗与 paragraph 切分的唯一依据。引擎经 config.grammar_loader 取规范，不直读本文件。
+# 对应设计：docs/详细设计/步骤08-文法驱动骨架构建设计.md §3.1(a)。
+# 配套正本：config/skeleton_spec.yaml（骨架文法：block_grammar / control_flow）。
+#
+# 原则：补/改物理切分规则只动本文件 + 实现跟随（config 先行、实现跟随），不在代码里塞魔数。
+
+# ── 列模型（COBOL 固定格式列区，1-based 列号；clean_line / Area 判定依据，去 6/72 魔数）──
+column_model:
+  indicator_col: 7              # 指示列：* / 注释、D 调试、- 续行、空 普通代码
+  area_a: { start: 8,  end: 11 }    # Area A：SECTION/paragraph 名、01/77 级
+  area_b: { start: 12, end: 72 }    # Area B：过程语句、子级数据项
+  clean_slice: { start: 7, end: 72 }  # clean_line 取此列段（保留指示列；7→0based 索引6）
+
+# ── 词法字典（驱动切分的关键字集合，从 segmenter 上提）──
+lexicon:
+  # 语句起始动词：用于切相邻无句点语句、判条件/头部结束
+  verbs: [MOVE, COMPUTE, ADD, SUBTRACT, MULTIPLY, DIVIDE, PERFORM, GO, IF, EVALUATE,
+          CALL, SET, INITIALIZE, STRING, UNSTRING, ACCEPT, DISPLAY, OPEN, CLOSE,
+          READ, WRITE, REWRITE, DELETE, START, CONTINUE, NEXT, EXIT, STOP, GOBACK,
+          RETURN, SEARCH, INSPECT]
+  # 块作用域关键字：标记块边界（递归切块的 stop 集来源）
+  scope_terminators: [END-IF, END-PERFORM, END-EVALUATE, ELSE, WHEN, THEN]
+  # PERFORM 头部允许的内联循环关键字（这些不算「过程名」）
+  perform_keywords: [VARYING, UNTIL, WITH, TEST, BEFORE, AFTER, TIMES, THRU, THROUGH, FROM, BY]
+
+# ── paragraph 标号模型（标号识别，修 Bug 1 的依据）──
+paragraph_model:
+  area: area_a                    # 标号必在 Area A；据列模型与 Area B 语句区分
+  pattern: '^([A-Za-z0-9][A-Za-z0-9-]*)\.\s*$'   # 单 token + 句点，如 "2071-CALL-PS01."
+  exclude: [verbs, scope_terminators]            # EXIT./CONTINUE./ELSE. 等不是标号

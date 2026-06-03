@@ -73,16 +73,11 @@ def cmd_translate_section(cob_file: str, section_name: str, output_dir: str):
         for s in prog.sections
     ]
 
-    # 构建 IO 上下文
-    import yaml
-    config_dir = Path(__file__).parent / "config"
-    with open(config_dir / "io_mappings.yaml") as f:
-        io_cfg = yaml.safe_load(f)
-
-    # 与全量路径一致：派生范式做基底 + io_programs 增量覆盖（resolve_io_info）
+    # 构建 IO 上下文（步骤09：经访问层取，不再直读 io_mappings.yaml）
+    from config import spec_loader
     from translator.rules import resolve_io_info
-    all_io = {**io_cfg.get("io_programs", {}), **io_cfg.get("io_programs2", {})}
-    io_pattern = io_cfg.get("io_default_pattern", {})
+    all_io = spec_loader.io_programs()
+    io_pattern = spec_loader.io_default_pattern()
     io_lines = []
     for call in sec.calls:
         info = resolve_io_info(call, all_io, io_pattern)

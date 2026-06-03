@@ -15,10 +15,8 @@
 from __future__ import annotations
 
 import re
-from pathlib import Path
 
-import yaml
-
+from config import spec_loader   # IO 映射访问层（步骤09：不再直读 io_mappings.yaml）
 from parser.variable_resolver import resolve, build_field_type_map
 from translator import rules as _rules
 from translator.naming import build_struct_registry
@@ -26,21 +24,14 @@ from translator.postprocess import fix_array_subscripts, _prefix_fields_outside_
 from translator.skeleton import _section_to_method
 from translator.segmenter import segment, split_paragraphs
 
-CONFIG_DIR = Path(__file__).parent.parent.parent / "config"
-
 
 def _load_io_maps() -> dict:
-    """载 config/io_mappings.yaml 并合并 io_programs(+io_programs2)/date/system/default（同 context.py）。"""
-    try:
-        with open(CONFIG_DIR / "io_mappings.yaml", encoding="utf-8") as f:
-            cfg = yaml.safe_load(f) or {}
-    except FileNotFoundError:
-        cfg = {}
+    """组装 io_maps（io_programs 已合并 io_programs2；同 context.py 形态）。经访问层取，不直读 yaml。"""
     return {
-        "io_programs": {**cfg.get("io_programs", {}), **cfg.get("io_programs2", {})},
-        "date_programs": cfg.get("date_programs", {}),
-        "system_programs": cfg.get("system_programs", {}),
-        "io_default_pattern": cfg.get("io_default_pattern", {}),
+        "io_programs": spec_loader.io_programs(),
+        "date_programs": spec_loader.date_programs(),
+        "system_programs": spec_loader.system_programs(),
+        "io_default_pattern": spec_loader.io_default_pattern(),
     }
 
 

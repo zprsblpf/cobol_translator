@@ -7,21 +7,9 @@
 from __future__ import annotations
 
 import re
-from pathlib import Path
 
-import yaml
-
+from config.yaml_cache import load as _load_yaml   # 唯一 YAML 加载入口（步骤09）
 from translator import rules as _rules
-
-CONFIG_DIR = Path(__file__).parent.parent / "config"
-
-
-def _load_yaml(name: str) -> dict:
-    try:
-        with open(CONFIG_DIR / name, encoding="utf-8") as f:
-            return yaml.safe_load(f) or {}
-    except FileNotFoundError:
-        return {}
 
 
 def build_struct_registry(state: dict) -> dict:

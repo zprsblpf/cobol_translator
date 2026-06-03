@@ -14,6 +14,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field as dc_field
 
+from config import grammar_loader               # 控制流降级策略正本（步骤08）
 from translator.segmenter import Stmt
 
 
@@ -179,6 +180,18 @@ def _operand(tok: str, ctx: Ctx) -> str:
     return _java(tok)
 
 
+def _lvalue(dst: str, ctx: Ctx) -> str:
+    """赋值左值（MOVE/SET/COMPUTE 的目标）→ Java 左值表达式。
+
+    照 wsaa_translation_spec.procedure_semantics.assignment_target：目标语义上必为字段，
+    绝不退化为字符串字面量。下标/引用修改目标复用 _operand 解析；裸词（含未登记字段）→
+    _field_base（camelCase 标识符），修 Bug 2：`"WSAA-A65086" = ""` → `wsaaA65086 = ""`。
+    """
+    if re.match(r"^[A-Za-z0-9\-]+\(", dst):     # X(IX) 下标 / X(s:l) 引用修改 → 同 RHS 解析
+        return _operand(dst, ctx)
+    return _field_base(dst)                      # 裸字段目标：必为字段，不退化字面量
+
+
 def _assign(dst: str, val: str, ctx: Ctx) -> str:
     """生成赋值语句：结构体字段走 setter，结构体整体走 new，普通字段走 = 。"""
     sp = _struct_prefix(dst, ctx)
@@ -189,7 +202,7 @@ def _assign(dst: str, val: str, ctx: Ctx) -> str:
                 return f"{_struct_obj(pre, ctx)} = new {_struct_cls(pre, ctx)}();"  # MOVE SPACES/INITIALIZE 重置
             return f"{_struct_obj(pre, ctx)} = {val};"                                # MOVE 结构体→结构体 拷贝
         return f"{_struct_obj(pre, ctx)}.{ctx.struct_setter}{_pascal(rest)}({val});"
-    return f"{_operand(dst, ctx)} = {val};"
+    return f"{_lvalue(dst, ctx)} = {val};"                                            # 左值必为字段（Bug 2）
 
 
 # ── 条件翻译 ──────────────────────────────────────────────────────────────────
@@ -683,7 +696,8 @@ def build_section(paras: list[tuple], ctx: Ctx, indent: int = 0) -> list[str]:
         if has_back_edge:
             break
 
-    if not has_back_edge:
+    # 控制流降级策略取自正本：无回跳、或正本关闭状态机降级 → 扁平拼接（默认开，行为不变）
+    if not has_back_edge or not grammar_loader.back_edge_state_machine():
         ctx.flow_label = None
         ctx.flow_paragraphs = set()
         out: list[str] = []
@@ -1132,12 +1146,12 @@ def _t_add(toks: list[str], ctx: Ctx) -> tuple[list[str], bool]:
         b = rest[gi - 1]
         c = rest[gi + 1]
         if _is_bigdecimal(c, ctx):
-            return [f"{_operand(c, ctx)} = {_operand(b, ctx)}.add({_arith_val(c, _operand(a, ctx), ctx)});"], True
-        return [f"{_operand(c, ctx)} = {_operand(b, ctx)} + {_operand(a, ctx)};"], True
+            return [f"{_lvalue(c, ctx)} = {_operand(b, ctx)}.add({_arith_val(c, _operand(a, ctx), ctx)});"], True
+        return [f"{_lvalue(c, ctx)} = {_operand(b, ctx)} + {_operand(a, ctx)};"], True
     b = rest[0]
     if _is_bigdecimal(b, ctx):
-        return [f"{_operand(b, ctx)} = {_operand(b, ctx)}.add({_arith_val(b, _operand(a, ctx), ctx)});"], True
-    return [f"{_operand(b, ctx)} += {_operand(a, ctx)};"], True
+        return [f"{_lvalue(b, ctx)} = {_operand(b, ctx)}.add({_arith_val(b, _operand(a, ctx), ctx)});"], True
+    return [f"{_lvalue(b, ctx)} += {_operand(a, ctx)};"], True
 
 
 def _t_subtract(toks: list[str], ctx: Ctx) -> tuple[list[str], bool]:
@@ -1157,12 +1171,12 @@ def _t_subtract(toks: list[str], ctx: Ctx) -> tuple[list[str], bool]:
         b = rest[gi - 1]
         c = rest[gi + 1]
         if _is_bigdecimal(c, ctx):
-            return [f"{_operand(c, ctx)} = {_operand(b, ctx)}.subtract({_arith_val(c, _operand(a, ctx), ctx)});"], True
-        return [f"{_operand(c, ctx)} = {_operand(b, ctx)} - {_operand(a, ctx)};"], True
+            return [f"{_lvalue(c, ctx)} = {_operand(b, ctx)}.subtract({_arith_val(c, _operand(a, ctx), ctx)});"], True
+        return [f"{_lvalue(c, ctx)} = {_operand(b, ctx)} - {_operand(a, ctx)};"], True
     b = rest[0]
     if _is_bigdecimal(b, ctx):
-        return [f"{_operand(b, ctx)} = {_operand(b, ctx)}.subtract({_arith_val(b, _operand(a, ctx), ctx)});"], True
-    return [f"{_operand(b, ctx)} -= {_operand(a, ctx)};"], True
+        return [f"{_lvalue(b, ctx)} = {_operand(b, ctx)}.subtract({_arith_val(b, _operand(a, ctx), ctx)});"], True
+    return [f"{_lvalue(b, ctx)} -= {_operand(a, ctx)};"], True
 
 
 def _t_multiply(toks: list[str], ctx: Ctx) -> tuple[list[str], bool]:
@@ -1184,8 +1198,8 @@ def _t_multiply(toks: list[str], ctx: Ctx) -> tuple[list[str], bool]:
     else:
         b = c = rest[0]
     if _is_bigdecimal(c, ctx):
-        return [f"{_operand(c, ctx)} = {_operand(b, ctx)}.multiply({_arith_val(c, _operand(a, ctx), ctx)});"], True
-    return [f"{_operand(c, ctx)} = {_operand(b, ctx)} * {_operand(a, ctx)};"], True
+        return [f"{_lvalue(c, ctx)} = {_operand(b, ctx)}.multiply({_arith_val(c, _operand(a, ctx), ctx)});"], True
+    return [f"{_lvalue(c, ctx)} = {_operand(b, ctx)} * {_operand(a, ctx)};"], True
 
 
 def _t_divide(toks: list[str], ctx: Ctx) -> tuple[list[str], bool]:
@@ -1212,8 +1226,8 @@ def _t_divide(toks: list[str], ctx: Ctx) -> tuple[list[str], bool]:
             c = dividend
         if _is_bigdecimal(c, ctx):
             scale = "2" if rounded else "2"
-            return [f"{_operand(c, ctx)} = {_operand(dividend, ctx)}.divide({_operand(divisor, ctx)}, {scale}, RoundingMode.HALF_UP);"], True
-        return [f"{_operand(c, ctx)} = {_operand(dividend, ctx)} / {_operand(divisor, ctx)};"], True
+            return [f"{_lvalue(c, ctx)} = {_operand(dividend, ctx)}.divide({_operand(divisor, ctx)}, {scale}, RoundingMode.HALF_UP);"], True
+        return [f"{_lvalue(c, ctx)} = {_operand(dividend, ctx)} / {_operand(divisor, ctx)};"], True
     else:
         return [], False
     # INTO 形式
@@ -1221,8 +1235,8 @@ def _t_divide(toks: list[str], ctx: Ctx) -> tuple[list[str], bool]:
     b = rest[0]
     c = rest[ru.index("GIVING") + 1] if "GIVING" in ru else b
     if _is_bigdecimal(c, ctx):
-        return [f"{_operand(c, ctx)} = {_operand(b, ctx)}.divide({_operand(divisor, ctx)}, 2, RoundingMode.HALF_UP);"], True
-    return [f"{_operand(c, ctx)} = {_operand(b, ctx)} / {_operand(divisor, ctx)};"], True
+        return [f"{_lvalue(c, ctx)} = {_operand(b, ctx)}.divide({_operand(divisor, ctx)}, 2, RoundingMode.HALF_UP);"], True
+    return [f"{_lvalue(c, ctx)} = {_operand(b, ctx)} / {_operand(divisor, ctx)};"], True
 
 
 def _t_compute(toks: list[str], ctx: Ctx) -> tuple[list[str], bool]:
@@ -1244,4 +1258,4 @@ def _t_compute(toks: list[str], ctx: Ctx) -> tuple[list[str], bool]:
             parts.append(t)
         else:
             parts.append(_operand(t, ctx))
-    return [f"{_operand(dst, ctx)} = {' '.join(parts)};"], True
+    return [f"{_lvalue(dst, ctx)} = {' '.join(parts)};"], True

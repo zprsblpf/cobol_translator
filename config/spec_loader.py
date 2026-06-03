@@ -4,7 +4,8 @@ config.spec_loader —— 规范访问层（步骤05 §6.1）。
 用途：集中加载翻译规范三件套并对外提供查询，骨架引擎与 WS 渲染引擎**都经本层取规范**，
       不直接读 yaml（加类型/构造尽量只改 config、不改引擎）。
 对应设计：docs/详细设计/步骤05-cob到Java翻译引擎详细设计.md。
-规范正本：config/wsaa_translation_spec.yaml；配套：type_mappings.yaml / naming_conventions.yaml / copy_mappings.yaml。
+规范正本：config/specs/wsaa_translation_spec.yaml；配套：config/mappings/{type,naming_conventions,copy,io}_mappings.yaml。
+      （步骤09：yaml 加载统一经 config.yaml_cache，按裸文件名自动解析 specs/ 与 mappings/ 子目录。）
 
 用法：
   from config import spec_loader
@@ -18,15 +19,9 @@ config.spec_loader —— 规范访问层（步骤05 §6.1）。
 from __future__ import annotations
 
 import re
-from functools import lru_cache
-from pathlib import Path
 
-import yaml
-
-from parser.variable_resolver import _cobol_to_java_name   # 复用命名（§6.1）
-from parser.ws.value import java_init                       # 复用 VALUE→Java 初值
-
-_CONFIG_DIR = Path(__file__).parent
+from config.conversions import cobol_to_java_name, java_init   # 纯转换函数（步骤09 下沉至 config）
+from config.yaml_cache import load as _load                    # 唯一 YAML 加载入口（步骤09）
 
 # 无 VALUE 时按 java_type 的初值（查表型，与步骤03 render_field 原 _DEFAULTS 一致，保证回归不变）
 _DEFAULTS = {"String": '""', "int": "0", "long": "0",
@@ -34,13 +29,6 @@ _DEFAULTS = {"String": '""', "int": "0", "long": "0",
 
 # Java 语句样式串集中为格式常量（§5：避免散落在各 render 函数硬编码）
 FIELD_DECL = "    private {type} {name} = {init};{comment}"
-
-
-@lru_cache(maxsize=None)
-def _load(name: str) -> dict:
-    """加载并缓存一个 config yaml。"""
-    with open(_CONFIG_DIR / name, encoding="utf-8") as f:
-        return yaml.safe_load(f) or {}
 
 
 # ── 标量类型 / 初值（查表型）────────────────────────────────────────────────
@@ -78,7 +66,7 @@ def init_of(node) -> str:
 
 def field_name(cobol: str) -> str:
     """COBOL 名 → Java 小驼峰字段名（WSAA-PROG → wsaaProg）。"""
-    return _cobol_to_java_name(cobol)
+    return cobol_to_java_name(cobol)
 
 
 def class_name(program: str) -> str:
@@ -123,3 +111,26 @@ def service_class(name: str) -> str:
 def service_field(name: str) -> str:
     """服务 COPY → 服务字段名（约定 camelCase(名)+Service）。"""
     return field_name(name) + "Service"
+
+
+# ── IO 子程序映射（CALL 'xxxIO'→Repository；收编 io_mappings.yaml 直读，§4.3）────────
+
+def io_default_pattern() -> dict:
+    """*IO 查表派生范式（class_suffix / operations 等），供 resolve_io_info 派生。"""
+    return _load("io_mappings.yaml").get("io_default_pattern", {})
+
+
+def io_programs() -> dict:
+    """IO 程序非标准覆盖项；已合并旧缩进兼容键 io_programs2（与 context.py 合并逻辑一致）。"""
+    cfg = _load("io_mappings.yaml")
+    return {**cfg.get("io_programs", {}), **cfg.get("io_programs2", {})}
+
+
+def date_programs() -> dict:
+    """日期转换子程序（非 *IO）→ 工具类方法映射。"""
+    return _load("io_mappings.yaml").get("date_programs", {})
+
+
+def system_programs() -> dict:
+    """系统程序（非 *IO，如 SYSERR）→ Java 代码/服务映射。"""
+    return _load("io_mappings.yaml").get("system_programs", {})

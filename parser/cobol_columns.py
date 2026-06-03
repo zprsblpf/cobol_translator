@@ -38,11 +38,15 @@ def indicator(raw: str) -> str:
 
 
 def clean_line(raw: str) -> str:
-    """取第7–72列（指示列+代码区），去行尾变更标记并 rstrip。
+    """取 clean_slice 列段（指示列+代码区），去行尾变更标记并 rstrip。
 
+    列区取自切分文法正本 column_model.clean_slice（步骤08 去 6/72 魔数；默认 7–72 列）。
     保留指示列：注释行据此可识别（以 * / 开头）；代码异常起于第7列时首字母不丢。
     """
-    seg = raw[6:72] if len(raw) > 72 else raw[6:]
+    from config import grammar_loader   # 延迟导入，避免 parser 加载期任何环依赖
+    cs = grammar_loader.column_model()["clean_slice"]
+    lo, hi = cs["start"] - 1, cs["end"]          # 1-based 列号 → 0-based 切片
+    seg = raw[lo:hi] if len(raw) > hi else raw[lo:]
     seg = seg.rstrip("\n").rstrip("\r")
     seg = _CHANGE_TAG_RE.sub("", seg)
     return seg.rstrip()

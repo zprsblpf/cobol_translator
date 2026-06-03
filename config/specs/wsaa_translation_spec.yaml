@@ -364,3 +364,18 @@ assumptions:
     text: "有符号 DISPLAY 数值（S9..）存储串取绝对值零填充，不建模负号 overpunch（语义为日期/金额，恒非负）。"
   - id: cobol_move_align
     text: "定宽串超宽高位截断、不足右补空格 / 高位补 0（对齐 COBOL MOVE 截断语义）。"
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# 六、过程语义（PROCEDURE DIVISION 翻译规则；步骤08 起逐步补充）
+# ═════════════════════════════════════════════════════════════════════════
+procedure_semantics:
+  - id: assignment_target
+    cobol: "MOVE x TO y / SET y / COMPUTE y = ... 等赋值语句的目标 y"
+    rule: |
+      赋值左值（目标）语义上必为「字段」，绝不可能是字符串字面量——即便该字段未登记进
+      field_type_map（拷贝簿未上盘等），也按命名规则渲染为 camelCase Java 标识符，不退化为字面量。
+      注：本规则只约束「赋值左值」；右值(RHS)裸词在非字段时仍可为字面量(如 O-K / 88 条件值)，不受影响。
+    sample:
+      - { cobol: "MOVE SPACES TO WSAA-A65086",  java: 'wsaaA65086 = "";' }
+      - { cobol: "SET WSAA-IX TO 1",            java: "wsaaIx = 1;" }

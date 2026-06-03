@@ -10,24 +10,15 @@
 """
 from __future__ import annotations
 
-from pathlib import Path
-
-import yaml
-
+from config.yaml_cache import load as _load_yaml   # 唯一 YAML 加载入口（步骤09）
 from parser.ws.model import WsNode
 from parser.ws import entry as _entry
 from parser.ws import conditions as _cond
 from parser.ws import pic as _pic
 
-_CONFIG = Path(__file__).parent.parent.parent / "config" / "type_mappings.yaml"
-
 
 def _type_rules() -> list[dict]:
-    try:
-        with open(_CONFIG, encoding="utf-8") as f:
-            return (yaml.safe_load(f) or {}).get("pic_rules", [])
-    except FileNotFoundError:
-        return []
+    return _load_yaml("type_mappings.yaml").get("pic_rules", [])
 
 
 def build_tree(entries: list[str]) -> list[WsNode]:
