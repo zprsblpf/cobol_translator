@@ -200,15 +200,13 @@ class TestIoCallAndStructAssign(unittest.TestCase):
         self.assertTrue(matched)
         self.assertEqual(lines, ["elpoParams = elpoRepository.findByKey(elpoParams);"])
 
-    def test_io_call_runtime_dispatch(self):
-        """功能码静态拿不到 → 运行时分发 execute(obj.getFunction(), obj)。"""
+    def test_io_call_no_func_falls_to_llm(self):
+        """决策 D（步骤10）：功能码恒为 CALL 前显性字面量，原 execute() 运行时分发是死代码已移除。
+        叶子级散点 CALL 若功能码不在 operations（游标/未知）→ matched=False，交 LLM。"""
         ctx = self._ctx()  # struct_function 为空
         lines, matched = self.rules.translate_leaf(
             self._leaf("CALL 'ELPOIO' USING ELPO-PARAMS"), ctx)
-        self.assertTrue(matched)
-        self.assertEqual(
-            lines,
-            ["elpoParams = elpoRepository.execute(elpoParams.getFunction(), elpoParams);"])
+        self.assertFalse(matched)
 
     def test_io_call_unmapped_falls_to_llm(self):
         """未映射的 IO 子程序 → matched=False，交 LLM。"""
@@ -224,12 +222,14 @@ class TestIoCallAndStructAssign(unittest.TestCase):
         self.assertEqual(ctx.struct_function.get("ELPO"), "READR")
 
     def test_move_struct_to_struct_is_copy(self):
-        """MOVE 结构体→结构体 是拷贝赋值，不是 new（修复的 bug）。"""
+        """决策 C（步骤10）：MOVE xxx-PARAMS TO yyy-PARAMS → 同名字段互拷，
+        以 BeanUtils.copyProperties 实现（名字对不上的自动忽略，无需拷贝簿字段表）；
+        不再退化成引用别名 sysrParams = elpoParams（§2 违规#6，编译不过）。"""
         ctx = self._ctx()
         lines, matched = self.rules.translate_leaf(
             self._leaf("MOVE ELPO-PARAMS TO SYSR-PARAMS"), ctx)
         self.assertTrue(matched)
-        self.assertEqual(lines, ["sysrParams = elpoParams;"])
+        self.assertEqual(lines, ["BeanUtils.copyProperties(elpoParams, sysrParams);"])
 
     def test_move_spaces_to_struct_is_reset(self):
         """MOVE SPACES→结构体 仍是 new 重置。"""
@@ -262,6 +262,85 @@ class TestIoCallAndStructAssign(unittest.TestCase):
             if not matched:
                 unmatched.append(leaf.raw or " ".join(leaf.tokens))
         self.assertEqual(unmatched, [], f"以下叶子未被固化、会交 LLM: {unmatched}")
+
+    # ── 步骤10：单条读 READR 结构化吸收（setup+CALL+IF STATUZ → findBy…Readr + null 检查）──
+    def _readr_ctx(self, **kw):
+        """带完整 io_default_pattern（READR 模板含 findBy → 识别为单条读）的 ctx；
+        清空 io_programs，让被测表走范式派生（field_name=<base>Repository，finder 按键派生）。"""
+        return self._ctx(
+            io_programs={},
+            io_default_pattern={
+                "class_suffix": "Repository", "field_suffix": "Repository",
+                "param_struct_suffix": "-PARAMS", "import_package": "com.example.repository",
+                "operations": {"READR": "findByKeyReadr({key})", "UPDAT": "save({entity})"}},
+            **kw)
+
+    def _build(self, ctx, sec_lines):
+        from translator.segmenter import segment, split_paragraphs
+        paras = [(lbl, segment(body)) for lbl, body in split_paragraphs(sec_lines)]
+        return "\n".join(self.rules.build_section(paras, ctx))
+
+    def test_readr_single_absorbed_ok_form(self):
+        """READR + IF STATUZ = O-K → `Rec r = repo.findBy…Readr(键); if (r != null) {…}`，
+        FUNCTION/FORMAT/SPACES/STATUZ 全吸收（§2 的 6 项违规清零）。"""
+        ctx = self._readr_ctx(
+            io_struct_prefixes={"ELPO"},
+            field_type_map={n: {"type": "String"} for n in
+                            ("wsaaCompany", "wsaaLanguage", "wsaaData")})
+        skel = self._build(ctx, [
+            "1510-START.",
+            "           MOVE SPACES         TO ELPO-PARAMS.",
+            "           MOVE WSAA-COMPANY   TO ELPO-CHDRCOY.",
+            "           MOVE WSAA-LANGUAGE  TO ELPO-CHDRNUM.",
+            "           MOVE ELPOREC        TO ELPO-FORMAT.",
+            "           MOVE READR          TO ELPO-FUNCTION.",
+            "           CALL 'ELPOIO'   USING ELPO-PARAMS.",
+            "           IF ELPO-STATUZ = O-K",
+            "              MOVE ELPO-DATA TO WSAA-DATA",
+            "           END-IF.",
+            "1590-EXIT.",
+            "           EXIT.",
+        ])
+        self.assertIn(
+            "ElpoRecord elpo = elpoRepository.findByChdrcoyAndChdrnumReadr("
+            "wsaaCompany, wsaaLanguage);", skel)
+        self.assertIn("if (elpo != null) {", skel)
+        for leak in ("setFunction", "setFormat", "new ElpoParams", "getStatuz",
+                     ".execute(", "findByKey(elpoParams"):
+            self.assertNotIn(leak, skel, f"残留泄漏: {leak}\n{skel}")
+        # 叶子全部命中 + 体内 ELPO-DATA 重绑定到 record
+        body = [self.rules.translate_leaf(lf, ctx)[0]
+                for _i, lf in ctx.leaves if lf.tokens and lf.tokens[0].upper() == "MOVE"]
+        self.assertIn(["wsaaData = elpo.getData();"], body)
+
+    def test_readr_single_absorbed_error_form(self):
+        """决策 A：IF STATUZ NOT=O-K AND NOT=ENDP（PERFORM 580）→ try{finder+后续} catch{580}。"""
+        ctx = self._readr_ctx(
+            io_struct_prefixes={"ITDM"},
+            known_sections={"580-DB-ERROR"},
+            section_to_method=lambda s: "dbError580",
+            field_type_map={n: {"type": "String"} for n in ("wsaaItem", "wsaaValue")})
+        skel = self._build(ctx, [
+            "2000-READ.",
+            "           MOVE SPACES   TO ITDM-PARAMS.",
+            "           MOVE WSAA-ITEM TO ITDM-ITEMKEY.",
+            "           MOVE READR    TO ITDM-FUNCTION.",
+            "           CALL 'ITDMIO' USING ITDM-PARAMS.",
+            "           IF ITDM-STATUZ NOT = O-K AND ITDM-STATUZ NOT = ENDP",
+            "              PERFORM 580-DB-ERROR",
+            "           END-IF.",
+            "           MOVE ITDM-VALUE TO WSAA-VALUE.",
+            "2090-EXIT.",
+            "           EXIT.",
+        ])
+        self.assertIn("try {", skel)
+        self.assertIn("ItdmRecord itdm = itdmRepository.findByItemkeyReadr(wsaaItem);", skel)
+        self.assertIn("} catch (Exception e) {", skel)
+        self.assertNotIn("getStatuz", skel)
+        # try 体内 ITDM-VALUE 重绑定到 record
+        body = [self.rules.translate_leaf(lf, ctx)[0]
+                for _i, lf in ctx.leaves if lf.tokens and lf.tokens[0].upper() == "MOVE"]
+        self.assertIn(["wsaaValue = itdm.getValue();"], body)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
