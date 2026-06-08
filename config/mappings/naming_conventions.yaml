@@ -21,5 +21,14 @@ struct_access:
   setter_prefix: set      # 字段写入访问器前缀
   default_class_suffix: Params   # copy_mappings 未显式配置类名时，结构体 Java 类后缀
 
+# 命名碰撞消歧（步骤12 §4）：COBOL 允许不同组下同名字段（靠 OF/IN 限定），扁平进同一容器类
+# 会 camelCase 撞名。策略 = 首个保基名（引用不破），其后撞名者用「父组名前缀」改名保留并标 TODO，
+# 绝不静默丢字段。仅对真正撞名的字段消歧（N-2：最小改动）。当前由 render_class._disambiguate 实现固化此范式。
+collision_policy:
+  strategy: parent_prefix        # parentJn + Pascal(jn)，如 wsaaGroupA + wsaaX → wsaaGroupAWsaaX
+  fallback: ordinal_suffix       # 父前缀仍冲突 → jn_2 / jn_3 … 兜底唯一
+  keep_first_as_base: true       # 首个占基名，引用按基名仍可解析
+  emit_todo: true                # 改名处标 TODO：若实为不同字段，引用需按 OF/IN 人工核对
+
 # 命名常量（无上述后缀的拷贝簿，如 VARCOM 定义的状态/功能码）保持为字符串字面量，
 # 不在此列出——凡不匹配 copybook_suffixes 的前缀即按常量处理。

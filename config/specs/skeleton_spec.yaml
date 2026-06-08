@@ -69,9 +69,17 @@ block_grammar:
       body: [END-PERFORM]        # 内联循环体 stop 集
     closed_by: { explicit: END-PERFORM, implicit: none }
     java_skeleton: loop_or_call  # 有 UNTIL/VARYING/TIMES → while/for；裸过程名 → method-call
+    # PERFORM A THRU B 范围语义（步骤12 §2 正本；rules._perform_range 实现跟随）：
+    #   COBOL THRU = 顺序执行「源码中从段 A 到段 B 之间的全部段」。绝不能只译 A 而丢中间段。
+    thru:
+      single_unit:   "A 与 B 同段（B 即 A 的 EXIT 哨兵，区间内仅 1 段）→ 单调用 pA();"
+      cross_section: "A、B 均为已知 SECTION 且 B 在 A 之后 → 按全程序段顺序展开区间内每段调用 pA();pMid();…;pB();（不丢中间段）"
+      unresolved:    "端点非已知 SECTION（paragraph 级）或区间无法确定 → 退化 pA() + // TODO 人工核对（不臆测中间段）"
     sample:
-      - cobol: "PERFORM 2000-INIT THRU 2000-EXIT"
-        java:  "p2000Init();   // PERFORM 2000-INIT THRU 2000-EXIT"
+      - cobol: "PERFORM 2000-INIT THRU 2000-INIT-EXIT   (区间仅本段)"
+        java:  "p2000Init();"
+      - cobol: "PERFORM 1000-A THRU 3000-C   (跨段：A→B→C 三段)"
+        java:  "p1000A(); p2000B(); p3000C();   // PERFORM 1000-A THRU 3000-C（展开 3 段）"
       - cobol: "PERFORM UNTIL WSAA-EOF = 'Y' READ ELPO-FILE END-PERFORM"
         java:  'while (!wsaaEof.equals("Y")) { readElpoFile(); }'
 

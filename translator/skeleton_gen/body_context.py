@@ -51,6 +51,7 @@ def build_body_ctx(program) -> tuple[_rules.Ctx, list[str]]:
         field_type_map=field_type_map,
         section_to_method=_section_to_method,
         known_sections={s.name.upper() for s in program.sections},
+        section_order=[s.name.upper() for s in program.sections],
         io_struct_prefixes=reg["prefixes"], struct_objects=reg["objects"],
         struct_classes=reg["classes"], struct_getter=reg["getter"],
         struct_setter=reg["setter"], struct_default_suffix=reg["default_suffix"],

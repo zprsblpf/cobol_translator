@@ -166,7 +166,7 @@ def render_redefines(node: WsNode, name_index: dict, view_groups: set[str],
         return _todo_plain(node, f"REDEFINES {node.redefines}: 目标含 OCCURS/编辑型/COMP-3 "
                                  f"或嵌套组，定宽视图不适用，需人工核对")
     read, wf, W = acc
-    out = [f"    // ── REDEFINES {node.name} → 视图 over {node.redefines}（双向同步；数值假设 A1 取绝对值）──"]
+    out = [f"    // ── REDEFINES {node.name} → 视图 over {node.redefines}（双向同步；有符号数值末位 overpunch 保号，步骤12 §1）──"]
     if not node.is_group:
         return out + _scalar_view(node, read, wf, W)
     off = 0

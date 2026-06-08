@@ -162,6 +162,46 @@ class TestSectionToMethod(unittest.TestCase):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# 3a2. PERFORM A THRU B 跨段不丢中间段（步骤12 §2）
+#     Bug：旧实现只取 header[0] 当过程名，THRU B 被忽略 → 跨多段时丢中间段。
+# ══════════════════════════════════════════════════════════════════════════════
+class TestPerformThru(unittest.TestCase):
+    def _ctx(self, order):
+        import translator.rules as r
+        return r.Ctx(field_type_map={}, section_to_method=lambda s: "p_" + s.replace("-", "").lower(),
+                     known_sections=set(order), section_order=list(order))
+
+    def _range(self, header, order):
+        import translator.rules as r
+        hu = [h.upper() for h in header]
+        return r._perform_range(header, hu, header[0].upper(), self._ctx(order), 0)
+
+    def test_thru_spans_sections_expanded(self):
+        """A THRU B 跨段 → 区间内每段都生成调用，不丢中间段 C。"""
+        order = ["A-SEC", "C-SEC", "B-SEC"]
+        out = "\n".join(self._range(["A-SEC", "THRU", "B-SEC"], order))
+        self.assertIn("p_asec();", out)
+        self.assertIn("p_csec();", out)   # 中间段不可丢
+        self.assertIn("p_bsec();", out)
+
+    def test_thru_single_unit_one_call(self):
+        """A THRU B 相邻且 B 紧接（A==B 或仅一段）→ 单调用，不啰嗦。"""
+        out = self._range(["A-SEC", "THRU", "A-SEC"], ["A-SEC", "B-SEC"])
+        self.assertEqual([l for l in out if "p_" in l], ["this.p_asec();"])
+
+    def test_thru_unknown_endpoint_todo(self):
+        """端点非已知 SECTION（paragraph 级）→ 退化 TODO + pA()，不臆测、不静默丢。"""
+        out = "\n".join(self._range(["2000-INIT", "THRU", "2000-EXIT"], ["2000-INIT"]))
+        self.assertIn("TODO", out)
+        self.assertIn("p_2000init();", out)
+
+    def test_no_thru_single_call_unchanged(self):
+        """无 THRU → 单调用，历史行为不变。"""
+        out = self._range(["A-SEC"], ["A-SEC", "B-SEC"])
+        self.assertEqual(out, ["this.p_asec();"])
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # 3b. IO 调用固化：_t_call（CALL 'xxxIO'）+ 结构体拷贝/重置（_assign）
 #     固化 IO 查询，把 BEGN/READR/NEXTR/UPDAT 从 LLM 收回确定性规则。
 # ══════════════════════════════════════════════════════════════════════════════
@@ -424,6 +464,90 @@ class TestIoCallAndStructAssign(unittest.TestCase):
         ])
         self.assertIn("tmlclstRepository.delete(tmlclst);", skel)
         self.assertNotIn("deleteByKey", skel)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 3b. 有符号 DISPLAY 存储串保符号（步骤12 §1，overpunch-on-negative）
+#     Bug：旧实现 _toDigits 无条件 .abs()，负金额经 REDEFINES/组切片 round-trip 后静默变正。
+# ══════════════════════════════════════════════════════════════════════════════
+class TestSignedOverpunch(unittest.TestCase):
+    _OVP = "}JKLMNOPQR"  # 须与 storage.NUM_HELPER 的 _OVP 一致
+
+    def _to_digits(self, val: int, n: int) -> str:
+        """镜像 Java _toDigits（scale=0 整数）：保符号 overpunch 编码。"""
+        neg = val < 0
+        s = str(abs(val))
+        if len(s) > n:
+            s = s[len(s) - n:]
+        s = s.rjust(n, "0")
+        if neg and s:
+            s = s[:-1] + self._OVP[int(s[-1])]
+        return s
+
+    def _de_overpunch(self, s: str) -> int:
+        """镜像 Java _deOverpunch + parse：解码 overpunch 还原带符号整数。"""
+        idx = self._OVP.find(s[-1])
+        if idx >= 0:
+            return -int(s[:-1] + str(idx))
+        return int(s)
+
+    def test_negative_round_trip(self):
+        """负值经 _toDigits → _deOverpunch 必须原样还原（含符号），正值不受影响。"""
+        for v, n in [(-123, 5), (-1, 3), (-456, 3), (0, 4), (789, 4), (-7, 1)]:
+            enc = self._to_digits(v, n)
+            self.assertEqual(len(enc), n, f"宽度变了：{v}->{enc}")
+            self.assertEqual(self._de_overpunch(enc), v, f"round-trip 丢符号：{v}->{enc}")
+
+    def test_positive_unchanged_no_overpunch(self):
+        """正/无符号值保持纯数字串（零回归）。"""
+        self.assertEqual(self._to_digits(123, 5), "00123")
+        self.assertTrue(self._to_digits(123, 5).isdigit())
+
+    def test_helper_emits_overpunch_not_bare_abs(self):
+        """生成的 Java helper 必含 overpunch 逻辑，且不再无条件 abs。"""
+        from translator.wsaa.storage import NUM_HELPER, num_from_digits
+        joined = "\n".join(NUM_HELPER)
+        self.assertIn("_OVP", joined)
+        self.assertIn("_deOverpunch", joined)
+        self.assertIn("v.signum() < 0", joined)
+        # int/long 解析须经 overpunch 解码
+        self.assertIn("_deOverpunch", num_from_digits("seg", "long", 0))
+        self.assertIn("_deOverpunch", num_from_digits("seg", "int", 0))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 3c. 命名碰撞：撞名字段改名保留，不静默丢（步骤12 §4）
+# ══════════════════════════════════════════════════════════════════════════════
+class TestNameCollision(unittest.TestCase):
+    def test_disambiguate_parent_prefix(self):
+        """父组名前缀消歧，且兜底序号保证唯一。"""
+        from translator.wsaa.render_class import _disambiguate
+        self.assertEqual(_disambiguate("wsaaX", "wsaaGroupA", {"wsaaX"}), "wsaaGroupAWsaaX")
+        # 父前缀仍冲突 → 序号兜底
+        self.assertEqual(_disambiguate("wsaaX", "wsaaG", {"wsaaX", "wsaaGWsaaX"}), "wsaaX_2")
+        # 无父组名 → jn_2
+        self.assertEqual(_disambiguate("wsaaX", "", {"wsaaX"}), "wsaaX_2")
+
+    def test_collision_renamed_not_dropped(self):
+        """两个不同父组下的同名叶子：第二个改名保留 + TODO，字段不丢。"""
+        from parser.ws.model import WsNode
+        from translator.wsaa.render_class import render_wsaa
+
+        def leaf(name):
+            return WsNode(level=3, name=name, pic="X(04)", raw=f"03 {name} PIC X(04).")
+
+        def grp(name, child):
+            g = WsNode(level=1, name=name, pic="", raw=f"01 {name}.")
+            g.children = [child]
+            return g
+        roots = [grp("WSAA-GROUP-A", leaf("WSAA-DUP")), grp("WSAA-GROUP-B", leaf("WSAA-DUP"))]
+        src = render_wsaa(roots, "ZTEST")
+        self.assertIn("wsaaDup", src)                 # 首个保基名
+        self.assertIn("命名碰撞", src)                 # 第二个标 TODO
+        self.assertNotIn("重复名跳过", src)            # 旧的静默丢行为已移除
+        self.assertEqual(src.count("private String wsaaDup ="), 1)  # 基名只一份
+        # 第二个字段确实声明了（改名后），不是被吞掉
+        self.assertIn("wsaaGroupBWsaaDup", src)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

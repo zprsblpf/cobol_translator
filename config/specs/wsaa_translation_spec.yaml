@@ -40,6 +40,12 @@ program_skeleton:
         而不是靠全局可见。
       - 多线程场景：每线程/每请求各持一个实例（线程封闭），从而天然线程安全，
         避免共享可变全局带来的竞态。
+    cross_call_persistence: |
+      ⚠️ 假设（步骤12 §3，决策 W-1=只标注不自动探测）：COBOL WORKING-STORAGE 在程序**被多次
+      CALL 之间是保留上次值的**（非 IS INITIAL/递归时类似 static）。本翻译「每次调用 new 一个容器」
+      默认**不保留跨 CALL 状态**——若原程序依赖「首次调用初始化标志、后续调用复用」之类持久语义，
+      该默认会改变行为。多数翻成无状态 service 无碍，但这是**需逐程序人工确认的假设**，故在生成的
+      容器类头注释就地标注（render_class），不做自动探测/改写。确需持久 → 改为容器复用/外部持久化。
     sample: "WORKING-STORAGE SECTION  →  class ZpoldwnmWsaa { private String wsaaProg = \"ZPOLDWN\"; ... }"
 
   copy:
@@ -360,8 +366,14 @@ todo_kept:
 # 五、固化假设（写进产物注释，如实标注）
 # ═════════════════════════════════════════════════════════════════════════
 assumptions:
-  - id: signed_display_abs
-    text: "有符号 DISPLAY 数值（S9..）存储串取绝对值零填充，不建模负号 overpunch（语义为日期/金额，恒非负）。"
+  - id: signed_display_overpunch
+    text: |
+      有符号 DISPLAY 数值（S9..）存储串**保符号**（步骤12 修正①，决策 S-1：overpunch-on-negative）：
+      正值/无符号 → 纯数字串（与历史行为一致，零回归）；负值 → 末位数字叠加 overpunch（0-9 ⇄ }JKLMNOPQR），
+      由 _toDigits 编码、_deOverpunch/_fromDigits 对称解码还原符号。
+      原「取绝对值」假设废止——它会把退费/冲正等负金额经 REDEFINES/组切片 round-trip 后静默变正（数据腐败）。
+      数值字段本身（BigDecimal/long/int）一直带符号，本条只修「存储串序列化」这一路径。
+      字段级豁免：abs_whitelist（确证恒非负的字段，强制取绝对值）—— 初始为空（全部保符号），按实测反例再加。
   - id: cobol_move_align
     text: "定宽串超宽高位截断、不足右补空格 / 高位补 0（对齐 COBOL MOVE 截断语义）。"
 

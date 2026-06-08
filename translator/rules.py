@@ -23,6 +23,7 @@ class Ctx:
     field_type_map: dict
     section_to_method: object          # callable: SEC名 -> java 方法名
     known_sections: set                # 所有 SECTION 名（大写）
+    section_order: list = dc_field(default_factory=list)  # 全程序 SECTION 名顺序（大写）——PERFORM…THRU 区间判定用（步骤12 §2）
     leaves: list = dc_field(default_factory=list)   # [(id, Stmt)]
     _counter: list = dc_field(default_factory=lambda: [0])
     flow_label: str | None = None      # 状态机循环标签（dispatch 模式下为 "FLOW"，否则 None）
@@ -1160,6 +1161,31 @@ def _proc_call(target: str, ctx: Ctx) -> str:
     return f"this.{method}();"
 
 
+def _perform_range(header: list, hu: list, target: str, ctx: Ctx, indent: int) -> list[str]:
+    """out-of-line PERFORM 的调用体（实现跟随正本 config/specs/skeleton_spec.yaml
+    block_grammar.perform.thru；步骤12 §2）：
+    - 无 THRU/THROUGH → 单调用 pA();（历史行为）。
+    - PERFORM A THRU B：A、B 均为已知 SECTION 且 B 在 A 之后 → 按全程序段顺序展开区间内每段调用
+      （COBOL THRU = 顺序执行 A..B 之间所有段；A==B 退化为单调用），不丢中间段。
+    - 端点非已知 SECTION / 区间无法确定（B 在 A 之前等）→ 单调用 pA() + 可见 TODO，退化人工核对（P-1③），不臆测。
+    """
+    ti = next((i for i, t in enumerate(hu) if t in ("THRU", "THROUGH")), -1)
+    if ti < 0 or ti + 1 >= len(header):
+        return [_ind(indent) + _proc_call(target, ctx)]
+    a, b = target, header[ti + 1].upper()
+    order = ctx.section_order
+    if a in order and b in order and order.index(b) >= order.index(a):
+        rng = order[order.index(a): order.index(b) + 1]
+        if len(rng) == 1:
+            return [_ind(indent) + _proc_call(a, ctx)]
+        out = [f"{_ind(indent)}// PERFORM {a} THRU {b}（步骤12 §2：THRU 跨段，按段顺序展开 {len(rng)} 段）"]
+        out += [_ind(indent) + _proc_call(s, ctx) for s in rng]
+        return out
+    return [f"{_ind(indent)}// TODO PERFORM {a} THRU {b}：THRU 端点非已知 SECTION 或区间无法确定，"
+            f"中间段/B 段可能漏翻，需人工核对（步骤12 §2 P-1③）",
+            _ind(indent) + _proc_call(a, ctx)]
+
+
 def _sk_perform(st: Stmt, ctx: Ctx, indent: int) -> list[str]:
     header = st.tokens
     hu = [h.upper() for h in header]
@@ -1202,7 +1228,7 @@ def _sk_perform(st: Stmt, ctx: Ctx, indent: int) -> list[str]:
     if st.children:
         body = build_skeleton(st.children, ctx, inner_indent)
     elif target:
-        body = [_ind(inner_indent) + _proc_call(target, ctx)]
+        body = _perform_range(header, hu, target, ctx, inner_indent)
     else:
         return [_ind(indent) + ctx.new_leaf(st)]
 
