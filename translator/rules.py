@@ -843,6 +843,131 @@ def _render_readr_single(info: dict, ctx: Ctx) -> list[str]:
     return out
 
 
+# ── 单条「写」IO（UPDAT/WRITE/WRITR/WRITS/REWRT/DELET）→ save()/delete() 吸收（步骤11）──
+# 与单条读同形（setup + CALL + IF STATUZ），但功能码=写、不返回记录、save/delete 丢返回，
+# STATUZ NOT=O-K 统一 try/catch 调错误段（决策 W-3 选项②，无 record!=null 语义）。
+# 见 docs/详细设计/步骤11、knowledge/io_call_patterns.md「更新（UPDAT）」节。
+
+
+def _write_io_ops(ctx: Ctx) -> set:
+    """单条「写」操作功能码集合：io_default_pattern.operations 中模板含 save/delete 的。
+    与 _read_io_ops（findBy）互补；读写两路各自结构吸收。"""
+    ops = (ctx.io_default_pattern or {}).get("operations", {})
+    return {code.upper() for code, t in ops.items()
+            if "save" in str(t).lower() or "delete" in str(t).lower()}
+
+
+def _is_op_delete(func: str, ctx: Ctx) -> bool:
+    """该写功能码是否为删除类（模板含 delete）→ repo.delete(entity)；否则 save(entity)。"""
+    tmpl = (ctx.io_default_pattern or {}).get("operations", {}).get(func, "")
+    return "delete" in str(tmpl).lower()
+
+
+def _is_init_params(st: Stmt, pfx: str) -> bool:
+    """识别 MOVE SPACES/低高值 TO pfx-PARAMS 或 INITIALIZE pfx-PARAMS（决策 W-1：插入新记录起手）。"""
+    if st.kind != "simple" or not st.tokens:
+        return False
+    tu = [t.upper() for t in st.tokens]
+    if tu[:1] == ["INITIALIZE"] and f"{pfx}-PARAMS" in tu:
+        return True
+    if tu[:1] == ["MOVE"] and "TO" in tu and f"{pfx}-PARAMS" in tu:
+        src = tu[1:tu.index("TO")]
+        if len(src) == 1 and src[0] in ("SPACES", "SPACE", "ZEROS", "ZEROES",
+                                        "ZERO", "LOW-VALUES", "HIGH-VALUES"):
+            return True
+    return False
+
+
+def _write_statuz_form(cond_tokens: list[str], pfx: str):
+    """写场景 STATUZ 形态（决策 W-3 选项②）：每项均为 pfx-STATUZ 比较且含 NOT=O-K
+    → 'error'（try/catch 调错误段）；其它（掺键/非 O-K 形）→ None（不吸收，整体放弃）。"""
+    parsed = []
+    for term in _split_and(cond_tokens):
+        p = _parse_statuz_term(term, pfx)
+        if p is None:
+            return None
+        parsed.append(p)
+    if any(neg and code == "O-K" for neg, code in parsed):
+        return "error"
+    return None
+
+
+def _match_write_single(stmts: list[Stmt], ctx: Ctx):
+    """识别单条写：setup(MOVE 字段/SPACES/FUNCTION/FORMAT) + CALL 'xxxIO' + [IF STATUZ]。
+    返回 {pfx,name,func,is_new,is_delete,setters,mode,then_stmts,try_tail,setup_start,consume_to} 或 None。"""
+    write_ops = _write_io_ops(ctx)
+    if not write_ops or not stmts:
+        return None
+
+    # 1. 定位 CALL，且前序 setup 有 MOVE <写功能码> TO pfx-FUNCTION
+    call_idx = call_info = func = None
+    for i, st in enumerate(stmts):
+        ci = _stmt_call_io(st, ctx)
+        if not ci:
+            continue
+        f = _setup_func_code(stmts[:i], ci[1], write_ops)
+        if f:
+            call_idx, call_info, func = i, ci, f
+            break
+    if call_idx is None:
+        return None
+    name, pfx = call_info
+
+    # 2. setup 起点：从 CALL 向前收集连续涉及 pfx 的语句
+    setup_start = call_idx
+    for i in range(call_idx - 1, -1, -1):
+        if _stmt_touches_pfx(stmts[i], pfx):
+            setup_start = i
+        else:
+            break
+
+    # 3. 实体来源（W-1）：setup 含 MOVE SPACES/INITIALIZE pfx-PARAMS → 插入(new)；否则复用上文实体
+    is_new = any(_is_init_params(st, pfx) for st in stmts[setup_start:call_idx])
+    # 4. setter（W-2）：CALL 前 MOVE val TO pfx-<字段>（排除 FUNCTION/FORMAT/STATUZ/PARAMS）
+    setters = [st for st in stmts[setup_start:call_idx] if _move_key_target(st, pfx)]
+
+    # 5. 紧随 CALL 的 IF STATUZ（可选）→ try/catch（W-3 选项②）
+    mode, then_stmts, try_tail = "plain", [], []
+    consume_to = call_idx + 1
+    nxt = stmts[call_idx + 1] if call_idx + 1 < len(stmts) else None
+    if nxt is not None and _is_statuz_if(nxt, pfx):
+        if _write_statuz_form(nxt.tokens, pfx) is None:
+            return None                                    # STATUZ-IF 形态不认识 → 整体放弃
+        mode, then_stmts = "error", nxt.children           # then(PERFORM 580/9999) → catch
+        try_tail, consume_to = stmts[call_idx + 2:], len(stmts)   # CALL+后续 全包进 try
+    return {"pfx": pfx, "name": name, "func": func, "is_new": is_new,
+            "is_delete": _is_op_delete(func, ctx), "setters": setters, "mode": mode,
+            "then_stmts": then_stmts, "try_tail": try_tail,
+            "setup_start": setup_start, "consume_to": consume_to}
+
+
+def _render_write_single(info: dict, ctx: Ctx) -> list[str]:
+    """渲染单条写 → [XxxRecord x = new XxxRecord();] + x.setField(...); + repo.save/delete(x);
+    + STATUZ error 形 try/catch（错误段移入 catch）。实体一律 XxxRecord（W-2），丢 save 返回。"""
+    pfx, name = info["pfx"], info["name"]
+    io = resolve_io_info(name, ctx.io_programs, ctx.io_default_pattern)
+    repo = io["field_name"] if io else _java(pfx) + "Repository"
+    rec_cls = _pascal(pfx) + "Record"
+    var = _java(pfx)
+
+    lines: list[str] = []
+    if info["is_new"]:                                     # W-1 插入：声明并 new；复用场景沿用上文 var
+        lines.append(f"{rec_cls} {var} = new {rec_cls}();")
+    lines.extend(_render_rebound(info["setters"], ctx, pfx, var, 0))   # MOVE→setter（pfx 重绑定到实体）
+    op_line = f"{repo}.delete({var});" if info["is_delete"] else f"{repo}.save({var});"  # 丢返回（W-4/save）
+
+    if info["mode"] == "plain":
+        lines.append(op_line)
+        return lines
+    # error（W-3 选项②）：save/delete + 后续 包进 try；原错误段移入 catch
+    out = lines + ["try {", "    " + op_line]
+    out.extend(_render_rebound(info["try_tail"], ctx, pfx, var, 1))
+    out.append("} catch (Exception e) {")
+    out.extend(_render_rebound(info["then_stmts"], ctx, pfx, var, 1) or ["    // (空)"])
+    out.append("}")
+    return out
+
+
 def _rewrite_begn_loops(paras: list[tuple], ctx: Ctx) -> list[tuple]:
     """把 BEGN+NEXTR 自跳循环 / 单次 BEGN 等值定位 改写为 List+for-each / findBy…Begn()。"""
     norm = [(lbl or f"__ENTRY_{i}", list(stmts)) for i, (lbl, stmts) in enumerate(paras)]
@@ -888,6 +1013,16 @@ def _rewrite_begn_loops(paras: list[tuple], ctx: Ctx) -> list[tuple]:
             raw.lines = _render_readr_single(rinfo, ctx)
             before = current[:rinfo["setup_start"]]
             after  = current[rinfo["consume_to"]:]    # error 形态 consume_to=末尾，后续已并入 try
+            result[i] = (paras[i][0], before + [raw] + after)
+            changed = True
+            continue
+        # ── Pass 2c：单条写 IO（UPDAT/WRITE/DELET 等，步骤11）──
+        winfo = _match_write_single(current, ctx)
+        if winfo:
+            raw = Stmt(kind="raw", tokens=[])
+            raw.lines = _render_write_single(winfo, ctx)
+            before = current[:winfo["setup_start"]]
+            after  = current[winfo["consume_to"]:]    # error 形态 consume_to=末尾，后续已并入 try
             result[i] = (paras[i][0], before + [raw] + after)
             changed = True
 

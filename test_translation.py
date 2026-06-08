@@ -342,6 +342,89 @@ class TestIoCallAndStructAssign(unittest.TestCase):
                 for _i, lf in ctx.leaves if lf.tokens and lf.tokens[0].upper() == "MOVE"]
         self.assertIn(["wsaaValue = itdm.getValue();"], body)
 
+    # ── 步骤11：单条写 IO（UPDAT/WRITE/DELET）结构化吸收 ──────────────────────
+    def _write_ctx(self, **kw):
+        """带写功能码（save/delete）的 io_default_pattern；io_programs 空走范式派生。"""
+        return self._ctx(
+            io_programs={},
+            io_default_pattern={
+                "class_suffix": "Repository", "field_suffix": "Repository",
+                "param_struct_suffix": "-PARAMS", "import_package": "com.example.repository",
+                "operations": {"READR": "findByKeyReadr({key})", "UPDAT": "save({entity})",
+                               "WRITR": "save({entity})", "DELET": "delete({entity})"}},
+            **kw)
+
+    def test_write_single_updat_reuse_try_catch(self):
+        """UPDAT（无 MOVE SPACES → 复用上文实体）+ IF STATUZ NOT=O-K（PERFORM 9999）
+        → x.setField(...); try{ repo.save(x); } catch{ 错误段(); }。对照 knowledge §186。"""
+        ctx = self._write_ctx(
+            io_struct_prefixes={"TMLCLST"},
+            known_sections={"9999-FATAL-ERROR"},
+            section_to_method=lambda s: "fatalError9999",
+            field_type_map={"wsaaNewValue": {"type": "String"}})
+        skel = self._build(ctx, [
+            "5000-UPDATE.",
+            "           MOVE WSAA-NEW-VALUE TO TMLCLST-FIELD.",
+            "           MOVE UPDAT          TO TMLCLST-FUNCTION.",
+            "           CALL 'TMLCLSTIO' USING TMLCLST-PARAMS.",
+            "           IF TMLCLST-STATUZ NOT = O-K",
+            "              PERFORM 9999-FATAL-ERROR",
+            "           END-IF.",
+            "5090-EXIT.",
+            "           EXIT.",
+        ])
+        self.assertIn("try {", skel)
+        self.assertIn("tmlclstRepository.save(tmlclst);", skel)
+        self.assertIn("} catch (Exception e) {", skel)
+        self.assertIn("fatalError9999();", skel)
+        for leak in ("getStatuz", "new TmlclstParams", "setFunction",
+                     "= tmlclstRepository.save", "TmlclstRecord tmlclst = new"):
+            self.assertNotIn(leak, skel, f"残留泄漏: {leak}\n{skel}")
+        # setter 以叶子占位进入，translate_leaf 时经 rebind 标注 → 实体 setter（非 Params）
+        body = [self.rules.translate_leaf(lf, ctx)[0]
+                for _i, lf in ctx.leaves if lf.tokens and lf.tokens[0].upper() == "MOVE"]
+        self.assertIn(["tmlclst.setField(wsaaNewValue);"], body)
+
+    def test_write_single_write_new_entity(self):
+        """WRITR（含 MOVE SPACES TO pfx-PARAMS → 插入）无 IF
+        → XxxRecord x = new XxxRecord(); x.setField(...); repo.save(x);。
+        （功能码用 WRITR：真实 LIFE 系统的写码为 5 字缩写，避开 COBOL 动词 WRITE 与切分器撞名）"""
+        ctx = self._write_ctx(
+            io_struct_prefixes={"TMLCLST"},
+            field_type_map={"wsaaVal": {"type": "String"}})
+        skel = self._build(ctx, [
+            "6000-INSERT.",
+            "           MOVE SPACES   TO TMLCLST-PARAMS.",
+            "           MOVE WSAA-VAL TO TMLCLST-FIELD.",
+            "           MOVE WRITR    TO TMLCLST-FUNCTION.",
+            "           CALL 'TMLCLSTIO' USING TMLCLST-PARAMS.",
+            "6090-EXIT.",
+            "           EXIT.",
+        ])
+        self.assertIn("TmlclstRecord tmlclst = new TmlclstRecord();", skel)
+        self.assertIn("tmlclstRepository.save(tmlclst);", skel)
+        for leak in ("getStatuz", "new TmlclstParams", "setFunction",
+                     "= tmlclstRepository.save"):
+            self.assertNotIn(leak, skel, f"残留泄漏: {leak}\n{skel}")
+        # setter 以叶子占位进入 → 实体 setter（rebind 标注）
+        body = [self.rules.translate_leaf(lf, ctx)[0]
+                for _i, lf in ctx.leaves if lf.tokens and lf.tokens[0].upper() == "MOVE"
+                and "TMLCLST-FIELD" in [t.upper() for t in lf.tokens]]
+        self.assertIn(["tmlclst.setField(wsaaVal);"], body)
+
+    def test_write_single_delet(self):
+        """DELET（决策 W-4 选项①）→ repo.delete(实体)，不出 deleteByKey。"""
+        ctx = self._write_ctx(io_struct_prefixes={"TMLCLST"})
+        skel = self._build(ctx, [
+            "7000-DELETE.",
+            "           MOVE DELET TO TMLCLST-FUNCTION.",
+            "           CALL 'TMLCLSTIO' USING TMLCLST-PARAMS.",
+            "7090-EXIT.",
+            "           EXIT.",
+        ])
+        self.assertIn("tmlclstRepository.delete(tmlclst);", skel)
+        self.assertNotIn("deleteByKey", skel)
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 4. 本地模型：连通性 + 翻译能力（vLLM 离线则 skip）
