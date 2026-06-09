@@ -28,7 +28,7 @@ io_default_pattern:
     WRITR: "save({entity})"
     WRITS: "save({entity})"
     REWRT: "save({entity})"
-    DELET: "deleteByKey({key})"
+    DELET: "delete({entity})"          # 步骤11 决策 W-4 选项①：传实体对象，最贴 Spring Data，免键派生
 
 # ── 非标准覆盖项（只写与范式不同的增量；其余字段自动派生并深合并）──────────────
 # 这里仅声明「方法名非标准」的表；其余功能码仍走范式。查询方法名同样以功能码结尾。

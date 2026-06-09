@@ -1,7 +1,8 @@
 """
 定宽存储串（fixed-width storage string）构造：COBOL 共享存储的本质抽象。
 
-对应设计：docs/详细设计/步骤04-WSAA遗留补全设计.md §3；决策 D8–D12 / 假设 A1、A2。
+对应设计：docs/详细设计/步骤04-WSAA遗留补全设计.md §3；决策 D8–D12 / 假设 A2。
+有符号数值存储串保符号（overpunch-on-negative）见 步骤12-翻译标准修正 §1（取代原「假设 A1 取绝对值」）。
 
 任一节点都有「W 字符定宽存储串」表示，所有 REDEFINES / 重叠视图建在它之上，
 改子↔改父经同一 backing（数值变量或字符目标）双向同步：
@@ -23,21 +24,39 @@ from translator.wsaa.render_field import java_name
 _NUMERIC = ("int", "long", "BigDecimal")
 
 # 数值 ↔ 定宽数字串 辅助方法（随视图按需输出，类似 render_view.PAD_HELPER）
+# 符号语义（实现跟随正本 config/specs/wsaa_translation_spec.yaml assumptions.signed_display_overpunch；
+# 步骤12 §1，决策 S-1 overpunch-on-negative）：正/无符号 → 纯数字串（零回归）；
+# 负值 → 末位叠加 overpunch（0-9 ⇄ }JKLMNOPQR），_toDigits 编码 / _deOverpunch 解码，忠实保号。
+_OVERPUNCH = "}JKLMNOPQR"
 NUM_HELPER = [
-    "    /** 数值 → 定宽数字串：取绝对值（假设 A1），scale 位低位小数，左补 0 / 高位截断到 n。 */",
+    "    private static final String _OVP = \"" + _OVERPUNCH + "\";  // 负号 overpunch 表：数字 0-9 → 该位字符",
+    "    /** 数值 → 定宽 DISPLAY 串：scale 位低位小数，左补 0 / 高位截断到 n；负值末位叠加 overpunch（保符号）。 */",
     "    private static String _toDigits(BigDecimal v, int n, int scale) {",
     "        if (v == null) v = BigDecimal.ZERO;",
+    "        boolean neg = v.signum() < 0;",
     "        String s = v.movePointRight(scale).abs().toBigInteger().toString();",
-    "        if (s.length() > n) return s.substring(s.length() - n);",
+    "        if (s.length() > n) s = s.substring(s.length() - n);",
     "        StringBuilder b = new StringBuilder();",
     "        while (b.length() < n - s.length()) b.append('0');",
-    "        return b.append(s).toString();",
+    "        b.append(s);",
+    "        if (neg && b.length() > 0) {",
+    "            int last = b.length() - 1;",
+    "            b.setCharAt(last, _OVP.charAt(b.charAt(last) - '0'));",
+    "        }",
+    "        return b.toString();",
     "    }",
-    "    /** 定宽数字串 → BigDecimal（scale 位小数）；空串按 0。 */",
-    "    private static BigDecimal _fromDigits(String s, int scale) {",
+    "    /** 还原 DISPLAY 末位 overpunch → 普通带号数字串（负则前置 -）；空串按 0。 */",
+    "    private static String _deOverpunch(String s) {",
     "        s = (s == null ? \"\" : s.trim());",
-    "        if (s.isEmpty()) s = \"0\";",
-    "        return new BigDecimal(new java.math.BigInteger(s)).movePointLeft(scale);",
+    "        if (s.isEmpty()) return \"0\";",
+    "        int last = s.length() - 1;",
+    "        int op = _OVP.indexOf(s.charAt(last));",
+    "        if (op >= 0) return \"-\" + s.substring(0, last) + (char) ('0' + op);",
+    "        return s;",
+    "    }",
+    "    /** 定宽 DISPLAY 串 → BigDecimal（scale 位小数）；解码 overpunch 还原符号；空串按 0。 */",
+    "    private static BigDecimal _fromDigits(String s, int scale) {",
+    "        return new BigDecimal(new java.math.BigInteger(_deOverpunch(s))).movePointLeft(scale);",
     "    }",
 ]
 
@@ -73,8 +92,8 @@ def num_from_digits(str_expr: str, jtype: str, scale: int) -> str:
     if jtype == "BigDecimal":
         return f"_fromDigits({str_expr}, {scale})"
     if jtype == "long":
-        return f"Long.parseLong({str_expr}.trim())"
-    return f"Integer.parseInt({str_expr}.trim())"
+        return f"Long.parseLong(_deOverpunch({str_expr}))"
+    return f"Integer.parseInt(_deOverpunch({str_expr}))"
 
 
 def _group_accessor(g: WsNode):

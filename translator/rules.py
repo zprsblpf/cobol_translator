@@ -23,6 +23,7 @@ class Ctx:
     field_type_map: dict
     section_to_method: object          # callable: SEC名 -> java 方法名
     known_sections: set                # 所有 SECTION 名（大写）
+    section_order: list = dc_field(default_factory=list)  # 全程序 SECTION 名顺序（大写）——PERFORM…THRU 区间判定用（步骤12 §2）
     leaves: list = dc_field(default_factory=list)   # [(id, Stmt)]
     _counter: list = dc_field(default_factory=lambda: [0])
     flow_label: str | None = None      # 状态机循环标签（dispatch 模式下为 "FLOW"，否则 None）
@@ -629,6 +630,345 @@ def _render_begn_single(info: dict, ctx: Ctx) -> list[str]:
     return lines
 
 
+# ── 单条「读」IO（READR/READS）→ findBy…Readr() + record!=null 吸收（步骤10）──────────
+# 与 BEGN 单次同形（setup + CALL + IF STATUZ），但功能码=READR/READS、返回单条记录、
+# STATUZ=O-K ⇔ record!=null。见 docs/详细设计/步骤10、docs/翻译标准/io查询.md。
+
+_STRUCT_CONV = {"FUNCTION", "FORMAT", "STATUZ", "PARAMS"}   # 调用约定字段（非真实数据字段）
+
+
+def _read_io_ops(ctx: Ctx) -> set:
+    """单条「读」操作功能码集合：io_default_pattern.operations 中模板含 findBy 的（READR/READS）。
+    写操作（save/delete）不返回记录、无 record!=null 语义，不走结构吸收，留给 _t_call。"""
+    ops = (ctx.io_default_pattern or {}).get("operations", {})
+    return {code.upper() for code, tmpl in ops.items() if "findBy" in str(tmpl)}
+
+
+def _split_and(tokens: list[str]) -> list[list[str]]:
+    """按顶层 AND 切分条件 token（本场景 STATUZ 条件无括号）。"""
+    out, cur = [], []
+    for t in tokens:
+        if t.upper() == "AND":
+            out.append(cur); cur = []
+        else:
+            cur.append(t)
+    out.append(cur)
+    return out
+
+
+def _parse_statuz_term(term: list[str], pfx: str):
+    """单个比较项 `pfx-STATUZ [NOT] = CODE` → (negate, CODE 大写)；非 STATUZ/形状不符 → None。"""
+    tu = [t.upper() for t in term]
+    if "=" not in tu:
+        return None
+    negate = "NOT" in tu
+    eqi = tu.index("=")
+    left = [t for t in tu[:eqi] if t != "NOT"]
+    right = term[eqi + 1:]
+    if len(left) != 1 or len(right) != 1 or left[0] != f"{pfx}-STATUZ":
+        return None
+    return negate, right[0].upper()
+
+
+def _statuz_form(cond_tokens: list[str], pfx: str):
+    """识别紧跟 READR CALL 的 IF STATUZ 形态 → 'ok'|'notok'|'error'|None（§3.3）。
+      · 单项 = O-K          → ok    (record != null)；NOT = O-K → notok (== null)
+      · 单项 = MRNF/ENDP    → notok；NOT = MRNF/ENDP → ok
+      · 两项 AND：NOT=O-K AND NOT=MRNF/ENDP → error（决策 A：真 DB 错误，try/catch 调 580）
+      · 其它（含掺入键字段）→ None（不半吸收，整体放弃）。
+    """
+    parsed = []
+    for term in _split_and(cond_tokens):
+        p = _parse_statuz_term(term, pfx)
+        if p is None:
+            return None
+        parsed.append(p)
+    if len(parsed) == 1:
+        neg, code = parsed[0]
+        if code == "O-K":
+            return "notok" if neg else "ok"
+        if code in ("MRNF", "ENDP"):
+            return "ok" if neg else "notok"
+        return None
+    if len(parsed) == 2:
+        codes = {c for _, c in parsed}
+        if all(neg for neg, _ in parsed) and "O-K" in codes and (codes & {"MRNF", "ENDP"}):
+            return "error"
+    return None
+
+
+def _setup_func_code(stmts: list[Stmt], pfx: str, codes: set):
+    """前序 setup 里 MOVE <code> TO pfx-FUNCTION 的功能码（限 codes 集合），否则 None。"""
+    for st in stmts:
+        if st.kind == "simple" and st.tokens:
+            tu = [t.upper() for t in st.tokens]
+            if tu[:1] == ["MOVE"] and "TO" in tu and f"{pfx}-FUNCTION" in tu:
+                for c in codes:
+                    if c in tu:
+                        return c
+    return None
+
+
+def _move_key_target(st: Stmt, pfx: str):
+    """MOVE src TO pfx-<字段>（排除 FUNCTION/FORMAT/STATUZ/PARAMS）→ (字段COBOL名, src token)。
+    决策 B1：CALL 前这些 MOVE 目标即查询键，按出现顺序拼 finder 实参。"""
+    if st.kind != "simple" or not st.tokens:
+        return None
+    tu = [t.upper() for t in st.tokens]
+    if tu[:1] != ["MOVE"] or "TO" not in tu:
+        return None
+    ti = tu.index("TO")
+    src = st.tokens[1:ti]
+    dsts = st.tokens[ti + 1:]
+    if len(src) != 1 or len(dsts) != 1:
+        return None
+    d = dsts[0].upper()
+    if "-" not in d or d.split("-", 1)[0] != pfx:
+        return None
+    field = d.split("-", 1)[1]
+    if field in _STRUCT_CONV:
+        return None
+    return field, src[0]
+
+
+def _is_statuz_if(st: Stmt, pfx: str) -> bool:
+    return st.kind == "if" and any(t.upper() == f"{pfx}-STATUZ" for t in st.tokens)
+
+
+def _match_readr_single(stmts: list[Stmt], ctx: Ctx):
+    """识别单条读：setup(MOVE 键/SPACES/FUNCTION/FORMAT) + CALL 'xxxIO' + [IF STATUZ]。
+    返回 {pfx,name,func,keys,mode,then_stmts,else_stmts,try_tail,setup_start,consume_to} 或 None。"""
+    read_ops = _read_io_ops(ctx)
+    if not read_ops or not stmts:
+        return None
+
+    # 1. 定位 CALL，且前序 setup 有 MOVE <readop> TO pfx-FUNCTION
+    call_idx = call_info = func = None
+    for i, st in enumerate(stmts):
+        ci = _stmt_call_io(st, ctx)
+        if not ci:
+            continue
+        f = _setup_func_code(stmts[:i], ci[1], read_ops)
+        if f:
+            call_idx, call_info, func = i, ci, f
+            break
+    if call_idx is None:
+        return None
+    name, pfx = call_info
+
+    # 2. setup 起点：从 CALL 向前收集连续涉及 pfx 的语句
+    setup_start = call_idx
+    for i in range(call_idx - 1, -1, -1):
+        if _stmt_touches_pfx(stmts[i], pfx):
+            setup_start = i
+        else:
+            break
+
+    # 3. 键备料（决策 B1）：setup 内 MOVE val TO pfx-<字段>，按序
+    keys = []
+    for st in stmts[setup_start:call_idx]:
+        mk = _move_key_target(st, pfx)
+        if mk:
+            keys.append(mk)
+    if not keys:
+        return None
+
+    # 4. 紧随 CALL 的 IF STATUZ（可选）
+    mode, then_stmts, else_stmts, try_tail = "plain", [], [], []
+    consume_to = call_idx + 1
+    nxt = stmts[call_idx + 1] if call_idx + 1 < len(stmts) else None
+    if nxt is not None and _is_statuz_if(nxt, pfx):
+        form = _statuz_form(nxt.tokens, pfx)
+        if form is None:
+            return None                                # STATUZ-IF 形态不认识 → 整体放弃
+        if form == "error":
+            mode, then_stmts = "error", nxt.children   # then(PERFORM 580) → catch
+            try_tail, consume_to = stmts[call_idx + 2:], len(stmts)   # CALL+后续 全包进 try
+        else:
+            mode, then_stmts, else_stmts = form, nxt.children, nxt.else_children
+            consume_to = call_idx + 2
+    return {"pfx": pfx, "name": name, "func": func, "keys": keys, "mode": mode,
+            "then_stmts": then_stmts, "else_stmts": else_stmts, "try_tail": try_tail,
+            "setup_start": setup_start, "consume_to": consume_to}
+
+
+def _render_rebound(stmts: list[Stmt], ctx: Ctx, pfx: str, var: str, indent: int) -> list[str]:
+    """渲染体内语句，临时把 pfx 重绑定到 record 变量：pfx-FIELD → var.getField()。"""
+    rebind = {pfx: var}
+    _tag_rebind(stmts, rebind)
+    saved = ctx.struct_objects.get(pfx)
+    ctx.struct_objects[pfx] = var
+    try:
+        return build_skeleton(stmts, ctx, indent)
+    finally:
+        if saved is None:
+            ctx.struct_objects.pop(pfx, None)
+        else:
+            ctx.struct_objects[pfx] = saved
+
+
+def _render_readr_single(info: dict, ctx: Ctx) -> list[str]:
+    """渲染单条读 → Rec r = repo.findBy…Readr(键); + STATUZ 改写（record!=null / try-catch）。"""
+    pfx, name, func = info["pfx"], info["name"], info["func"]
+    io = resolve_io_info(name, ctx.io_programs, ctx.io_default_pattern)
+    repo = io["field_name"] if io else _java(pfx) + "Repository"
+    rec_cls = _pascal(pfx) + "Record"
+    var = _java(pfx)
+    # finder：按键派生 findBy<键…>Readr（同 BEGN，不取 io_default_pattern 的通用占位模板名）；
+    #   仅当该表在 io_programs 有「显式」操作码覆盖（如 CHDRENQIO→findByPolicyNoReadr）才用其方法名。
+    raw_op = (ctx.io_programs.get(name) or {}).get("operations", {}).get(func)
+    finder = (raw_op.split("(", 1)[0] if raw_op
+              else "findBy" + "And".join(_pascal(k) for k, _ in info["keys"]) + func.capitalize())
+    vals = ", ".join(_operand(v, ctx) for _, v in info["keys"])
+    call_line = f"{rec_cls} {var} = {repo}.{finder}({vals});"
+
+    mode = info["mode"]
+    if mode == "plain":
+        return [call_line]
+    if mode == "error":
+        # 决策 A：finder + 后续 包进 try；原 580 分支移入 catch
+        out = ["try {", "    " + call_line]
+        out.extend(_render_rebound(info["try_tail"], ctx, pfx, var, 1))
+        out.append("} catch (Exception e) {")
+        out.extend(_render_rebound(info["then_stmts"], ctx, pfx, var, 1) or ["    // (空)"])
+        out.append("}")
+        return out
+    # ok / notok：record != null / == null
+    cmp = "!= null" if mode == "ok" else "== null"
+    out = [call_line, f"if ({var} {cmp}) {{"]
+    out.extend(_render_rebound(info["then_stmts"], ctx, pfx, var, 1) or ["    // (空)"])
+    if info["else_stmts"]:
+        out.append("} else {")
+        out.extend(_render_rebound(info["else_stmts"], ctx, pfx, var, 1))
+    out.append("}")
+    return out
+
+
+# ── 单条「写」IO（UPDAT/WRITE/WRITR/WRITS/REWRT/DELET）→ save()/delete() 吸收（步骤11）──
+# 与单条读同形（setup + CALL + IF STATUZ），但功能码=写、不返回记录、save/delete 丢返回，
+# STATUZ NOT=O-K 统一 try/catch 调错误段（决策 W-3 选项②，无 record!=null 语义）。
+# 见 docs/详细设计/步骤11、knowledge/io_call_patterns.md「更新（UPDAT）」节。
+
+
+def _write_io_ops(ctx: Ctx) -> set:
+    """单条「写」操作功能码集合：io_default_pattern.operations 中模板含 save/delete 的。
+    与 _read_io_ops（findBy）互补；读写两路各自结构吸收。"""
+    ops = (ctx.io_default_pattern or {}).get("operations", {})
+    return {code.upper() for code, t in ops.items()
+            if "save" in str(t).lower() or "delete" in str(t).lower()}
+
+
+def _is_op_delete(func: str, ctx: Ctx) -> bool:
+    """该写功能码是否为删除类（模板含 delete）→ repo.delete(entity)；否则 save(entity)。"""
+    tmpl = (ctx.io_default_pattern or {}).get("operations", {}).get(func, "")
+    return "delete" in str(tmpl).lower()
+
+
+def _is_init_params(st: Stmt, pfx: str) -> bool:
+    """识别 MOVE SPACES/低高值 TO pfx-PARAMS 或 INITIALIZE pfx-PARAMS（决策 W-1：插入新记录起手）。"""
+    if st.kind != "simple" or not st.tokens:
+        return False
+    tu = [t.upper() for t in st.tokens]
+    if tu[:1] == ["INITIALIZE"] and f"{pfx}-PARAMS" in tu:
+        return True
+    if tu[:1] == ["MOVE"] and "TO" in tu and f"{pfx}-PARAMS" in tu:
+        src = tu[1:tu.index("TO")]
+        if len(src) == 1 and src[0] in ("SPACES", "SPACE", "ZEROS", "ZEROES",
+                                        "ZERO", "LOW-VALUES", "HIGH-VALUES"):
+            return True
+    return False
+
+
+def _write_statuz_form(cond_tokens: list[str], pfx: str):
+    """写场景 STATUZ 形态（决策 W-3 选项②）：每项均为 pfx-STATUZ 比较且含 NOT=O-K
+    → 'error'（try/catch 调错误段）；其它（掺键/非 O-K 形）→ None（不吸收，整体放弃）。"""
+    parsed = []
+    for term in _split_and(cond_tokens):
+        p = _parse_statuz_term(term, pfx)
+        if p is None:
+            return None
+        parsed.append(p)
+    if any(neg and code == "O-K" for neg, code in parsed):
+        return "error"
+    return None
+
+
+def _match_write_single(stmts: list[Stmt], ctx: Ctx):
+    """识别单条写：setup(MOVE 字段/SPACES/FUNCTION/FORMAT) + CALL 'xxxIO' + [IF STATUZ]。
+    返回 {pfx,name,func,is_new,is_delete,setters,mode,then_stmts,try_tail,setup_start,consume_to} 或 None。"""
+    write_ops = _write_io_ops(ctx)
+    if not write_ops or not stmts:
+        return None
+
+    # 1. 定位 CALL，且前序 setup 有 MOVE <写功能码> TO pfx-FUNCTION
+    call_idx = call_info = func = None
+    for i, st in enumerate(stmts):
+        ci = _stmt_call_io(st, ctx)
+        if not ci:
+            continue
+        f = _setup_func_code(stmts[:i], ci[1], write_ops)
+        if f:
+            call_idx, call_info, func = i, ci, f
+            break
+    if call_idx is None:
+        return None
+    name, pfx = call_info
+
+    # 2. setup 起点：从 CALL 向前收集连续涉及 pfx 的语句
+    setup_start = call_idx
+    for i in range(call_idx - 1, -1, -1):
+        if _stmt_touches_pfx(stmts[i], pfx):
+            setup_start = i
+        else:
+            break
+
+    # 3. 实体来源（W-1）：setup 含 MOVE SPACES/INITIALIZE pfx-PARAMS → 插入(new)；否则复用上文实体
+    is_new = any(_is_init_params(st, pfx) for st in stmts[setup_start:call_idx])
+    # 4. setter（W-2）：CALL 前 MOVE val TO pfx-<字段>（排除 FUNCTION/FORMAT/STATUZ/PARAMS）
+    setters = [st for st in stmts[setup_start:call_idx] if _move_key_target(st, pfx)]
+
+    # 5. 紧随 CALL 的 IF STATUZ（可选）→ try/catch（W-3 选项②）
+    mode, then_stmts, try_tail = "plain", [], []
+    consume_to = call_idx + 1
+    nxt = stmts[call_idx + 1] if call_idx + 1 < len(stmts) else None
+    if nxt is not None and _is_statuz_if(nxt, pfx):
+        if _write_statuz_form(nxt.tokens, pfx) is None:
+            return None                                    # STATUZ-IF 形态不认识 → 整体放弃
+        mode, then_stmts = "error", nxt.children           # then(PERFORM 580/9999) → catch
+        try_tail, consume_to = stmts[call_idx + 2:], len(stmts)   # CALL+后续 全包进 try
+    return {"pfx": pfx, "name": name, "func": func, "is_new": is_new,
+            "is_delete": _is_op_delete(func, ctx), "setters": setters, "mode": mode,
+            "then_stmts": then_stmts, "try_tail": try_tail,
+            "setup_start": setup_start, "consume_to": consume_to}
+
+
+def _render_write_single(info: dict, ctx: Ctx) -> list[str]:
+    """渲染单条写 → [XxxRecord x = new XxxRecord();] + x.setField(...); + repo.save/delete(x);
+    + STATUZ error 形 try/catch（错误段移入 catch）。实体一律 XxxRecord（W-2），丢 save 返回。"""
+    pfx, name = info["pfx"], info["name"]
+    io = resolve_io_info(name, ctx.io_programs, ctx.io_default_pattern)
+    repo = io["field_name"] if io else _java(pfx) + "Repository"
+    rec_cls = _pascal(pfx) + "Record"
+    var = _java(pfx)
+
+    lines: list[str] = []
+    if info["is_new"]:                                     # W-1 插入：声明并 new；复用场景沿用上文 var
+        lines.append(f"{rec_cls} {var} = new {rec_cls}();")
+    lines.extend(_render_rebound(info["setters"], ctx, pfx, var, 0))   # MOVE→setter（pfx 重绑定到实体）
+    op_line = f"{repo}.delete({var});" if info["is_delete"] else f"{repo}.save({var});"  # 丢返回（W-4/save）
+
+    if info["mode"] == "plain":
+        lines.append(op_line)
+        return lines
+    # error（W-3 选项②）：save/delete + 后续 包进 try；原错误段移入 catch
+    out = lines + ["try {", "    " + op_line]
+    out.extend(_render_rebound(info["try_tail"], ctx, pfx, var, 1))
+    out.append("} catch (Exception e) {")
+    out.extend(_render_rebound(info["then_stmts"], ctx, pfx, var, 1) or ["    // (空)"])
+    out.append("}")
+    return out
+
+
 def _rewrite_begn_loops(paras: list[tuple], ctx: Ctx) -> list[tuple]:
     """把 BEGN+NEXTR 自跳循环 / 单次 BEGN 等值定位 改写为 List+for-each / findBy…Begn()。"""
     norm = [(lbl or f"__ENTRY_{i}", list(stmts)) for i, (lbl, stmts) in enumerate(paras)]
@@ -659,14 +999,33 @@ def _rewrite_begn_loops(paras: list[tuple], ctx: Ctx) -> list[tuple]:
             continue   # 已被 Pass 1 处理为循环
         current = result[i][1]                              # Pass 1 可能已剥离本段其他 pfx 的 setup
         info = _match_begn_single(current, ctx)             # 在已修改的列表上检测，索引与切分自洽
-        if not info:
+        if info:
+            raw = Stmt(kind="raw", tokens=[])
+            raw.lines = _render_begn_single(info, ctx)
+            before = current[:info["setup_start"]]
+            after  = current[info["call_idx"] + 2:]   # 跳过 CALL + IF
+            result[i] = (paras[i][0], before + [raw] + after)
+            changed = True
             continue
-        raw = Stmt(kind="raw", tokens=[])
-        raw.lines = _render_begn_single(info, ctx)
-        before = current[:info["setup_start"]]
-        after  = current[info["call_idx"] + 2:]   # 跳过 CALL + IF
-        result[i] = (paras[i][0], before + [raw] + after)
-        changed = True
+        # ── Pass 2b：单条读 READR/READS 等值定位（步骤10：setup + CALL + IF STATUZ）──
+        rinfo = _match_readr_single(current, ctx)
+        if rinfo:
+            raw = Stmt(kind="raw", tokens=[])
+            raw.lines = _render_readr_single(rinfo, ctx)
+            before = current[:rinfo["setup_start"]]
+            after  = current[rinfo["consume_to"]:]    # error 形态 consume_to=末尾，后续已并入 try
+            result[i] = (paras[i][0], before + [raw] + after)
+            changed = True
+            continue
+        # ── Pass 2c：单条写 IO（UPDAT/WRITE/DELET 等，步骤11）──
+        winfo = _match_write_single(current, ctx)
+        if winfo:
+            raw = Stmt(kind="raw", tokens=[])
+            raw.lines = _render_write_single(winfo, ctx)
+            before = current[:winfo["setup_start"]]
+            after  = current[winfo["consume_to"]:]    # error 形态 consume_to=末尾，后续已并入 try
+            result[i] = (paras[i][0], before + [raw] + after)
+            changed = True
 
     return result if changed else paras
 
@@ -802,6 +1161,31 @@ def _proc_call(target: str, ctx: Ctx) -> str:
     return f"this.{method}();"
 
 
+def _perform_range(header: list, hu: list, target: str, ctx: Ctx, indent: int) -> list[str]:
+    """out-of-line PERFORM 的调用体（实现跟随正本 config/specs/skeleton_spec.yaml
+    block_grammar.perform.thru；步骤12 §2）：
+    - 无 THRU/THROUGH → 单调用 pA();（历史行为）。
+    - PERFORM A THRU B：A、B 均为已知 SECTION 且 B 在 A 之后 → 按全程序段顺序展开区间内每段调用
+      （COBOL THRU = 顺序执行 A..B 之间所有段；A==B 退化为单调用），不丢中间段。
+    - 端点非已知 SECTION / 区间无法确定（B 在 A 之前等）→ 单调用 pA() + 可见 TODO，退化人工核对（P-1③），不臆测。
+    """
+    ti = next((i for i, t in enumerate(hu) if t in ("THRU", "THROUGH")), -1)
+    if ti < 0 or ti + 1 >= len(header):
+        return [_ind(indent) + _proc_call(target, ctx)]
+    a, b = target, header[ti + 1].upper()
+    order = ctx.section_order
+    if a in order and b in order and order.index(b) >= order.index(a):
+        rng = order[order.index(a): order.index(b) + 1]
+        if len(rng) == 1:
+            return [_ind(indent) + _proc_call(a, ctx)]
+        out = [f"{_ind(indent)}// PERFORM {a} THRU {b}（步骤12 §2：THRU 跨段，按段顺序展开 {len(rng)} 段）"]
+        out += [_ind(indent) + _proc_call(s, ctx) for s in rng]
+        return out
+    return [f"{_ind(indent)}// TODO PERFORM {a} THRU {b}：THRU 端点非已知 SECTION 或区间无法确定，"
+            f"中间段/B 段可能漏翻，需人工核对（步骤12 §2 P-1③）",
+            _ind(indent) + _proc_call(a, ctx)]
+
+
 def _sk_perform(st: Stmt, ctx: Ctx, indent: int) -> list[str]:
     header = st.tokens
     hu = [h.upper() for h in header]
@@ -844,7 +1228,7 @@ def _sk_perform(st: Stmt, ctx: Ctx, indent: int) -> list[str]:
     if st.children:
         body = build_skeleton(st.children, ctx, inner_indent)
     elif target:
-        body = [_ind(inner_indent) + _proc_call(target, ctx)]
+        body = _perform_range(header, hu, target, ctx, inner_indent)
     else:
         return [_ind(indent) + ctx.new_leaf(st)]
 
@@ -988,16 +1372,18 @@ def resolve_io_info(name: str, io_programs: dict, pattern: dict | None) -> dict 
 
 def _t_call(toks: list[str], ctx: Ctx) -> tuple[list[str], bool]:
     """
-    CALL 'xxxIO' USING xxx-PARAMS → 固化 Repository 调用。
+    CALL 'xxxIO' USING xxx-PARAMS → 固化 Repository 调用（叶子级退路）。
+
+    单条「读」(READR/READS) 的标准形态 setup+CALL+IF 由 _rewrite_begn_loops 的结构化吸收
+    （_match_readr_single / _render_readr_single）整段改写为 `Rec r = repo.findBy…Readr(键)`，
+    不会走到这里。本函数只兜底未被结构吸收的散点 CALL：
       · 功能码由前一句 MOVE … TO xxx-FUNCTION 设，记在 ctx.struct_function。
-      · 单条操作（READR/UPDAT/WRITE/DELET…）在 io_default_pattern.operations 有对应方法
+      · 功能码在 io_default_pattern.operations 有对应方法（如 UPDAT/WRITE→save）
         → 直出 obj = repo.method(obj);
-      · 顺序读游标（BEGN/BEGNH/NEXTR）刻意不在 operations 中（无法用固定单方法表达，
-        见 knowledge/io_call_patterns.md）→ 落到运行时分发 obj = repo.execute(obj.getFunction(), obj);
-        在还原出的 while 循环内逐条推进（功能码经 MOVE 由 BEGN→NEXTR 变化）。
-      · 功能码静态也拿不到 → 同样走 execute() 运行时分发（仍确定性）。
+      · 否则（含游标 BEGN/NEXTR、功能码不在 operations）→ matched=False，交 LLM 兜底。
+        决策 D（步骤10）：功能码恒为 CALL 前显性字面量、静态恒可得，原 execute() 运行时分发
+        是为不存在场景写的死代码，已移除。
       · 未映射的子程序 → matched=False，交 LLM 兜底。
-    契约：参数对象进出（Repository 在返回对象上写 STATUZ），下游 STATUZ 检查零改写。
     """
     if len(toks) < 2:
         return [], False
@@ -1021,10 +1407,9 @@ def _t_call(toks: list[str], ctx: Ctx) -> tuple[list[str], bool]:
         obj = _struct_obj(prefix, ctx) if prefix else "params"
         func = ctx.struct_function.get(prefix)
         if func and func in ops:
-            method = re.sub(r"\{[^}]*\}", obj, ops[func])           # findByKey({key}) → findByKey(elpoParams)
+            method = re.sub(r"\{[^}]*\}", obj, ops[func])           # save({entity}) → save(elpoParams)
             return [f"{obj} = {repo}.{method};"], True               # 静态固化
-        # 功能码静态拿不到 → 运行时分发
-        return [f"{obj} = {repo}.execute({obj}.{ctx.struct_getter}Function(), {obj});"], True
+        return [], False    # 功能码不在 operations（游标/未知）→ 交 LLM（决策 D：移除 execute 死代码退路）
 
     # 日期子程序：dateConversionService.convertDateN(params)
     dinfo = ctx.date_programs.get(name)
@@ -1060,13 +1445,25 @@ def _t_move(toks: list[str], ctx: Ctx) -> tuple[list[str], bool]:
         return [], False
     src = src_toks[0]
     su = src.upper()
+    sp_src = _struct_prefix(src, ctx)
+    src_is_params = bool(sp_src and sp_src[1] == "PARAMS")
     lines: list[str] = []
     for dst in dsts:
-        # 跟踪 IO 功能码：MOVE READR TO ELPO-FUNCTION → struct_function["ELPO"]="READR"
-        # （仍照常生成 setter，因运行时分发退路需要 obj.getFunction() 携带功能码）
         sp_dst = _struct_prefix(dst, ctx)
-        if sp_dst and sp_dst[1] == "FUNCTION":
-            ctx.struct_function[sp_dst[0]] = su.strip("'\"")
+        # 调用约定吸收（步骤10）：FUNCTION/FORMAT 不是真实字段，一律不生成 setter。
+        #   · MOVE READR TO ELPO-FUNCTION → 仅记 struct_function（供 CALL 吸收功能码）。
+        #   · MOVE ELPOREC TO ELPO-FORMAT → 仅校验记录格式，Java 侧无对应，直接吞掉。
+        if sp_dst and sp_dst[1] in ("FUNCTION", "FORMAT"):
+            if sp_dst[1] == "FUNCTION":
+                ctx.struct_function[sp_dst[0]] = su.strip("'\"")
+            continue
+        # 决策 C（步骤10）：组级 params 互拷 MOVE xxx-PARAMS TO yyy-PARAMS →
+        #   BeanUtils.copyProperties(src, dst)：运行时按同名属性互拷、名字对不上的自动忽略，
+        #   恰好等价「同名字段互拷」，且无需拷贝簿字段表（字段不在盘上时静态无法逐字段枚举）。
+        if src_is_params and sp_dst and sp_dst[1] == "PARAMS":
+            lines.append(f"BeanUtils.copyProperties("
+                         f"{_struct_obj(sp_src[0], ctx)}, {_struct_obj(sp_dst[0], ctx)});")
+            continue
         if su in _FIGURATIVE_BLANK:
             val = '""' if not _is_numeric_field(dst, ctx) else ("BigDecimal.ZERO" if _is_bigdecimal(dst, ctx) else "0")
         elif su in _FIGURATIVE_ZERO:

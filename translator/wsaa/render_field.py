@@ -22,9 +22,13 @@ def _short(raw: str, n: int = 64) -> str:
     return raw if len(raw) <= n else raw[:n] + "…"
 
 
-def render_field(node: WsNode, dims: list[int]) -> list[str]:
-    """渲染一个叶子字段（dims=祖先+自身 OCCURS 维度列表）。"""
-    jn = java_name(node.name)
+def render_field(node: WsNode, dims: list[int], name_override: str | None = None) -> list[str]:
+    """渲染一个叶子字段（dims=祖先+自身 OCCURS 维度列表）。
+
+    name_override：命名碰撞消歧用（步骤12 §4）；非 None 时用它替代 java_name(节点名)，
+    其余（类型/初值/样式）不变。
+    """
+    jn = name_override or java_name(node.name)
     jt = node.java_type
     cm = f"  // COBOL: {_short(node.raw)}"
     if dims:

@@ -162,6 +162,46 @@ class TestSectionToMethod(unittest.TestCase):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# 3a2. PERFORM A THRU B 跨段不丢中间段（步骤12 §2）
+#     Bug：旧实现只取 header[0] 当过程名，THRU B 被忽略 → 跨多段时丢中间段。
+# ══════════════════════════════════════════════════════════════════════════════
+class TestPerformThru(unittest.TestCase):
+    def _ctx(self, order):
+        import translator.rules as r
+        return r.Ctx(field_type_map={}, section_to_method=lambda s: "p_" + s.replace("-", "").lower(),
+                     known_sections=set(order), section_order=list(order))
+
+    def _range(self, header, order):
+        import translator.rules as r
+        hu = [h.upper() for h in header]
+        return r._perform_range(header, hu, header[0].upper(), self._ctx(order), 0)
+
+    def test_thru_spans_sections_expanded(self):
+        """A THRU B 跨段 → 区间内每段都生成调用，不丢中间段 C。"""
+        order = ["A-SEC", "C-SEC", "B-SEC"]
+        out = "\n".join(self._range(["A-SEC", "THRU", "B-SEC"], order))
+        self.assertIn("p_asec();", out)
+        self.assertIn("p_csec();", out)   # 中间段不可丢
+        self.assertIn("p_bsec();", out)
+
+    def test_thru_single_unit_one_call(self):
+        """A THRU B 相邻且 B 紧接（A==B 或仅一段）→ 单调用，不啰嗦。"""
+        out = self._range(["A-SEC", "THRU", "A-SEC"], ["A-SEC", "B-SEC"])
+        self.assertEqual([l for l in out if "p_" in l], ["this.p_asec();"])
+
+    def test_thru_unknown_endpoint_todo(self):
+        """端点非已知 SECTION（paragraph 级）→ 退化 TODO + pA()，不臆测、不静默丢。"""
+        out = "\n".join(self._range(["2000-INIT", "THRU", "2000-EXIT"], ["2000-INIT"]))
+        self.assertIn("TODO", out)
+        self.assertIn("p_2000init();", out)
+
+    def test_no_thru_single_call_unchanged(self):
+        """无 THRU → 单调用，历史行为不变。"""
+        out = self._range(["A-SEC"], ["A-SEC", "B-SEC"])
+        self.assertEqual(out, ["this.p_asec();"])
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # 3b. IO 调用固化：_t_call（CALL 'xxxIO'）+ 结构体拷贝/重置（_assign）
 #     固化 IO 查询，把 BEGN/READR/NEXTR/UPDAT 从 LLM 收回确定性规则。
 # ══════════════════════════════════════════════════════════════════════════════
@@ -200,15 +240,13 @@ class TestIoCallAndStructAssign(unittest.TestCase):
         self.assertTrue(matched)
         self.assertEqual(lines, ["elpoParams = elpoRepository.findByKey(elpoParams);"])
 
-    def test_io_call_runtime_dispatch(self):
-        """功能码静态拿不到 → 运行时分发 execute(obj.getFunction(), obj)。"""
+    def test_io_call_no_func_falls_to_llm(self):
+        """决策 D（步骤10）：功能码恒为 CALL 前显性字面量，原 execute() 运行时分发是死代码已移除。
+        叶子级散点 CALL 若功能码不在 operations（游标/未知）→ matched=False，交 LLM。"""
         ctx = self._ctx()  # struct_function 为空
         lines, matched = self.rules.translate_leaf(
             self._leaf("CALL 'ELPOIO' USING ELPO-PARAMS"), ctx)
-        self.assertTrue(matched)
-        self.assertEqual(
-            lines,
-            ["elpoParams = elpoRepository.execute(elpoParams.getFunction(), elpoParams);"])
+        self.assertFalse(matched)
 
     def test_io_call_unmapped_falls_to_llm(self):
         """未映射的 IO 子程序 → matched=False，交 LLM。"""
@@ -224,12 +262,14 @@ class TestIoCallAndStructAssign(unittest.TestCase):
         self.assertEqual(ctx.struct_function.get("ELPO"), "READR")
 
     def test_move_struct_to_struct_is_copy(self):
-        """MOVE 结构体→结构体 是拷贝赋值，不是 new（修复的 bug）。"""
+        """决策 C（步骤10）：MOVE xxx-PARAMS TO yyy-PARAMS → 同名字段互拷，
+        以 BeanUtils.copyProperties 实现（名字对不上的自动忽略，无需拷贝簿字段表）；
+        不再退化成引用别名 sysrParams = elpoParams（§2 违规#6，编译不过）。"""
         ctx = self._ctx()
         lines, matched = self.rules.translate_leaf(
             self._leaf("MOVE ELPO-PARAMS TO SYSR-PARAMS"), ctx)
         self.assertTrue(matched)
-        self.assertEqual(lines, ["sysrParams = elpoParams;"])
+        self.assertEqual(lines, ["BeanUtils.copyProperties(elpoParams, sysrParams);"])
 
     def test_move_spaces_to_struct_is_reset(self):
         """MOVE SPACES→结构体 仍是 new 重置。"""
@@ -262,6 +302,252 @@ class TestIoCallAndStructAssign(unittest.TestCase):
             if not matched:
                 unmatched.append(leaf.raw or " ".join(leaf.tokens))
         self.assertEqual(unmatched, [], f"以下叶子未被固化、会交 LLM: {unmatched}")
+
+    # ── 步骤10：单条读 READR 结构化吸收（setup+CALL+IF STATUZ → findBy…Readr + null 检查）──
+    def _readr_ctx(self, **kw):
+        """带完整 io_default_pattern（READR 模板含 findBy → 识别为单条读）的 ctx；
+        清空 io_programs，让被测表走范式派生（field_name=<base>Repository，finder 按键派生）。"""
+        return self._ctx(
+            io_programs={},
+            io_default_pattern={
+                "class_suffix": "Repository", "field_suffix": "Repository",
+                "param_struct_suffix": "-PARAMS", "import_package": "com.example.repository",
+                "operations": {"READR": "findByKeyReadr({key})", "UPDAT": "save({entity})"}},
+            **kw)
+
+    def _build(self, ctx, sec_lines):
+        from translator.segmenter import segment, split_paragraphs
+        paras = [(lbl, segment(body)) for lbl, body in split_paragraphs(sec_lines)]
+        return "\n".join(self.rules.build_section(paras, ctx))
+
+    def test_readr_single_absorbed_ok_form(self):
+        """READR + IF STATUZ = O-K → `Rec r = repo.findBy…Readr(键); if (r != null) {…}`，
+        FUNCTION/FORMAT/SPACES/STATUZ 全吸收（§2 的 6 项违规清零）。"""
+        ctx = self._readr_ctx(
+            io_struct_prefixes={"ELPO"},
+            field_type_map={n: {"type": "String"} for n in
+                            ("wsaaCompany", "wsaaLanguage", "wsaaData")})
+        skel = self._build(ctx, [
+            "1510-START.",
+            "           MOVE SPACES         TO ELPO-PARAMS.",
+            "           MOVE WSAA-COMPANY   TO ELPO-CHDRCOY.",
+            "           MOVE WSAA-LANGUAGE  TO ELPO-CHDRNUM.",
+            "           MOVE ELPOREC        TO ELPO-FORMAT.",
+            "           MOVE READR          TO ELPO-FUNCTION.",
+            "           CALL 'ELPOIO'   USING ELPO-PARAMS.",
+            "           IF ELPO-STATUZ = O-K",
+            "              MOVE ELPO-DATA TO WSAA-DATA",
+            "           END-IF.",
+            "1590-EXIT.",
+            "           EXIT.",
+        ])
+        self.assertIn(
+            "ElpoRecord elpo = elpoRepository.findByChdrcoyAndChdrnumReadr("
+            "wsaaCompany, wsaaLanguage);", skel)
+        self.assertIn("if (elpo != null) {", skel)
+        for leak in ("setFunction", "setFormat", "new ElpoParams", "getStatuz",
+                     ".execute(", "findByKey(elpoParams"):
+            self.assertNotIn(leak, skel, f"残留泄漏: {leak}\n{skel}")
+        # 叶子全部命中 + 体内 ELPO-DATA 重绑定到 record
+        body = [self.rules.translate_leaf(lf, ctx)[0]
+                for _i, lf in ctx.leaves if lf.tokens and lf.tokens[0].upper() == "MOVE"]
+        self.assertIn(["wsaaData = elpo.getData();"], body)
+
+    def test_readr_single_absorbed_error_form(self):
+        """决策 A：IF STATUZ NOT=O-K AND NOT=ENDP（PERFORM 580）→ try{finder+后续} catch{580}。"""
+        ctx = self._readr_ctx(
+            io_struct_prefixes={"ITDM"},
+            known_sections={"580-DB-ERROR"},
+            section_to_method=lambda s: "dbError580",
+            field_type_map={n: {"type": "String"} for n in ("wsaaItem", "wsaaValue")})
+        skel = self._build(ctx, [
+            "2000-READ.",
+            "           MOVE SPACES   TO ITDM-PARAMS.",
+            "           MOVE WSAA-ITEM TO ITDM-ITEMKEY.",
+            "           MOVE READR    TO ITDM-FUNCTION.",
+            "           CALL 'ITDMIO' USING ITDM-PARAMS.",
+            "           IF ITDM-STATUZ NOT = O-K AND ITDM-STATUZ NOT = ENDP",
+            "              PERFORM 580-DB-ERROR",
+            "           END-IF.",
+            "           MOVE ITDM-VALUE TO WSAA-VALUE.",
+            "2090-EXIT.",
+            "           EXIT.",
+        ])
+        self.assertIn("try {", skel)
+        self.assertIn("ItdmRecord itdm = itdmRepository.findByItemkeyReadr(wsaaItem);", skel)
+        self.assertIn("} catch (Exception e) {", skel)
+        self.assertNotIn("getStatuz", skel)
+        # try 体内 ITDM-VALUE 重绑定到 record
+        body = [self.rules.translate_leaf(lf, ctx)[0]
+                for _i, lf in ctx.leaves if lf.tokens and lf.tokens[0].upper() == "MOVE"]
+        self.assertIn(["wsaaValue = itdm.getValue();"], body)
+
+    # ── 步骤11：单条写 IO（UPDAT/WRITE/DELET）结构化吸收 ──────────────────────
+    def _write_ctx(self, **kw):
+        """带写功能码（save/delete）的 io_default_pattern；io_programs 空走范式派生。"""
+        return self._ctx(
+            io_programs={},
+            io_default_pattern={
+                "class_suffix": "Repository", "field_suffix": "Repository",
+                "param_struct_suffix": "-PARAMS", "import_package": "com.example.repository",
+                "operations": {"READR": "findByKeyReadr({key})", "UPDAT": "save({entity})",
+                               "WRITR": "save({entity})", "DELET": "delete({entity})"}},
+            **kw)
+
+    def test_write_single_updat_reuse_try_catch(self):
+        """UPDAT（无 MOVE SPACES → 复用上文实体）+ IF STATUZ NOT=O-K（PERFORM 9999）
+        → x.setField(...); try{ repo.save(x); } catch{ 错误段(); }。对照 knowledge §186。"""
+        ctx = self._write_ctx(
+            io_struct_prefixes={"TMLCLST"},
+            known_sections={"9999-FATAL-ERROR"},
+            section_to_method=lambda s: "fatalError9999",
+            field_type_map={"wsaaNewValue": {"type": "String"}})
+        skel = self._build(ctx, [
+            "5000-UPDATE.",
+            "           MOVE WSAA-NEW-VALUE TO TMLCLST-FIELD.",
+            "           MOVE UPDAT          TO TMLCLST-FUNCTION.",
+            "           CALL 'TMLCLSTIO' USING TMLCLST-PARAMS.",
+            "           IF TMLCLST-STATUZ NOT = O-K",
+            "              PERFORM 9999-FATAL-ERROR",
+            "           END-IF.",
+            "5090-EXIT.",
+            "           EXIT.",
+        ])
+        self.assertIn("try {", skel)
+        self.assertIn("tmlclstRepository.save(tmlclst);", skel)
+        self.assertIn("} catch (Exception e) {", skel)
+        self.assertIn("fatalError9999();", skel)
+        for leak in ("getStatuz", "new TmlclstParams", "setFunction",
+                     "= tmlclstRepository.save", "TmlclstRecord tmlclst = new"):
+            self.assertNotIn(leak, skel, f"残留泄漏: {leak}\n{skel}")
+        # setter 以叶子占位进入，translate_leaf 时经 rebind 标注 → 实体 setter（非 Params）
+        body = [self.rules.translate_leaf(lf, ctx)[0]
+                for _i, lf in ctx.leaves if lf.tokens and lf.tokens[0].upper() == "MOVE"]
+        self.assertIn(["tmlclst.setField(wsaaNewValue);"], body)
+
+    def test_write_single_write_new_entity(self):
+        """WRITR（含 MOVE SPACES TO pfx-PARAMS → 插入）无 IF
+        → XxxRecord x = new XxxRecord(); x.setField(...); repo.save(x);。
+        （功能码用 WRITR：真实 LIFE 系统的写码为 5 字缩写，避开 COBOL 动词 WRITE 与切分器撞名）"""
+        ctx = self._write_ctx(
+            io_struct_prefixes={"TMLCLST"},
+            field_type_map={"wsaaVal": {"type": "String"}})
+        skel = self._build(ctx, [
+            "6000-INSERT.",
+            "           MOVE SPACES   TO TMLCLST-PARAMS.",
+            "           MOVE WSAA-VAL TO TMLCLST-FIELD.",
+            "           MOVE WRITR    TO TMLCLST-FUNCTION.",
+            "           CALL 'TMLCLSTIO' USING TMLCLST-PARAMS.",
+            "6090-EXIT.",
+            "           EXIT.",
+        ])
+        self.assertIn("TmlclstRecord tmlclst = new TmlclstRecord();", skel)
+        self.assertIn("tmlclstRepository.save(tmlclst);", skel)
+        for leak in ("getStatuz", "new TmlclstParams", "setFunction",
+                     "= tmlclstRepository.save"):
+            self.assertNotIn(leak, skel, f"残留泄漏: {leak}\n{skel}")
+        # setter 以叶子占位进入 → 实体 setter（rebind 标注）
+        body = [self.rules.translate_leaf(lf, ctx)[0]
+                for _i, lf in ctx.leaves if lf.tokens and lf.tokens[0].upper() == "MOVE"
+                and "TMLCLST-FIELD" in [t.upper() for t in lf.tokens]]
+        self.assertIn(["tmlclst.setField(wsaaVal);"], body)
+
+    def test_write_single_delet(self):
+        """DELET（决策 W-4 选项①）→ repo.delete(实体)，不出 deleteByKey。"""
+        ctx = self._write_ctx(io_struct_prefixes={"TMLCLST"})
+        skel = self._build(ctx, [
+            "7000-DELETE.",
+            "           MOVE DELET TO TMLCLST-FUNCTION.",
+            "           CALL 'TMLCLSTIO' USING TMLCLST-PARAMS.",
+            "7090-EXIT.",
+            "           EXIT.",
+        ])
+        self.assertIn("tmlclstRepository.delete(tmlclst);", skel)
+        self.assertNotIn("deleteByKey", skel)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 3b. 有符号 DISPLAY 存储串保符号（步骤12 §1，overpunch-on-negative）
+#     Bug：旧实现 _toDigits 无条件 .abs()，负金额经 REDEFINES/组切片 round-trip 后静默变正。
+# ══════════════════════════════════════════════════════════════════════════════
+class TestSignedOverpunch(unittest.TestCase):
+    _OVP = "}JKLMNOPQR"  # 须与 storage.NUM_HELPER 的 _OVP 一致
+
+    def _to_digits(self, val: int, n: int) -> str:
+        """镜像 Java _toDigits（scale=0 整数）：保符号 overpunch 编码。"""
+        neg = val < 0
+        s = str(abs(val))
+        if len(s) > n:
+            s = s[len(s) - n:]
+        s = s.rjust(n, "0")
+        if neg and s:
+            s = s[:-1] + self._OVP[int(s[-1])]
+        return s
+
+    def _de_overpunch(self, s: str) -> int:
+        """镜像 Java _deOverpunch + parse：解码 overpunch 还原带符号整数。"""
+        idx = self._OVP.find(s[-1])
+        if idx >= 0:
+            return -int(s[:-1] + str(idx))
+        return int(s)
+
+    def test_negative_round_trip(self):
+        """负值经 _toDigits → _deOverpunch 必须原样还原（含符号），正值不受影响。"""
+        for v, n in [(-123, 5), (-1, 3), (-456, 3), (0, 4), (789, 4), (-7, 1)]:
+            enc = self._to_digits(v, n)
+            self.assertEqual(len(enc), n, f"宽度变了：{v}->{enc}")
+            self.assertEqual(self._de_overpunch(enc), v, f"round-trip 丢符号：{v}->{enc}")
+
+    def test_positive_unchanged_no_overpunch(self):
+        """正/无符号值保持纯数字串（零回归）。"""
+        self.assertEqual(self._to_digits(123, 5), "00123")
+        self.assertTrue(self._to_digits(123, 5).isdigit())
+
+    def test_helper_emits_overpunch_not_bare_abs(self):
+        """生成的 Java helper 必含 overpunch 逻辑，且不再无条件 abs。"""
+        from translator.wsaa.storage import NUM_HELPER, num_from_digits
+        joined = "\n".join(NUM_HELPER)
+        self.assertIn("_OVP", joined)
+        self.assertIn("_deOverpunch", joined)
+        self.assertIn("v.signum() < 0", joined)
+        # int/long 解析须经 overpunch 解码
+        self.assertIn("_deOverpunch", num_from_digits("seg", "long", 0))
+        self.assertIn("_deOverpunch", num_from_digits("seg", "int", 0))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 3c. 命名碰撞：撞名字段改名保留，不静默丢（步骤12 §4）
+# ══════════════════════════════════════════════════════════════════════════════
+class TestNameCollision(unittest.TestCase):
+    def test_disambiguate_parent_prefix(self):
+        """父组名前缀消歧，且兜底序号保证唯一。"""
+        from translator.wsaa.render_class import _disambiguate
+        self.assertEqual(_disambiguate("wsaaX", "wsaaGroupA", {"wsaaX"}), "wsaaGroupAWsaaX")
+        # 父前缀仍冲突 → 序号兜底
+        self.assertEqual(_disambiguate("wsaaX", "wsaaG", {"wsaaX", "wsaaGWsaaX"}), "wsaaX_2")
+        # 无父组名 → jn_2
+        self.assertEqual(_disambiguate("wsaaX", "", {"wsaaX"}), "wsaaX_2")
+
+    def test_collision_renamed_not_dropped(self):
+        """两个不同父组下的同名叶子：第二个改名保留 + TODO，字段不丢。"""
+        from parser.ws.model import WsNode
+        from translator.wsaa.render_class import render_wsaa
+
+        def leaf(name):
+            return WsNode(level=3, name=name, pic="X(04)", raw=f"03 {name} PIC X(04).")
+
+        def grp(name, child):
+            g = WsNode(level=1, name=name, pic="", raw=f"01 {name}.")
+            g.children = [child]
+            return g
+        roots = [grp("WSAA-GROUP-A", leaf("WSAA-DUP")), grp("WSAA-GROUP-B", leaf("WSAA-DUP"))]
+        src = render_wsaa(roots, "ZTEST")
+        self.assertIn("wsaaDup", src)                 # 首个保基名
+        self.assertIn("命名碰撞", src)                 # 第二个标 TODO
+        self.assertNotIn("重复名跳过", src)            # 旧的静默丢行为已移除
+        self.assertEqual(src.count("private String wsaaDup ="), 1)  # 基名只一份
+        # 第二个字段确实声明了（改名后），不是被吞掉
+        self.assertIn("wsaaGroupBWsaaDup", src)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
