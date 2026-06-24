@@ -14,7 +14,9 @@ from __future__ import annotations
 from config import spec_loader
 from translator.skeleton_gen.program_model import build_model
 from translator.skeleton_gen.copy_resolver import resolve
-from translator.skeleton_gen.body_context import build_body_ctx, translate_section_body
+from translator.skeleton_gen.body_context import (
+    build_body_ctx, translate_section_body, render_pending_range_methods,
+)
 
 
 def _using_params(model) -> list[tuple[str, str]]:
@@ -92,6 +94,16 @@ def _section_method(model, using, s, ctx, ws_field_names, known_methods) -> list
     return out
 
 
+def _range_method(model, using, name, body) -> list[str]:
+    """单个合成区间方法（步骤13 §2.3 路线b：PERFORM A THRU B 的 paragraph 区间）→ 方法签名 + 翻译体。
+    签名与 SECTION 方法同款（带 wsaa + USING），故段内 this.aThruB(wsaa, using…) 调用可直达。"""
+    out = ["", f"    void {name}({_sig(model.wsaa_class, using)}) {{",
+           "        // 合成区间方法（步骤13 §2.3：PERFORM…THRU paragraph 区间，区间内各单元体按源序拼接翻译）"]
+    out += [("        " + ln if ln.strip() else "") for ln in body.split("\n")]
+    out.append("    }")
+    return out
+
+
 def render_skeleton(program) -> str:
     """CobolProgram → 主类骨架 Java 源码字符串（含确定性翻译的 SECTION 方法体，步骤07）。"""
     model = build_model(program)
@@ -111,5 +123,9 @@ def render_skeleton(program) -> str:
             continue
         seen.add(s.method)
         lines += _section_method(model, using, s, ctx, ws_field_names, known_methods)
+    # 步骤13 §2.3 缺口2 step3：所有 SECTION 发射后，drain pending 区间方法、翻译并发射为类级合成方法。
+    rendered = render_pending_range_methods(ctx, ws_field_names, _args(using), known_methods)
+    for name, body in rendered.items():
+        lines += _range_method(model, using, name, body)
     lines += ["}", ""]
     return "\n".join(lines)

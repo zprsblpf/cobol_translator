@@ -35,6 +35,26 @@ def _load_io_maps() -> dict:
     }
 
 
+def _build_proc_order(program) -> list[tuple]:
+    """全程序「过程单元顺序表」（步骤13 §2.1 缺口1）：按源码物理顺序罗列每个 SECTION 头与其下 paragraph，
+    每项四元 (name_upper, kind, section_upper, body_lines)。
+    构建：每段 split_paragraphs → 首个无标签块（段前导语句）归 SECTION 头单元，其余带标签块各成 paragraph 单元。
+    section_order 保留不变（SECTION 级路径继续用它），proc_order 是其带体超集。"""
+    proc_order: list[tuple] = []
+    for s in program.sections:
+        sec = s.name.upper()
+        sec_body: list[str] = []
+        para_units: list[tuple] = []
+        for lbl, body in split_paragraphs(s.lines):
+            if lbl is None:
+                sec_body += body                       # 段前导无标签块 → 归 SECTION 头
+            else:
+                para_units.append((lbl.upper(), "paragraph", sec, body))
+        proc_order.append((sec, "section", sec, sec_body))   # SECTION 头作该段第一个单元
+        proc_order += para_units
+    return proc_order
+
+
 def build_body_ctx(program) -> tuple[_rules.Ctx, list[str]]:
     """CobolProgram → (rules.Ctx, ws_field_names)。ws_field_names 仅含 WORKING-STORAGE 字段（用于 wsaa. 前缀）。"""
     # field_type_map 用 WS+LINKAGE 全量（同 pipeline，供规则判型）；前缀集只取 WS（LINKAGE 是方法入参，裸名）
@@ -52,6 +72,7 @@ def build_body_ctx(program) -> tuple[_rules.Ctx, list[str]]:
         section_to_method=_section_to_method,
         known_sections={s.name.upper() for s in program.sections},
         section_order=[s.name.upper() for s in program.sections],
+        proc_order=_build_proc_order(program),   # 步骤13 §2.1：paragraph 级 THRU 区间解析的数据基座
         io_struct_prefixes=reg["prefixes"], struct_objects=reg["objects"],
         struct_classes=reg["classes"], struct_getter=reg["getter"],
         struct_setter=reg["setter"], struct_default_suffix=reg["default_suffix"],
@@ -103,4 +124,22 @@ def translate_section_body(body_lines: list[str], ctx: _rules.Ctx, ws_field_name
         fill = "\n".join(lines) if matched else f"// TODO 叶子待译: {raw}"
         body = body.replace(f"/*__LEAF_{lid}__*/", fill)
     body = re.sub(r"/\*__LEAF_\d+__\*/", "// TODO: 未翻译叶子", body)   # 防御
-    return _postprocess_body(body, ws_field_names, call_args, known_methods)
+    # 步骤13 §2.3 缺口2：本段翻译中 _perform_range 可能已登记合成区间方法名，并入 known_methods，
+    # 则 B1 自动把段内 this.aThruB(); 补成 this.aThruB(wsaa, using…);（无需 _perform_range 感知 call_args）。
+    methods = set(known_methods) | set(ctx.pending_range_methods)
+    return _postprocess_body(body, ws_field_names, call_args, methods)
+
+
+def render_pending_range_methods(ctx: _rules.Ctx, ws_field_names: list[str],
+                                 call_args: str, known_methods: set[str]) -> dict[str, str]:
+    """drain ctx.pending_range_methods，逐条把拼接体复用 translate_section_body 翻成合成区间方法体
+    （步骤13 §2.3 缺口3：编排下沉 body_context，避免 rules→body_context 成环）。
+    返回 {合成方法名: Java 方法体}，供 render_skeleton 发射为类级方法。
+    设计思路：合成体本身可能再含 PERFORM…THRU 登记新的嵌套区间方法，故按工作集循环至稳定。"""
+    rendered: dict[str, str] = {}
+    while True:
+        todo = {n: lines for n, lines in ctx.pending_range_methods.items() if n not in rendered}
+        if not todo:
+            return rendered
+        for name, lines in todo.items():
+            rendered[name] = translate_section_body(lines, ctx, ws_field_names, call_args, known_methods)

@@ -1,8 +1,8 @@
 # 步骤13 · paragraph 级 PERFORM THRU 区间解析设计
 
-状态：🔶决策已认可·实现细节回填待认可（2026-06-09 用户认可决策 D1=路线b/D2=同段+跨段/D3=保守；
-2026-06-24 回填 3 处实现级细节——缺口1 proc_order 四元载荷 / 缺口2 合成方法收集+类级落地 / 缺口3 翻译编排下沉 body_context，
-见 §2.1·§2.3·§4，**待认可后动工**）
+状态：🟢已实现（2026-06-09 认可决策 D1=路线b/D2=同段+跨段/D3=保守；2026-06-24 回填 3 处实现级细节；
+2026-06-25 用户认可回填细节并落地实现——缺口1 proc_order 四元载荷 / 缺口2 合成方法收集+类级落地 / 缺口3 翻译编排下沉 body_context，
+行号已回填 §4，43 项单测通过，真实程序渲染稳定）
 对应概要：`../架构索引/项目总览.md`
 翻译标准正本：`config/specs/skeleton_spec.yaml`（block_grammar.perform.thru）、`config/mappings/naming_conventions.yaml`
 依赖前序：步骤12 §2（SECTION 级 THRU 区间展开，本步骤是其 paragraph 级延伸）、步骤07/08（SECTION 方法体 + 段内 paragraph 内联/状态机降级）
@@ -113,16 +113,22 @@ paragraph 顺序与其体（`split_paragraphs` 已存在，步骤08）。把「S
 
 ---
 
-## 4. 文件与调用关系（实现落点，待认可后回填行号）
+## 4. 文件与调用关系（实现落点，行号已回填 2026-06-25）
 
 | 文件 | 改动 | 职责 |
 |---|---|---|
-| `translator/rules.py` | `Ctx` 加 `proc_order`（四元，缺口1）+ `pending_range_methods`（程序级，缺口2）字段；`reset_section` **不清** `pending_range_methods`；`_perform_range` 加 paragraph 级分支（解析区间→登记 pending→返回 `this.aThruB();`，缺口2-3）；新增 config 命名模板取值辅助 | 区间解析 + 登记（**不碰翻译流程**） |
-| `translator/skeleton_gen/body_context.py` | `build_body_ctx` 构建并注入四元 `proc_order`（遍历 `program.sections` + `split_paragraphs`，带体）；新增 `render_pending_range_methods()` 合成方法体翻译编排（缺口3） | 数据基座 + 合成方法翻译 |
-| `translator/skeleton_gen/render_skeleton.py` | 所有 SECTION 发射后，drain `ctx.pending_range_methods`、调 `render_pending_range_methods` 发射类级合成方法；`known_methods` 并入合成名（缺口2，**§4 原表漏列此文件，回填补入**） | 合成方法类级落地 |
-| `config/specs/skeleton_spec.yaml` | `block_grammar.perform.thru` 加 paragraph 级两态说明（正本先行） | 翻译标准 |
-| `config/mappings/naming_conventions.yaml` | （路线 b）新增 `perform_range_method` 命名模板 | 命名规范 |
-| `test_translation.py` | `TestPerformThru` 扩展 paragraph 级用例（见 §6） | 验证 |
+| `translator/rules.py` | `Ctx` 加 `proc_order`（四元，缺口1，`rules.py:30`）+ `pending_range_methods`（程序级，缺口2，`rules.py:33`）字段；`reset_section` **不清**（该重置在 `body_context.reset_section`，未列这两字段→不清，零改动即满足）；`_perform_range` 升级两级查找（`rules.py:1171`）；新增 `_perform_range_paragraph`（解析区间→登记 pending→返回 `this.aThruB();`，缺口2-3，`rules.py:1202`）；`from config import spec_loader`（`rules.py:18`）调命名正本 | 区间解析 + 登记（**不碰翻译流程**） |
+| `config/spec_loader.py` | 新增 `perform_range_method(a_method,b_method)`（缺口/§2.4 命名取值辅助，`spec_loader.py:116`） | 命名正本访问层 |
+| `translator/skeleton_gen/body_context.py` | 新增 `_build_proc_order()`（遍历 `program.sections`+`split_paragraphs` 建四元，`body_context.py:38`）并在 `build_body_ctx` 注入（`body_context.py:75`）；`translate_section_body` 末尾 `known_methods ∪ pending 键`（缺口2，`body_context.py:129`）；新增 `render_pending_range_methods()`（缺口3，工作集循环至稳定，`body_context.py:133`） | 数据基座 + 合成方法翻译编排 |
+| `translator/skeleton_gen/render_skeleton.py` | 新增 `_range_method()`（合成方法签名+体，`render_skeleton.py:97`）；section 循环后 drain `pending` 调 `render_pending_range_methods` 发射类级方法（缺口2 step3，`render_skeleton.py:126`） | 合成方法类级落地 |
+| `config/specs/skeleton_spec.yaml` | `perform.thru` 加 `paragraph_intra_section`/`cross_section_paragraph` 两态说明（正本先行） | 翻译标准 |
+| `config/mappings/naming_conventions.yaml` | （路线 b）新增 `perform_range.method_template`（`{a}Thru{B}`） | 命名规范 |
+| `test_translation.py` | `TestPerformThru` 扩展 5 项 paragraph 级用例（synthesize/cross-section/idempotent/duplicate-degrade/b-before-a-degrade） | 验证 |
+
+**实现期偏差说明（如实记录，均更保守、未超范围）**：
+- 命名取值辅助最终落 `config/spec_loader.py`（命名正本的天然归属），由 `rules._perform_range_paragraph` 调用——比「放 rules」更内聚，rules 仍不含 config 解析逻辑。
+- `reset_section` 实际位于 `body_context.py`（非 rules）；其本就不触碰 `proc_order`/`pending_range_methods`，故「程序级、段重置不清」零改动即成立。
+- 区间「单单元」(`ib<=ia`，含 C-3 单条 PERFORM paragraph) → 返回 None 交回 TODO 退化（不发射指向不存在方法的裸调用），比 §2.2「退化单调用」更安全；端点重名（count≠1，D3 保守）同样退化。
 
 数据流（回填后）：`body_context.build_body_ctx` 建四元 `proc_order` → 注入 `Ctx` → 段翻译中 `_sk_perform`
 → `_perform_range`（先 SECTION 级，零回归；后 paragraph 级）→ 命中 paragraph 区间则**登记** `pending_range_methods`

@@ -200,6 +200,69 @@ class TestPerformThru(unittest.TestCase):
         out = self._range(["A-SEC"], ["A-SEC", "B-SEC"])
         self.assertEqual(out, ["this.p_asec();"])
 
+    # ── 步骤13：paragraph 级 THRU 区间（路线b 合成区间方法）──
+    def _pctx(self, proc_order, section_order=None):
+        import translator.rules as r
+        return r.Ctx(field_type_map={}, section_to_method=lambda s: "p_" + s.replace("-", "").lower(),
+                     known_sections=set(section_order or []), section_order=list(section_order or []),
+                     proc_order=list(proc_order))
+
+    def _prange(self, header, ctx):
+        import translator.rules as r
+        hu = [h.upper() for h in header]
+        return r._perform_range(header, hu, header[0].upper(), ctx, 0)
+
+    def test_thru_paragraph_range_synthesizes_method(self):
+        """paragraph 级 A THRU B（同段，B 在后）→ 合成区间方法、登记 pending、调用点单次 this.xThruY()。"""
+        proc = [("S", "section", "S", []),
+                ("PARA-A", "paragraph", "S", ["  MOVE 1 TO X"]),
+                ("PARA-M", "paragraph", "S", ["  MOVE 2 TO Y"]),
+                ("PARA-B", "paragraph", "S", ["  MOVE 3 TO Z"])]
+        ctx = self._pctx(proc)
+        out = "\n".join(self._prange(["PARA-A", "THRU", "PARA-B"], ctx))
+        mname = "p_paraaThruP_parab"
+        self.assertIn(f"this.{mname}();", out)              # 单次合成调用
+        self.assertIn(mname, ctx.pending_range_methods)     # 已登记落地
+        # 区间内三单元体按 proc_order 序拼接（不丢中间 PARA-M）
+        self.assertEqual(ctx.pending_range_methods[mname],
+                         ["  MOVE 1 TO X", "  MOVE 2 TO Y", "  MOVE 3 TO Z"])
+
+    def test_thru_paragraph_range_cross_section(self):
+        """跨 SECTION 的 paragraph 区间（D2）：proc_order 含 SECTION 头单元，区间天然覆盖、不丢。"""
+        proc = [("S1", "section", "S1", []),
+                ("PARA-A", "paragraph", "S1", ["  A"]),
+                ("S2", "section", "S2", ["  SHDR"]),
+                ("PARA-B", "paragraph", "S2", ["  B"])]
+        ctx = self._pctx(proc)
+        out = "\n".join(self._prange(["PARA-A", "THRU", "PARA-B"], ctx))
+        self.assertIn("this.p_paraaThruP_parab();", out)
+        self.assertEqual(ctx.pending_range_methods["p_paraaThruP_parab"], ["  A", "  SHDR", "  B"])
+
+    def test_thru_paragraph_idempotent(self):
+        """同区间重复 PERFORM 只合成一次（幂等）。"""
+        proc = [("PARA-A", "paragraph", "S", ["  A"]), ("PARA-B", "paragraph", "S", ["  B"])]
+        ctx = self._pctx(proc)
+        self._prange(["PARA-A", "THRU", "PARA-B"], ctx)
+        self._prange(["PARA-A", "THRU", "PARA-B"], ctx)
+        self.assertEqual(len(ctx.pending_range_methods), 1)
+
+    def test_thru_paragraph_duplicate_name_degrades(self):
+        """端点重名（无法保守界定边界，D3）→ 退化 TODO，不臆测、不合成。"""
+        proc = [("PARA-A", "paragraph", "S", ["  A"]), ("PARA-B", "paragraph", "S", ["  B"]),
+                ("PARA-A", "paragraph", "S2", ["  A2"])]
+        ctx = self._pctx(proc)
+        out = "\n".join(self._prange(["PARA-A", "THRU", "PARA-B"], ctx))
+        self.assertIn("TODO", out)
+        self.assertEqual(ctx.pending_range_methods, {})
+
+    def test_thru_paragraph_b_before_a_degrades(self):
+        """B 在 A 之前 / 单单元（含 C-3 单条 PERFORM paragraph）→ 退化 TODO，不合成。"""
+        proc = [("PARA-B", "paragraph", "S", ["  B"]), ("PARA-A", "paragraph", "S", ["  A"])]
+        ctx = self._pctx(proc)
+        out = "\n".join(self._prange(["PARA-A", "THRU", "PARA-B"], ctx))
+        self.assertIn("TODO", out)
+        self.assertEqual(ctx.pending_range_methods, {})
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 3b. IO 调用固化：_t_call（CALL 'xxxIO'）+ 结构体拷贝/重置（_assign）
