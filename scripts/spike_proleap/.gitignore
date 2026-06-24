@@ -1,0 +1,6 @@
+# spike 生成物（byproduct），不入库；脚本本身(.java/.py/.sh)保留
+stub_copybooks/
+cleaned_*.cob
+asg_dump.json
+.classpath.txt
+*.class
