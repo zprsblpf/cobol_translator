@@ -1171,6 +1171,27 @@ def _proc_call(target: str, ctx: Ctx) -> str:
     return f"this.{method}();"
 
 
+def _perform_single_paragraph(target: str, ctx: Ctx, indent: int) -> list[str]:
+    """单条 PERFORM <target>（无 THRU、无循环）的落地（步骤15 C-3）：
+    - target 是已知 SECTION → 维持 this.<sec>()（真实方法已在，零回归）。
+    - target 是 paragraph（proc_order 中恰一次、kind=paragraph，且合成名不与已有 SECTION 方法撞名）
+      → 登记单单元 pending 方法 [(target, 该单元体)]、返回 this.pXxx()（渲染期补出方法定义，B1 补实参）。
+    - 兜不住（不在 proc_order / 重名 / 撞 SECTION 方法名，D15-2 保守）→ this.pXxx() + 前置可见 TODO，不臆造。"""
+    call = _ind(indent) + _proc_call(target, ctx)
+    if target in ctx.known_sections:
+        return [call]
+    order = getattr(ctx, "proc_order", None) or []
+    units = [u for u in order if u[0] == target and u[1] == "paragraph"]
+    mname = ctx.section_to_method(target)
+    section_methods = {ctx.section_to_method(s) for s in ctx.known_sections}
+    if len(units) == 1 and mname not in section_methods:
+        if mname not in ctx.pending_range_methods:          # 幂等：同段多次 PERFORM 只合成一次
+            ctx.pending_range_methods[mname] = [(target, units[0][3])]
+        return [call]
+    return [f"{_ind(indent)}// TODO 单条 PERFORM {target}：未解析到唯一过程单元（不在 proc_order/重名/撞 SECTION 方法名），"
+            f"调用目标可能不存在，需人工核对（步骤15 §2.1 兜不住保守，不臆造）", call]
+
+
 def _perform_range(header: list, hu: list, target: str, ctx: Ctx, indent: int) -> list[str]:
     """out-of-line PERFORM 的调用体（实现跟随正本 config/specs/skeleton_spec.yaml
     block_grammar.perform.thru；步骤12 §2）：
@@ -1181,7 +1202,7 @@ def _perform_range(header: list, hu: list, target: str, ctx: Ctx, indent: int) -
     """
     ti = next((i for i, t in enumerate(hu) if t in ("THRU", "THROUGH")), -1)
     if ti < 0 or ti + 1 >= len(header):
-        return [_ind(indent) + _proc_call(target, ctx)]
+        return _perform_single_paragraph(target, ctx, indent)   # 步骤15 C-3：单条 PERFORM 落地
     a, b = target, header[ti + 1].upper()
     # ① SECTION 级（步骤12 §2，零回归）：A、B 均为已知 SECTION 且 B 在后 → 按段顺序展开每段调用。
     order = ctx.section_order

@@ -69,6 +69,11 @@ block_grammar:
       body: [END-PERFORM]        # 内联循环体 stop 集
     closed_by: { explicit: END-PERFORM, implicit: none }
     java_skeleton: loop_or_call  # 有 UNTIL/VARYING/TIMES → while/for；裸过程名 → method-call
+    # 单条 PERFORM <过程名>（无 THRU、无循环；步骤15 C-3 正本；rules._perform_single_paragraph 实现跟随）：
+    single:
+      section:    "target 是已知 SECTION → this.<sec>();（真实方法已在，零回归）"
+      paragraph:  "target 是 paragraph（proc_order 中恰一次、非 SECTION、合成名不撞 SECTION 方法名）→ 登记单单元合成方法 pXxx()（体=该 paragraph）、调用点 this.pXxx();（渲染期补出方法定义，B1 补实参）"
+      unresolved: "target 不在 proc_order / 重名 / 撞 SECTION 方法名 → 保守 this.pXxx() + 前置可见 // TODO 人工核对，不臆造（消除静默坏调用）"
     # PERFORM A THRU B 范围语义（步骤12 §2 正本；rules._perform_range 实现跟随）：
     #   COBOL THRU = 顺序执行「源码中从段 A 到段 B 之间的全部段」。绝不能只译 A 而丢中间段。
     thru:

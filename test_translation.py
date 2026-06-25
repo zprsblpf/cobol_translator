@@ -279,6 +279,41 @@ class TestPerformThru(unittest.TestCase):
                           ("PARA-M", ["  MOVE 2 TO Y"]),
                           ("PARA-B", ["  MOVE 3 TO Z"])])
 
+    # ── 步骤15（C-3）：单条 PERFORM <paragraph> → 合成单段方法，调用点 this.pXxx() 不变 ──
+    def test_perform_single_paragraph_synthesizes_method(self):
+        """单条 PERFORM PARA-X（X 为 paragraph、非 SECTION）→ 登记单单元 pending 方法、
+        调用点 this.p_parax();（补出之前缺失的方法定义）。"""
+        proc = [("S", "section", "S", []), ("PARA-X", "paragraph", "S", ["  MOVE 1 TO X"])]
+        ctx = self._pctx(proc)
+        out = "\n".join(self._prange(["PARA-X"], ctx))
+        self.assertIn("this.p_parax();", out)
+        self.assertEqual(ctx.pending_range_methods["p_parax"], [("PARA-X", ["  MOVE 1 TO X"])])
+
+    def test_perform_single_section_unchanged(self):
+        """单条 PERFORM SOME-SEC（已知 SECTION）→ 真实方法已在，不登记 pending（零回归）。"""
+        proc = [("SOME-SEC", "section", "SOME-SEC", [])]
+        ctx = self._pctx(proc, section_order=["SOME-SEC"])
+        out = "\n".join(self._prange(["SOME-SEC"], ctx))
+        self.assertIn("this.p_somesec();", out)
+        self.assertEqual(ctx.pending_range_methods, {})
+
+    def test_perform_single_unknown_conservative(self):
+        """单条 PERFORM NOPE（proc_order 无、非 SECTION）→ 维持 this.pNope() + 可见 TODO，不登记、不臆造。"""
+        proc = [("PARA-X", "paragraph", "S", ["  A"])]
+        ctx = self._pctx(proc)
+        out = "\n".join(self._prange(["NOPE"], ctx))
+        self.assertIn("this.p_nope();", out)
+        self.assertIn("TODO", out)
+        self.assertEqual(ctx.pending_range_methods, {})
+
+    def test_perform_single_paragraph_idempotent(self):
+        """同 paragraph 多次单条 PERFORM → 只合成一次（幂等）。"""
+        proc = [("PARA-X", "paragraph", "S", ["  A"])]
+        ctx = self._pctx(proc)
+        self._prange(["PARA-X"], ctx)
+        self._prange(["PARA-X"], ctx)
+        self.assertEqual(len(ctx.pending_range_methods), 1)
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 步骤14：THRU 区间内 GO TO 交互。合成区间方法保留标签后，区间内 GO TO 经 build_section
@@ -331,6 +366,18 @@ class TestThruRangeGoto(unittest.TestCase):
                 ("PARA-B", "paragraph", "S", ["       MOVE 2 TO WS-Y."])]
         body = self._render(proc, "PARA-A", "PARA-B")
         self.assertNotIn("switch (__pc)", body)
+
+    def test_perform_single_paragraph_renders_method(self):
+        """步骤15：单条 PERFORM PARA-X 登记的单段方法经 drain 渲染，方法体含该 paragraph 译文。"""
+        import translator.rules as r
+        from translator.skeleton_gen.body_context import render_pending_range_methods
+        proc = [("S", "section", "S", []),
+                ("PARA-X", "paragraph", "S", ["       MOVE 7 TO WS-X."])]
+        ctx = self._ctx(proc)
+        r._perform_range(["PARA-X"], ["PARA-X"], "PARA-X", ctx, 0)
+        rendered = render_pending_range_methods(ctx, ws_field_names=[], call_args="", known_methods=set())
+        self.assertIn("p_parax", rendered)
+        self.assertIn("7", rendered["p_parax"])
 
 
 # ══════════════════════════════════════════════════════════════════════════════
