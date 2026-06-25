@@ -731,5 +731,107 @@ class TestDialectNormalize(unittest.TestCase):
         self.assertEqual(dialect.normalize("MOVE 'GO HOME' TO WS-X"), "MOVE 'GO HOME' TO WS-X")
 
 
+class TestAsgBuild(unittest.TestCase):
+    """步骤17 §5①②③：相2 旁路 ASG —— build_asg 把裸 Stmt 提升为带类型节点树，
+    PERFORM/GO TO 目标解析到真实过程单元，THRU 区间按 order 取闭区间。"""
+
+    _SRC = (
+        "       IDENTIFICATION DIVISION.\n"
+        "       PROGRAM-ID. ASGT.\n"
+        "       DATA DIVISION.\n"
+        "       WORKING-STORAGE SECTION.\n"
+        "       01 WS-X PIC 9(02) VALUE 0.\n"
+        "       PROCEDURE DIVISION.\n"
+        "       1000-MAIN SECTION.\n"
+        "           PERFORM 2000-A THRU 2000-C.\n"
+        "           GO TO 9000-EXIT.\n"
+        "       2000-A SECTION.\n"
+        "           MOVE 1 TO WS-X.\n"
+        "       2000-B SECTION.\n"
+        "           MOVE 2 TO WS-X.\n"
+        "       2000-C SECTION.\n"
+        "           MOVE 3 TO WS-X.\n"
+        "       9000-EXIT SECTION.\n"
+        "           GOBACK.\n"
+    )
+
+    def _build(self):
+        import tempfile, os
+        from parser.cobol_parser import parse
+        from asg import build_asg
+        fd, path = tempfile.mkstemp(suffix=".cob")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(self._SRC)
+            return build_asg(parse(path))
+        finally:
+            os.unlink(path)
+
+    @staticmethod
+    def _walk(n):
+        for a in ("then", "els", "inline_body", "stmts", "paragraphs", "sections"):
+            for c in getattr(n, a, None) or []:
+                yield c
+                yield from TestAsgBuild._walk(c)
+
+    def test_build_section_count_and_nonempty(self):
+        # ① build_asg 跑通，SECTION 数与 parse 一致，节点树非空
+        asg = self._build()
+        self.assertEqual([s.name for s in asg.sections],
+                         ["1000-MAIN", "2000-A", "2000-B", "2000-C", "9000-EXIT"])
+        self.assertTrue(any(p.stmts for s in asg.sections for p in s.paragraphs))
+
+    def test_goto_target_resolved(self):
+        # ② GO TO 目标解析到真实过程单元（target.unit 非 None）
+        from asg import GotoStmt
+        asg = self._build()
+        gotos = [n for n in self._walk(asg) if isinstance(n, GotoStmt)]
+        self.assertEqual(len(gotos), 1)
+        self.assertEqual(gotos[0].target.name, "9000-EXIT")
+        self.assertIsNotNone(gotos[0].target.unit)
+
+    def test_perform_thru_closed_interval(self):
+        # ③ PERFORM A THRU C → resolve_thru 取 [A..C] 闭区间过程单元序列
+        from asg import PerformStmt
+        asg = self._build()
+        perfs = [n for n in self._walk(asg) if isinstance(n, PerformStmt)]
+        self.assertEqual(len(perfs), 1)
+        p = perfs[0]
+        self.assertEqual((p.target.name, p.thru.name), ("2000-A", "2000-C"))
+        units = asg.registry.resolve_thru(p.target.name, p.thru.name)
+        self.assertEqual([u.name for u in units], ["2000-A", "2000-B", "2000-C"])
+
+
+class TestAsgGotoVisitor(unittest.TestCase):
+    """步骤17 §5④：单点 visitor 自证 —— GotoJavaVisitor.visit(GotoStmt) 逐字符等于
+    旧 rules._sk_control 对同一 GO（flow_label=None 非 dispatch）的产出，证明
+    「访问带类型 GotoStmt.target」可替代 rules 的 tokens[0]=="GO" 嗅探。"""
+
+    def _old(self, target):
+        from translator.segmenter import Stmt
+        from translator import rules
+        st = Stmt(kind="simple", tokens=["GO", "TO", target],
+                  children=[], else_children=[], whens=[], raw="GO TO " + target)
+        ctx = rules.Ctx(field_type_map={}, section_to_method={}, known_sections=set())
+        return rules._sk_control(st, ctx, 0)
+
+    def _new(self, target):
+        from asg import GotoStmt, GotoJavaVisitor
+        from asg.registry import ProcRef
+        node = GotoStmt(target=ProcRef(name=target, unit=None), raw="GO TO " + target)
+        return GotoJavaVisitor().visit(node)
+
+    def test_goto_exit_equiv(self):
+        # 目标 …EXIT → return（带注释），新旧逐字符一致
+        self.assertEqual(self._new("9000-EXIT"), self._old("9000-EXIT"))
+        self.assertEqual(self._new("9000-EXIT"), ["return;  // GO TO 9000-EXIT"])
+
+    def test_goto_unknown_equiv(self):
+        # 未知非 EXIT 段 → TODO-GOTO + return，新旧逐字符一致
+        self.assertEqual(self._new("8000-FOO"), self._old("8000-FOO"))
+        self.assertEqual(self._new("8000-FOO"),
+                         ["// TODO-GOTO: 跳转 8000-FOO，需人工核对控制流", "return;"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
