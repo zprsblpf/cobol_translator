@@ -1037,12 +1037,14 @@ def _rewrite_begn_loops(paras: list[tuple], ctx: Ctx) -> list[tuple]:
     return result if changed else paras
 
 
-def build_section(paras: list[tuple], ctx: Ctx, indent: int = 0) -> list[str]:
+def build_section(paras: list[tuple], ctx: Ctx, indent: int = 0, force_sm: bool = False) -> list[str]:
     """
     段内控制流降级。paras = [(label_or_None, [Stmt]), ...]。
     - 先尝试把 BEGN+NEXTR 自跳循环改写为 List + for-each（吸收 setFunction/跳出/NEXTR）。
     - 无回跳 GO TO（back-edge）：扁平拼接各 paragraph 骨架（前向 GO TO→EXIT 仍按 return 处理）。
     - 存在回跳（target paragraph 索引 <= 当前）：用带标签的 while(true)+switch 状态机降级。
+    - force_sm（步骤14 §2.3 D14-3=a，仅合成区间方法置 True）：区间内**任一**指向内部标签的 GO TO
+      （前向亦然）即建状态机，使前向跳过中间单元精确路由。普通 SECTION 默认 False，渲染零变化。
     """
     paras = _rewrite_begn_loops(paras, ctx)
     # 首段若无标签，赋合成入口名
@@ -1052,18 +1054,19 @@ def build_section(paras: list[tuple], ctx: Ctx, indent: int = 0) -> list[str]:
     labels = [l for l, _ in norm]
     label_index = {l: i for i, l in enumerate(labels)}
 
-    has_back_edge = False
+    # 触发状态机的「区间内跳转」：默认仅回跳（j<=i）；force_sm 下任一指向内部标签的 GO TO（含前向）。
+    has_jump = False
     for i, (_lbl, stmts) in enumerate(norm):
         for tgt in _collect_gotos(stmts):
             j = label_index.get(tgt)
-            if j is not None and j <= i:
-                has_back_edge = True
+            if j is not None and (force_sm or j <= i):
+                has_jump = True
                 break
-        if has_back_edge:
+        if has_jump:
             break
 
-    # 控制流降级策略取自正本：无回跳、或正本关闭状态机降级 → 扁平拼接（默认开，行为不变）
-    if not has_back_edge or not grammar_loader.back_edge_state_machine():
+    # 控制流降级策略取自正本：无内部跳转、或正本关闭状态机降级 → 扁平拼接（默认开，行为不变）
+    if not has_jump or not grammar_loader.back_edge_state_machine():
         ctx.flow_label = None
         ctx.flow_paragraphs = set()
         out: list[str] = []
@@ -1221,10 +1224,9 @@ def _perform_range_paragraph(a: str, b: str, ctx: Ctx, indent: int) -> list[str]
     # 合成方法名走 config 正本（§2.4），端点方法名复用 section_to_method（对 paragraph 名同样适用）。
     mname = spec_loader.perform_range_method(ctx.section_to_method(a), ctx.section_to_method(b))
     if mname not in ctx.pending_range_methods:   # 同区间重复 PERFORM 只合成一次（幂等）
-        merged: list[str] = []
-        for u in rng:
-            merged += u[3]                       # 四元第四元 = 该单元 COBOL 段体行
-        ctx.pending_range_methods[mname] = merged
+        # 步骤14 §2.1：存**带标签**的单元序列 [(label, body), …]（不再拼平丢标签），
+        # 使合成区间方法翻译时 build_section 能重见区间内 paragraph 边界、按状态机路由区间内 GO TO。
+        ctx.pending_range_methods[mname] = [(u[0], u[3]) for u in rng]
     return [f"{_ind(indent)}// PERFORM {a} THRU {b}（步骤13 §2.3 路线b：合成区间方法，{len(rng)} 单元）",
             f"{_ind(indent)}this.{mname}();"]
 

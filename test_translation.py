@@ -223,9 +223,10 @@ class TestPerformThru(unittest.TestCase):
         mname = "p_paraaThruP_parab"
         self.assertIn(f"this.{mname}();", out)              # 单次合成调用
         self.assertIn(mname, ctx.pending_range_methods)     # 已登记落地
-        # 区间内三单元体按 proc_order 序拼接（不丢中间 PARA-M）
+        # 区间内三单元按 proc_order 序、带标签登记（步骤14 §2.1：不丢中间 PARA-M、不丢标签）
         self.assertEqual(ctx.pending_range_methods[mname],
-                         ["  MOVE 1 TO X", "  MOVE 2 TO Y", "  MOVE 3 TO Z"])
+                         [("PARA-A", ["  MOVE 1 TO X"]), ("PARA-M", ["  MOVE 2 TO Y"]),
+                          ("PARA-B", ["  MOVE 3 TO Z"])])
 
     def test_thru_paragraph_range_cross_section(self):
         """跨 SECTION 的 paragraph 区间（D2）：proc_order 含 SECTION 头单元，区间天然覆盖、不丢。"""
@@ -236,7 +237,8 @@ class TestPerformThru(unittest.TestCase):
         ctx = self._pctx(proc)
         out = "\n".join(self._prange(["PARA-A", "THRU", "PARA-B"], ctx))
         self.assertIn("this.p_paraaThruP_parab();", out)
-        self.assertEqual(ctx.pending_range_methods["p_paraaThruP_parab"], ["  A", "  SHDR", "  B"])
+        self.assertEqual(ctx.pending_range_methods["p_paraaThruP_parab"],
+                         [("PARA-A", ["  A"]), ("S2", ["  SHDR"]), ("PARA-B", ["  B"])])
 
     def test_thru_paragraph_idempotent(self):
         """同区间重复 PERFORM 只合成一次（幂等）。"""
@@ -262,6 +264,73 @@ class TestPerformThru(unittest.TestCase):
         out = "\n".join(self._prange(["PARA-A", "THRU", "PARA-B"], ctx))
         self.assertIn("TODO", out)
         self.assertEqual(ctx.pending_range_methods, {})
+
+    # ── 步骤14 D14-1：合成区间方法保留 paragraph 标签（让区间内 GO TO 可被状态机路由）──
+    def test_thru_paragraph_registers_labeled_units(self):
+        """登记的不是无标签拼接行，而是带标签的单元序列 [(label, body), …]，
+        让 build_section 重见区间内 paragraph 边界（步骤14 §2.1 根因修复）。"""
+        proc = [("PARA-A", "paragraph", "S", ["  MOVE 1 TO X"]),
+                ("PARA-M", "paragraph", "S", ["  MOVE 2 TO Y"]),
+                ("PARA-B", "paragraph", "S", ["  MOVE 3 TO Z"])]
+        ctx = self._pctx(proc)
+        self._prange(["PARA-A", "THRU", "PARA-B"], ctx)
+        self.assertEqual(ctx.pending_range_methods["p_paraaThruP_parab"],
+                         [("PARA-A", ["  MOVE 1 TO X"]),
+                          ("PARA-M", ["  MOVE 2 TO Y"]),
+                          ("PARA-B", ["  MOVE 3 TO Z"])])
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 步骤14：THRU 区间内 GO TO 交互。合成区间方法保留标签后，区间内 GO TO 经 build_section
+#         状态机精确路由（回跳→循环 / 前向→跳转 / 出口→return / 区间外→保守 TODO）。
+# ══════════════════════════════════════════════════════════════════════════════
+class TestThruRangeGoto(unittest.TestCase):
+    def _ctx(self, proc_order):
+        import translator.rules as r
+        return r.Ctx(field_type_map={}, section_to_method=lambda s: "p_" + s.replace("-", "").lower(),
+                     known_sections=set(), section_order=[], proc_order=list(proc_order))
+
+    def _render(self, proc_order, a, b):
+        """登记 A THRU B 区间方法 → drain 渲染，返回该合成方法的 Java 体字符串。"""
+        import translator.rules as r
+        from translator.skeleton_gen.body_context import render_pending_range_methods
+        ctx = self._ctx(proc_order)
+        r._perform_range([a, "THRU", b], [a.upper(), "THRU", b.upper()], a.upper(), ctx, 0)
+        rendered = render_pending_range_methods(ctx, ws_field_names=[], call_args="", known_methods=set())
+        return "\n".join(rendered.values())
+
+    def test_thru_goto_back_edge_loop(self):
+        """命门：区间内回跳 GO TO（PARA-B → PARA-A）→ 合成方法体出 __pc 状态机，循环不被打断。"""
+        proc = [("PARA-A", "paragraph", "S", ["       MOVE 1 TO WS-X."]),
+                ("PARA-B", "paragraph", "S", ["       GO TO PARA-A."])]
+        body = self._render(proc, "PARA-A", "PARA-B")
+        self.assertIn("switch (__pc)", body)
+        self.assertIn('__pc = "PARA-A"; continue FLOW;', body)
+
+    def test_thru_goto_forward_intra_state_machine(self):
+        """D14-3 方案 a：区间内前向 GO TO（PARA-A → PARA-C，无回跳）→ 仍建状态机精确跳转，
+        跳过中间 PARA-B，不再误退/挂 TODO。"""
+        proc = [("PARA-A", "paragraph", "S", ["       GO TO PARA-C."]),
+                ("PARA-B", "paragraph", "S", ["       MOVE 9 TO WS-Y."]),
+                ("PARA-C", "paragraph", "S", ["       MOVE 3 TO WS-Z."])]
+        body = self._render(proc, "PARA-A", "PARA-C")
+        self.assertIn("switch (__pc)", body)
+        self.assertIn('__pc = "PARA-C"; continue FLOW;', body)
+
+    def test_thru_goto_out_of_range_todo(self):
+        """D14-4 保守：区间内 GO TO 跳到区间外段（OTHER-SEC）→ 保守 // TODO-GOTO，不臆测落点。"""
+        proc = [("PARA-A", "paragraph", "S", ["       GO TO OTHER-SEC."]),
+                ("PARA-B", "paragraph", "S", ["       MOVE 1 TO WS-X."])]
+        body = self._render(proc, "PARA-A", "PARA-B")
+        self.assertIn("TODO-GOTO", body)
+        self.assertNotIn('__pc = "OTHER-SEC"', body)
+
+    def test_thru_no_goto_unchanged(self):
+        """区间无 GO TO → 扁平拼接，无状态机（零回归，与步骤13 一致）。"""
+        proc = [("PARA-A", "paragraph", "S", ["       MOVE 1 TO WS-X."]),
+                ("PARA-B", "paragraph", "S", ["       MOVE 2 TO WS-Y."])]
+        body = self._render(proc, "PARA-A", "PARA-B")
+        self.assertNotIn("switch (__pc)", body)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

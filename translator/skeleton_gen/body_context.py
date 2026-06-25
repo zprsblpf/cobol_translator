@@ -108,15 +108,19 @@ def _postprocess_body(body: str, ws_field_names: list[str], call_args: str,
     return body
 
 
-def translate_section_body(body_lines: list[str], ctx: _rules.Ctx, ws_field_names: list[str],
-                           call_args: str, known_methods: set[str]) -> str:
-    """单个 SECTION 段体 → Java 方法体（确定性，无 LLM）。规则兜不住的叶子落 // TODO 叶子待译。"""
+def translate_paragraphs_body(paras_raw: list, ctx: _rules.Ctx, ws_field_names: list[str],
+                              call_args: str, known_methods: set[str], force_sm: bool = False) -> str:
+    """已切好的 [(label, body_lines), …] → Java 方法体（确定性，无 LLM）。
+    步骤14 §2.1：合成区间方法走此入口，**不经 split_paragraphs 的有损往返**，标签直传，
+    让 build_section 重见区间内 paragraph 边界、按状态机精确路由区间内 GO TO。
+    force_sm（D14-3=a）：合成区间方法置 True，区间内前向 GO TO 亦建状态机精确跳转。
+    （translate_section_body 先 split 再委托本函数，二者共用同一翻译核，零重复。）"""
     reset_section(ctx)
     try:
-        paras = [(lbl, segment(b)) for lbl, b in split_paragraphs(body_lines)]
-        body = "\n".join(_rules.build_section(paras, ctx))
+        paras = [(lbl, segment(b)) for lbl, b in paras_raw]
+        body = "\n".join(_rules.build_section(paras, ctx, force_sm=force_sm))
     except Exception as e:
-        commented = "\n".join(f"// {ln}" for ln in body_lines)
+        commented = "\n".join(f"// {ln}" for _lbl, b in paras_raw for ln in b)
         return f"// TODO 段翻译失败（{e}）；原 COBOL：\n{commented}"
     for lid, leaf in ctx.leaves:
         lines, matched = _rules.translate_leaf(leaf, ctx)
@@ -130,16 +134,26 @@ def translate_section_body(body_lines: list[str], ctx: _rules.Ctx, ws_field_name
     return _postprocess_body(body, ws_field_names, call_args, methods)
 
 
+def translate_section_body(body_lines: list[str], ctx: _rules.Ctx, ws_field_names: list[str],
+                           call_args: str, known_methods: set[str]) -> str:
+    """单个 SECTION 段体 → Java 方法体（确定性，无 LLM）。先 split_paragraphs 切段，
+    再委托 translate_paragraphs_body（共用翻译核）。规则兜不住的叶子落 // TODO 叶子待译。"""
+    return translate_paragraphs_body(split_paragraphs(body_lines), ctx, ws_field_names, call_args, known_methods)
+
+
 def render_pending_range_methods(ctx: _rules.Ctx, ws_field_names: list[str],
                                  call_args: str, known_methods: set[str]) -> dict[str, str]:
-    """drain ctx.pending_range_methods，逐条把拼接体复用 translate_section_body 翻成合成区间方法体
-    （步骤13 §2.3 缺口3：编排下沉 body_context，避免 rules→body_context 成环）。
+    """drain ctx.pending_range_methods，逐条把**带标签单元序列** [(label, body), …] 经
+    translate_paragraphs_body 翻成合成区间方法体（步骤14 §2.1：保标签让区间内 GO TO 走状态机；
+    步骤13 §2.3 缺口3：编排下沉 body_context，避免 rules→body_context 成环）。
     返回 {合成方法名: Java 方法体}，供 render_skeleton 发射为类级方法。
     设计思路：合成体本身可能再含 PERFORM…THRU 登记新的嵌套区间方法，故按工作集循环至稳定。"""
     rendered: dict[str, str] = {}
     while True:
-        todo = {n: lines for n, lines in ctx.pending_range_methods.items() if n not in rendered}
+        todo = {n: paras for n, paras in ctx.pending_range_methods.items() if n not in rendered}
         if not todo:
             return rendered
-        for name, lines in todo.items():
-            rendered[name] = translate_section_body(lines, ctx, ws_field_names, call_args, known_methods)
+        for name, paras_raw in todo.items():
+            # force_sm=True：合成区间方法内前向 GO TO 亦走状态机精确跳转（D14-3=a，仅作用于区间方法）。
+            rendered[name] = translate_paragraphs_body(paras_raw, ctx, ws_field_names, call_args,
+                                                       known_methods, force_sm=True)
