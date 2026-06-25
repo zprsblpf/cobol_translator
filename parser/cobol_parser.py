@@ -257,6 +257,11 @@ def parse(cob_file: str | Path) -> CobolProgram:
     proc_start = -1
 
     for i, line in enumerate(upper_lines):
+        # DIVISION/SECTION 标记必须在代码区判定：注释区(第7列 '*')里出现的 "procedure division"
+        # 等字样是英文散文、非语法标记。复用定列正本 cobol_columns 剔除注释/停用行后再匹配，
+        # 否则 proc_start 会被注释行误命中 → 数据段被当过程段（架构演进初步设计 §7 / 步骤14 §1）。
+        if cobol_columns.is_comment(raw_lines[i]) or cobol_columns.is_deactivated(raw_lines[i]):
+            continue
         if re.search(r"\bWORKING-STORAGE\s+SECTION\b", line) and ws_start < 0:
             ws_start = i + 1
         if re.search(r"\bLINKAGE\s+SECTION\b", line) and linkage_start < 0:

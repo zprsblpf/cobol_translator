@@ -673,5 +673,42 @@ class TestLocalModel(unittest.TestCase):
         self.assertIn("=", body)
 
 
+class TestProcStartCommentImmune(unittest.TestCase):
+    """步骤14 §1 / 架构演进初步设计 §7：proc_start 定位须跳过注释行，
+    注释里的 "PROCEDURE DIVISION" 字样不得误判 → 数据段不应被当过程段。"""
+
+    def _parse_src(self, src: str):
+        import tempfile, os
+        from parser.cobol_parser import parse
+        fd, path = tempfile.mkstemp(suffix=".cob")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(src)
+            return parse(path)
+        finally:
+            os.unlink(path)
+
+    def test_comment_procedure_division_not_misdetected(self):
+        # 第7列 '*' 的注释行含 "procedure division" 字样，真正 PROCEDURE DIVISION 在其后。
+        src = (
+            "       IDENTIFICATION DIVISION.\n"
+            "       PROGRAM-ID. TPROG.\n"
+            "      *   The basic procedure division logic reads records.\n"
+            "       DATA DIVISION.\n"
+            "       WORKING-STORAGE SECTION.\n"
+            "       01 WSAA-PROG PIC X(07) VALUE 'TPROG'.\n"
+            "       PROCEDURE DIVISION.\n"
+            "       1000-MAIN SECTION.\n"
+            "           MOVE 1 TO WSAA-PROG.\n"
+        )
+        prog = self._parse_src(src)
+        names = {s.name.upper() for s in prog.sections}
+        # 数据/环境段不得混入过程段
+        self.assertNotIn("WORKING-STORAGE", names)
+        self.assertNotIn("FILE", names)
+        # 真过程段须在
+        self.assertIn("1000-MAIN", names)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
