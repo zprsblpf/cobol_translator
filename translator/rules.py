@@ -1252,6 +1252,62 @@ def _perform_range_paragraph(a: str, b: str, ctx: Ctx, indent: int) -> list[str]
             f"{_ind(indent)}this.{mname}();"]
 
 
+def _has_test_after(hu: list) -> bool:
+    """WITH TEST AFTER 检测：TEST 紧跟 AFTER（区别于 VARYING 的 AFTER——后者前邻 UNTIL 条件）。"""
+    return any(hu[i] == "TEST" and i + 1 < len(hu) and hu[i + 1] == "AFTER" for i in range(len(hu)))
+
+
+def _parse_varying_clauses(header: list, hu: list, ctx: Ctx):
+    """把 VARYING…AFTER… 切成子句序列 [(v, a, b, cond), …]（步骤16 §2.3，D16-2 任意层）。
+    每子句 <var> FROM <a> BY <b> UNTIL <cond>，cond 自 UNTIL 后延至下一 AFTER/header 末。
+    任一子句兜不住 → None（调用方落 LLM，all-or-nothing，D16-3）。"""
+    starts = [i for i, t in enumerate(hu) if t in ("VARYING", "AFTER")] + [len(header)]
+    clauses = []
+    for s in range(len(starts) - 1):
+        seg = header[starts[s] + 1: starts[s + 1]]   # VARYING/AFTER 关键字后到下一子句前
+        su = [t.upper() for t in seg]
+        try:
+            v = _operand(seg[0], ctx)
+            a = _operand(seg[su.index("FROM") + 1], ctx)
+            b = _operand(seg[su.index("BY") + 1], ctx)
+            cond = _try_condition(seg[su.index("UNTIL") + 1:], ctx)
+        except (ValueError, IndexError):
+            return None
+        if cond is None:
+            return None
+        clauses.append((v, a, b, cond))
+    return clauses
+
+
+def _perform_loop(header: list, hu: list, ctx: Ctx, indent: int):
+    """PERFORM 循环子句 → (open_lines, close_lines)。无循环 → ([], [])；兜不住 → None（落 LLM 叶子）。
+    步骤16：WITH TEST AFTER→do-while（仅无 VARYING，D16-1）；VARYING…AFTER→嵌套 for（D16-2）；UNTIL/TIMES 基本形不变。"""
+    test_after = _has_test_after(hu)
+    if "VARYING" in hu:
+        if test_after:
+            return None                       # D16-1：VARYING+TEST AFTER 保守落 LLM，不臆造
+        clauses = _parse_varying_clauses(header, hu, ctx)
+        if clauses is None:
+            return None
+        open_lines, close_lines = [], []
+        for k, (v, a, b, cond) in enumerate(clauses):
+            open_lines.append(f"{_ind(indent + k)}for ({v} = {a}; !({cond}); {v} = {v} + {b}) {{")
+            close_lines.insert(0, f"{_ind(indent + k)}}}")
+        return open_lines, close_lines
+    if "UNTIL" in hu:
+        cond = _try_condition(header[hu.index("UNTIL") + 1:], ctx)
+        if cond is None:
+            return None
+        if test_after:                        # do { … } while (!(cond));
+            return [f"{_ind(indent)}do {{"], [f"{_ind(indent)}}} while (!({cond}));"]
+        return [f"{_ind(indent)}while (!({cond})) {{"], [f"{_ind(indent)}}}"]
+    if "TIMES" in hu:
+        ti = hu.index("TIMES")
+        cnt = _operand(header[ti - 1], ctx) if ti > 0 else "1"
+        return [f"{_ind(indent)}for (int _i = 0; _i < {cnt}; _i++) {{"], [f"{_ind(indent)}}}"]
+    return [], []
+
+
 def _sk_perform(st: Stmt, ctx: Ctx, indent: int) -> list[str]:
     header = st.tokens
     hu = [h.upper() for h in header]
@@ -1260,37 +1316,12 @@ def _sk_perform(st: Stmt, ctx: Ctx, indent: int) -> list[str]:
     if header and hu[0] not in {"VARYING", "UNTIL", "WITH", "TEST"} and not header[0].isdigit():
         target = header[0].upper()
 
-    # 循环子句
-    loop_open: list[str] = []
-    loop_close = ""
-    # VARYING v FROM a BY b UNTIL cond
-    if "VARYING" in hu:
-        try:
-            vi = hu.index("VARYING")
-            v = _operand(header[vi + 1], ctx)
-            a = _operand(header[hu.index("FROM") + 1], ctx)
-            b = _operand(header[hu.index("BY") + 1], ctx)
-            ucond = _try_condition(header[hu.index("UNTIL") + 1:], ctx)
-            if ucond is None:
-                return [_ind(indent) + ctx.new_leaf(st)]
-            loop_open = [f"{_ind(indent)}for ({v} = {a}; !({ucond}); {v} = {v} + {b}) {{"]
-            loop_close = f"{_ind(indent)}}}"
-        except (ValueError, IndexError):
-            return [_ind(indent) + ctx.new_leaf(st)]
-    elif "UNTIL" in hu:
-        ucond = _try_condition(header[hu.index("UNTIL") + 1:], ctx)
-        if ucond is None:
-            return [_ind(indent) + ctx.new_leaf(st)]
-        loop_open = [f"{_ind(indent)}while (!({ucond})) {{"]
-        loop_close = f"{_ind(indent)}}}"
-    elif "TIMES" in hu:
-        ti = hu.index("TIMES")
-        cnt = _operand(header[ti - 1], ctx) if ti > 0 else "1"
-        loop_open = [f"{_ind(indent)}for (int _i = 0; _i < {cnt}; _i++) {{"]
-        loop_close = f"{_ind(indent)}}}"
+    loop = _perform_loop(header, hu, ctx, indent)   # 步骤16：循环子句解析（含 TEST AFTER / VARYING AFTER）
+    if loop is None:
+        return [_ind(indent) + ctx.new_leaf(st)]    # 兜不住 → 整条落 LLM 叶子（D16-3）
+    open_lines, close_lines = loop
 
-    inner_indent = indent + (1 if loop_open else 0)
-    body: list[str] = []
+    inner_indent = indent + len(open_lines)         # 每层 open = 一层嵌套，body 进最内层
     if st.children:
         body = build_skeleton(st.children, ctx, inner_indent)
     elif target:
@@ -1298,8 +1329,8 @@ def _sk_perform(st: Stmt, ctx: Ctx, indent: int) -> list[str]:
     else:
         return [_ind(indent) + ctx.new_leaf(st)]
 
-    if loop_open:
-        return loop_open + body + [loop_close]
+    if open_lines:
+        return open_lines + body + close_lines
     return body
 
 

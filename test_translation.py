@@ -381,6 +381,66 @@ class TestThruRangeGoto(unittest.TestCase):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# 步骤16：PERFORM 循环复杂变体。WITH TEST AFTER → do-while；VARYING…AFTER → 嵌套 for；
+#         任一子句兜不住 → 整条落 LLM 叶子（all-or-nothing）。
+# ══════════════════════════════════════════════════════════════════════════════
+class TestPerformLoop(unittest.TestCase):
+    def _ctx(self, ftm=None):
+        import translator.rules as r
+        return r.Ctx(field_type_map=ftm or {}, section_to_method=lambda s: "p_" + s.replace("-", "").lower(),
+                     known_sections=set())
+
+    def _perform(self, header_str, ctx, body=("MOVE", "1", "TO", "WSAA-X")):
+        import translator.rules as r
+        from translator.segmenter import Stmt
+        st = Stmt(kind="perform", tokens=header_str.split(),
+                  children=[Stmt(kind="simple", tokens=list(body), raw=" ".join(body))])
+        return "\n".join(r._sk_perform(st, ctx, 0))
+
+    def test_until_test_after_do_while(self):
+        """WITH TEST AFTER UNTIL cond → do { … } while (!(cond));（先执行一次再判，do-while）。"""
+        ctx = self._ctx({"wsaaDone": {"type": "String"}})
+        out = self._perform("WITH TEST AFTER UNTIL WSAA-DONE = 'Y'", ctx)
+        self.assertIn("do {", out)
+        self.assertRegex(out, r"\}\s*while\s*\(!\(")
+
+    def test_until_test_before_unchanged(self):
+        """普通 UNTIL（默认 TEST BEFORE）→ while (!(cond))（零回归，无 do）。"""
+        ctx = self._ctx({"wsaaDone": {"type": "String"}})
+        out = self._perform("UNTIL WSAA-DONE = 'Y'", ctx)
+        self.assertIn("while (!(", out)
+        self.assertNotIn("do {", out)
+
+    def test_varying_after_nested(self):
+        """VARYING i … UNTIL ci AFTER j … UNTIL cj → 外 for(i) 内 for(j) 双层嵌套。"""
+        ctx = self._ctx({"wsaaI": {"type": "int"}, "wsaaJ": {"type": "int"}})
+        out = self._perform("VARYING WSAA-I FROM 1 BY 1 UNTIL WSAA-I > 10 "
+                            "AFTER WSAA-J FROM 1 BY 1 UNTIL WSAA-J > 5", ctx)
+        self.assertEqual(out.count("for ("), 2)
+        # 外层 i 在内层 j 之前（嵌套顺序）
+        self.assertLess(out.index("wsaaI = 1"), out.index("wsaaJ = 1"))
+
+    def test_varying_single_unchanged(self):
+        """单层 VARYING（无 AFTER）→ 单 for(...)（零回归）。"""
+        ctx = self._ctx({"wsaaI": {"type": "int"}})
+        out = self._perform("VARYING WSAA-I FROM 1 BY 1 UNTIL WSAA-I > 10", ctx)
+        self.assertEqual(out.count("for ("), 1)
+
+    def test_varying_after_unparsable_falls_to_llm(self):
+        """某层条件兜不住（88 条件名无关系符）→ 整条落 LLM 叶子，不出半个循环（D16-3）。"""
+        ctx = self._ctx({"wsaaI": {"type": "int"}})
+        out = self._perform("VARYING WSAA-I FROM 1 BY 1 UNTIL END-OF-FILE", ctx)
+        self.assertNotIn("for (", out)
+
+    def test_varying_test_after_conservative(self):
+        """VARYING + WITH TEST AFTER（叠加，语义复杂）→ 保守落 LLM，不臆造（D16-1）。"""
+        ctx = self._ctx({"wsaaI": {"type": "int"}})
+        out = self._perform("WITH TEST AFTER VARYING WSAA-I FROM 1 BY 1 UNTIL WSAA-I > 10", ctx)
+        self.assertNotIn("for (", out)
+        self.assertNotIn("do {", out)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # 3b. IO 调用固化：_t_call（CALL 'xxxIO'）+ 结构体拷贝/重置（_assign）
 #     固化 IO 查询，把 BEGN/READR/NEXTR/UPDAT 从 LLM 收回确定性规则。
 # ══════════════════════════════════════════════════════════════════════════════

@@ -69,6 +69,12 @@ block_grammar:
       body: [END-PERFORM]        # 内联循环体 stop 集
     closed_by: { explicit: END-PERFORM, implicit: none }
     java_skeleton: loop_or_call  # 有 UNTIL/VARYING/TIMES → while/for；裸过程名 → method-call
+    # 循环子句复杂变体（步骤16 正本；rules._perform_loop 实现跟随）：
+    loop:
+      test_before:  "默认 / WITH TEST BEFORE：UNTIL cond → while (!(cond)) {…}（先判后做，零回归）"
+      test_after:   "WITH TEST AFTER（仅无 VARYING，D16-1）：UNTIL cond → do {…} while (!(cond));（先做一次再判，do-while）"
+      varying_after: "VARYING i … UNTIL ci AFTER j … UNTIL cj [AFTER k …]（D16-2）→ 逐子句嵌套 for（i 最外、末子句最内），任意层"
+      conservative: "VARYING+TEST AFTER 叠加 / 任一子句条件兜不住 → 整条 PERFORM 落 LLM 叶子（all-or-nothing，不出半个/误译循环，D16-3）"
     # 单条 PERFORM <过程名>（无 THRU、无循环；步骤15 C-3 正本；rules._perform_single_paragraph 实现跟随）：
     single:
       section:    "target 是已知 SECTION → this.<sec>();（真实方法已在，零回归）"
