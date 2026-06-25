@@ -15,6 +15,7 @@ import re
 from dataclasses import dataclass, field as dc_field
 
 from config import grammar_loader               # 控制流降级策略正本（步骤08）
+from config import spec_loader                   # 命名正本（步骤13 §2.4：合成区间方法名）
 from translator.segmenter import Stmt
 
 
@@ -24,6 +25,12 @@ class Ctx:
     section_to_method: object          # callable: SEC名 -> java 方法名
     known_sections: set                # 所有 SECTION 名（大写）
     section_order: list = dc_field(default_factory=list)  # 全程序 SECTION 名顺序（大写）——PERFORM…THRU 区间判定用（步骤12 §2）
+    # 步骤13 §2.1 缺口1：全程序「过程单元顺序表」，四元 (name_upper, kind, section_upper, body_lines)，
+    # kind∈{section,paragraph}，按源码物理顺序罗列所有 SECTION 头与其下 paragraph；paragraph 级 THRU 区间解析用。
+    proc_order: list = dc_field(default_factory=list)
+    # 步骤13 §2.3 缺口2：程序级合成区间方法登记表，{合成方法名: 区间内各单元体按 proc_order 序拼接的 COBOL 行}。
+    # **程序级、reset_section 不清**：_perform_range 命中 paragraph 区间时登记，render_skeleton 收尾 drain 落地为类级方法。
+    pending_range_methods: dict = dc_field(default_factory=dict)
     leaves: list = dc_field(default_factory=list)   # [(id, Stmt)]
     _counter: list = dc_field(default_factory=lambda: [0])
     flow_label: str | None = None      # 状态机循环标签（dispatch 模式下为 "FLOW"，否则 None）
@@ -1173,6 +1180,7 @@ def _perform_range(header: list, hu: list, target: str, ctx: Ctx, indent: int) -
     if ti < 0 or ti + 1 >= len(header):
         return [_ind(indent) + _proc_call(target, ctx)]
     a, b = target, header[ti + 1].upper()
+    # ① SECTION 级（步骤12 §2，零回归）：A、B 均为已知 SECTION 且 B 在后 → 按段顺序展开每段调用。
     order = ctx.section_order
     if a in order and b in order and order.index(b) >= order.index(a):
         rng = order[order.index(a): order.index(b) + 1]
@@ -1181,9 +1189,44 @@ def _perform_range(header: list, hu: list, target: str, ctx: Ctx, indent: int) -
         out = [f"{_ind(indent)}// PERFORM {a} THRU {b}（步骤12 §2：THRU 跨段，按段顺序展开 {len(rng)} 段）"]
         out += [_ind(indent) + _proc_call(s, ctx) for s in rng]
         return out
-    return [f"{_ind(indent)}// TODO PERFORM {a} THRU {b}：THRU 端点非已知 SECTION 或区间无法确定，"
-            f"中间段/B 段可能漏翻，需人工核对（步骤12 §2 P-1③）",
+    # ② paragraph 级（步骤13 §2.2/§2.3 路线b）：端点为 paragraph 时在 proc_order 解析区间、合成区间方法。
+    pr = _perform_range_paragraph(a, b, ctx, indent)
+    if pr is not None:
+        return pr
+    # ③ 端点缺失/重名/区间无法确定（D3 保守）→ 退化 pA() + 可见 TODO，不臆测中间段。
+    return [f"{_ind(indent)}// TODO PERFORM {a} THRU {b}：THRU 端点非已知过程单元或区间无法确定，"
+            f"中间段/B 段可能漏翻，需人工核对（步骤12 §2 P-1③ / 步骤13 §2.2）",
             _ind(indent) + _proc_call(a, ctx)]
+
+
+def _perform_range_paragraph(a: str, b: str, ctx: Ctx, indent: int) -> list[str] | None:
+    """paragraph 级 PERFORM A THRU B 区间解析（步骤13 §2.2/§2.3 路线b）。
+    在全程序 proc_order 中保守解析 A..B 区间（含跨 SECTION，D2），命中则**登记**合成区间方法、
+    返回单次 `this.aThruB();`（实参由 body_context._postprocess_body 的 B1 自动补齐，凭 known_methods）；
+    无法保守解析（proc_order 缺/端点缺失/重名/B 在 A 之前/单单元 C-3）→ 返回 None，交回 _perform_range 的 TODO 退化。
+    设计思路：_perform_range 在段翻译中途被调，当场无处发射类级方法，故只「登记」不「落地」，落地下沉 render_skeleton。"""
+    order = ctx.proc_order
+    if not order:
+        return None
+    names = [u[0] for u in order]
+    # 保守 D3：两端点须在 proc_order 各恰出现一次（重名→不臆测边界），且 B 不在 A 之前。
+    if names.count(a) != 1 or names.count(b) != 1:
+        return None
+    ia, ib = names.index(a), names.index(b)
+    if ib <= ia:
+        return None  # B 在 A 之前 / 单单元（含 C-3 单条 PERFORM paragraph，§5 范围外）→ 退化
+    rng = order[ia: ib + 1]
+    if any(not u[0] for u in rng):       # 区间夹无名/畸形单元 → 保守退化
+        return None
+    # 合成方法名走 config 正本（§2.4），端点方法名复用 section_to_method（对 paragraph 名同样适用）。
+    mname = spec_loader.perform_range_method(ctx.section_to_method(a), ctx.section_to_method(b))
+    if mname not in ctx.pending_range_methods:   # 同区间重复 PERFORM 只合成一次（幂等）
+        merged: list[str] = []
+        for u in rng:
+            merged += u[3]                       # 四元第四元 = 该单元 COBOL 段体行
+        ctx.pending_range_methods[mname] = merged
+    return [f"{_ind(indent)}// PERFORM {a} THRU {b}（步骤13 §2.3 路线b：合成区间方法，{len(rng)} 单元）",
+            f"{_ind(indent)}this.{mname}();"]
 
 
 def _sk_perform(st: Stmt, ctx: Ctx, indent: int) -> list[str]:

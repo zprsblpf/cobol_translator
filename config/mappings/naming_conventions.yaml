@@ -30,5 +30,10 @@ collision_policy:
   keep_first_as_base: true       # 首个占基名，引用按基名仍可解析
   emit_todo: true                # 改名处标 TODO：若实为不同字段，引用需按 OF/IN 人工核对
 
+# PERFORM A THRU B 合成区间方法命名（步骤13 §2.4 路线b）：paragraph 级 THRU 区间无现成方法可调，
+# 合成一个区间方法承载整段调用。方法名 = 两端点方法名按模板拼接（{a}=端点A方法名原样、{B}=端点B方法名首字母大写）。
+perform_range:
+  method_template: "{a}Thru{B}"   # 如 readPolicy1100 THRU updTotals1300 → readPolicy1100ThruUpdTotals1300
+
 # 命名常量（无上述后缀的拷贝簿，如 VARCOM 定义的状态/功能码）保持为字符串字面量，
 # 不在此列出——凡不匹配 copybook_suffixes 的前缀即按常量处理。

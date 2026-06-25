@@ -113,6 +113,14 @@ def service_field(name: str) -> str:
     return field_name(name) + "Service"
 
 
+def perform_range_method(a_method: str, b_method: str) -> str:
+    """PERFORM A THRU B 合成区间方法名（步骤13 §2.4 路线b，模板取自 naming_conventions.yaml）。
+    入参为两端点的 Java 方法名（小驼峰），{a} 原样、{B} 首字母大写后套模板拼接。"""
+    tmpl = _load("naming_conventions.yaml").get("perform_range", {}).get("method_template", "{a}Thru{B}")
+    big_b = (b_method[:1].upper() + b_method[1:]) if b_method else b_method
+    return tmpl.format(a=a_method, B=big_b)
+
+
 # ── IO 子程序映射（CALL 'xxxIO'→Repository；收编 io_mappings.yaml 直读，§4.3）────────
 
 def io_default_pattern() -> dict:
