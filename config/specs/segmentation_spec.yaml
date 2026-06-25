@@ -31,3 +31,12 @@ paragraph_model:
   area: area_a                    # 标号必在 Area A；据列模型与 Area B 语句区分
   pattern: '^([A-Za-z0-9][A-Za-z0-9-]*)\.\s*$'   # 单 token + 句点，如 "2071-CALL-PS01."
   exclude: [verbs, scope_terminators]            # EXIT./CONTINUE./ELSE. 等不是标号
+
+# ── 方言归一（相1 预处理：源码层文本归一为标准 COBOL，规则正本；详见 docs/翻译标准/流程结构.md）──
+# 每条规则 = {pattern, replacement, quote_guard}；代码（preprocess.dialect）只读本节应用，不内嵌方言正则。
+# 新增方言只动本节（数据驱动、不改代码）。
+dialect_normalization:
+  go_to:                                          # 本 shop 省 TO 的 GO 段名 → 标准 GO TO（流程结构.md §一）
+    pattern: '\bGO\s+(?!TO\b)(?=[0-9A-Za-z])'     # 命中省 TO 的 GO；排除 GO TO（先行 ?!TO）与 GOBACK（GO 后须空白）
+    replacement: 'GO TO '                          # 在 GO 与段名间补 TO
+    quote_guard: true                              # 仅引号外施加（避免字符串内 'GO X' 假阳；引号语义由代码保证）

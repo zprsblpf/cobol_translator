@@ -710,5 +710,26 @@ class TestProcStartCommentImmune(unittest.TestCase):
         self.assertIn("1000-MAIN", names)
 
 
+class TestDialectNormalize(unittest.TestCase):
+    """步骤16：相1 方言归一（规则源自 config dialect_normalization，preprocess.dialect 应用）。
+    本 shop 省 TO 的 GO 段名 → 标准 GO TO；GOBACK/已是 GO TO 不动；引号内文本不动。"""
+
+    def test_go_without_to_normalized(self):
+        from preprocess import dialect
+        self.assertEqual(dialect.normalize("GO 2060-RECEIPT"), "GO TO 2060-RECEIPT")
+
+    def test_go_to_idempotent(self):
+        from preprocess import dialect
+        self.assertEqual(dialect.normalize("GO TO 3190-EXIT"), "GO TO 3190-EXIT")
+
+    def test_goback_untouched(self):
+        from preprocess import dialect
+        self.assertEqual(dialect.normalize("GOBACK"), "GOBACK")
+
+    def test_quoted_go_protected(self):
+        from preprocess import dialect
+        self.assertEqual(dialect.normalize("MOVE 'GO HOME' TO WS-X"), "MOVE 'GO HOME' TO WS-X")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

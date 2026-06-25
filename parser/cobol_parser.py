@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from parser import cobol_columns
+from preprocess.line_stream import CleanSource, build as _build_clean
 
 
 # ── 数据结构 ──────────────────────────────────────────────────────────────────
@@ -73,24 +74,16 @@ class CobolProgram:
 # ── 工具函数 ──────────────────────────────────────────────────────────────────
 
 def _strip_cobol_line(raw: str) -> str:
-    """净化一物理行：停用('!!!!!!')/注释('* /')/调试('D')行返回 ''，其余取代码区（第7列起）。
+    """净化一物理行 —— 薄委托相1 `CleanSource.strip_line`（步骤15 绞杀接线，逻辑不变）。
 
-    列处理复用单一正本 parser.cobol_columns（步骤06）：clean_line 自第7列起，修正代码异常起于
-    第7列时首字母被吞的问题；同时识别 '!!!!!!' 停用行并丢弃（修停用旧段被误纳）。
+    停用('!!!!!!')/注释('* /')/调试('D')行返回 ''，其余取代码区（第7列起）。
     """
-    if cobol_columns.is_deactivated(raw) or cobol_columns.is_comment(raw) or cobol_columns.is_debug(raw):
-        return ""
-    return cobol_columns.clean_line(raw)
+    return CleanSource.strip_line(raw)
 
 
 def _clean_lines(raw_lines: list[str]) -> list[tuple[int, str]]:
-    """返回 (原始行号, 净化后的代码) 列表，去除注释和空行，保留行号用于错误定位。"""
-    result = []
-    for i, line in enumerate(raw_lines, 1):
-        clean = _strip_cobol_line(line)
-        if clean.strip():
-            result.append((i, clean))
-    return result
+    """返回 (原始行号, 净化后的代码) 列表 —— 薄委托相1 `build(...).as_pairs()`（步骤15，逻辑不变）。"""
+    return _build_clean(raw_lines).as_pairs()
 
 
 # ── 变量解析 ──────────────────────────────────────────────────────────────────
