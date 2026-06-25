@@ -849,5 +849,63 @@ class TestLocalModel(unittest.TestCase):
         self.assertIn("=", body)
 
 
+class TestProcStartCommentImmune(unittest.TestCase):
+    """步骤14 §1 / 架构演进初步设计 §7：proc_start 定位须跳过注释行，
+    注释里的 "PROCEDURE DIVISION" 字样不得误判 → 数据段不应被当过程段。"""
+
+    def _parse_src(self, src: str):
+        import tempfile, os
+        from parser.cobol_parser import parse
+        fd, path = tempfile.mkstemp(suffix=".cob")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(src)
+            return parse(path)
+        finally:
+            os.unlink(path)
+
+    def test_comment_procedure_division_not_misdetected(self):
+        # 第7列 '*' 的注释行含 "procedure division" 字样，真正 PROCEDURE DIVISION 在其后。
+        src = (
+            "       IDENTIFICATION DIVISION.\n"
+            "       PROGRAM-ID. TPROG.\n"
+            "      *   The basic procedure division logic reads records.\n"
+            "       DATA DIVISION.\n"
+            "       WORKING-STORAGE SECTION.\n"
+            "       01 WSAA-PROG PIC X(07) VALUE 'TPROG'.\n"
+            "       PROCEDURE DIVISION.\n"
+            "       1000-MAIN SECTION.\n"
+            "           MOVE 1 TO WSAA-PROG.\n"
+        )
+        prog = self._parse_src(src)
+        names = {s.name.upper() for s in prog.sections}
+        # 数据/环境段不得混入过程段
+        self.assertNotIn("WORKING-STORAGE", names)
+        self.assertNotIn("FILE", names)
+        # 真过程段须在
+        self.assertIn("1000-MAIN", names)
+
+
+class TestDialectNormalize(unittest.TestCase):
+    """步骤16：相1 方言归一（规则源自 config dialect_normalization，preprocess.dialect 应用）。
+    本 shop 省 TO 的 GO 段名 → 标准 GO TO；GOBACK/已是 GO TO 不动；引号内文本不动。"""
+
+    def test_go_without_to_normalized(self):
+        from preprocess import dialect
+        self.assertEqual(dialect.normalize("GO 2060-RECEIPT"), "GO TO 2060-RECEIPT")
+
+    def test_go_to_idempotent(self):
+        from preprocess import dialect
+        self.assertEqual(dialect.normalize("GO TO 3190-EXIT"), "GO TO 3190-EXIT")
+
+    def test_goback_untouched(self):
+        from preprocess import dialect
+        self.assertEqual(dialect.normalize("GOBACK"), "GOBACK")
+
+    def test_quoted_go_protected(self):
+        from preprocess import dialect
+        self.assertEqual(dialect.normalize("MOVE 'GO HOME' TO WS-X"), "MOVE 'GO HOME' TO WS-X")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

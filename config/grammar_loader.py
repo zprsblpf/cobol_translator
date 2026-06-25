@@ -100,3 +100,19 @@ def block_grammar() -> list:
 def back_edge_state_machine() -> bool:
     """控制流降级开关：存在回跳 GO TO 是否降级为 while+switch 状态机。"""
     return bool(_skel()["control_flow"].get("back_edge_to_state_machine", True))
+
+
+# ── 方言归一规则（相1 预处理正本；preprocess.dialect 据此应用，代码不内嵌方言正则）──
+
+@lru_cache(maxsize=None)
+def dialect_rules() -> tuple:
+    """方言归一规则（来自 segmentation_spec.dialect_normalization，预编译 pattern）。
+
+    返回 ((name, compiled_pattern, replacement, quote_guard), ...)；无配置则空。
+    规则的「是什么」全在 config；本层只加载/编译，应用逻辑在 preprocess.dialect。
+    """
+    rules = _seg().get("dialect_normalization", {})
+    return tuple(
+        (name, re.compile(r["pattern"]), r["replacement"], bool(r.get("quote_guard", False)))
+        for name, r in rules.items()
+    )
