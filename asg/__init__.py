@@ -13,18 +13,18 @@
 """
 from asg.nodes import (
     Program, Section, Paragraph,
-    IfStmt, EvaluateStmt, PerformStmt, GotoStmt, CallStmt, Leaf,
+    IfStmt, EvaluateStmt, PerformStmt, GotoStmt, CallStmt, MoveStmt, Leaf,
 )
 from asg.registry import ProcUnit, ProcRef, ProcRegistry, SymbolTable
-from asg.visitor import AsgVisitor, GotoJavaVisitor
+from asg.visitor import AsgVisitor, GotoJavaVisitor, LeafJavaVisitor
 from asg.builder import build as _build
 
 __all__ = [
     "build_asg",
     "Program", "Section", "Paragraph",
-    "IfStmt", "EvaluateStmt", "PerformStmt", "GotoStmt", "CallStmt", "Leaf",
+    "IfStmt", "EvaluateStmt", "PerformStmt", "GotoStmt", "CallStmt", "MoveStmt", "Leaf",
     "ProcUnit", "ProcRef", "ProcRegistry", "SymbolTable",
-    "AsgVisitor", "GotoJavaVisitor",
+    "AsgVisitor", "GotoJavaVisitor", "LeafJavaVisitor",
 ]
 
 

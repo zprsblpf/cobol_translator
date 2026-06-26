@@ -907,5 +907,679 @@ class TestDialectNormalize(unittest.TestCase):
         self.assertEqual(dialect.normalize("MOVE 'GO HOME' TO WS-X"), "MOVE 'GO HOME' TO WS-X")
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# 步骤17：相2 自研轻量 ASG（旁路并存）。验收四项（设计 §5）——
+#   ① build_asg 跑通、Program 节点树非空、SECTION 数与 parse 一致；
+#   ② GO TO 解析：GotoStmt 目标解析到真实过程单元；
+#   ③ PERFORM THRU 区间：resolve_thru 取 [A..B] 闭区间；
+#   ④ 单点 visitor 自证：GotoJavaVisitor 输出 == rules._sk_control 对同一 GO 的 Java（逐字符）。
+# 旁路不接旧路径，旧用例/快照零 diff 由旧代码未动天然成立（此处只自证新通路）。
+# ══════════════════════════════════════════════════════════════════════════════
+class TestAsgBuild(unittest.TestCase):
+    """① 结构提升 + ② 引用解析：build_asg 在内联程序上跑通，GO TO 解析到真实单元。"""
+
+    # 内联最小程序：两个 SECTION + EXIT paragraph + 一条 GO TO（仿 TestProcStartCommentImmune 列布局）。
+    SRC = (
+        "       IDENTIFICATION DIVISION.\n"
+        "       PROGRAM-ID. TASG.\n"
+        "       DATA DIVISION.\n"
+        "       WORKING-STORAGE SECTION.\n"
+        "       01 WSAA-X PIC X(04) VALUE 'A'.\n"
+        "       PROCEDURE DIVISION.\n"
+        "       1000-MAIN SECTION.\n"
+        "           MOVE 1 TO WSAA-X.\n"
+        "           GO TO 1000-EXIT.\n"
+        "       1000-EXIT.\n"
+        "           EXIT.\n"
+        "       2000-NEXT SECTION.\n"
+        "           MOVE 2 TO WSAA-X.\n"
+    )
+
+    def _parse(self, src: str):
+        import tempfile, os
+        from parser.cobol_parser import parse
+        fd, path = tempfile.mkstemp(suffix=".cob")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(src)
+            return parse(path)
+        finally:
+            os.unlink(path)
+
+    def _collect_gotos(self, program):
+        from asg import AsgVisitor
+        found = []
+
+        class _C(AsgVisitor):
+            def visit_GotoStmt(self, node):
+                found.append(node)
+        _C().visit(program)
+        return found
+
+    def test_build_runs_and_sections_match_parse(self):
+        """① build_asg 跑通，program_id 一致、SECTION 数与 parse 一致、节点树非空。"""
+        from asg import build_asg, Program, Section
+        prog = self._parse(self.SRC)
+        asg = build_asg(prog)
+        self.assertIsInstance(asg, Program)
+        self.assertEqual(asg.program_id, prog.program_id)
+        self.assertEqual(len(asg.sections), len(prog.sections))   # SECTION 数一致
+        self.assertTrue(all(isinstance(s, Section) for s in asg.sections))
+        # 节点树非空：至少有 paragraph 且有语句被提升
+        self.assertTrue(any(s.paragraphs for s in asg.sections))
+        self.assertTrue(any(p.stmts for s in asg.sections for p in s.paragraphs))
+
+    def test_registry_attached_to_root(self):
+        """build_asg 把 ProcRegistry 挂在 Program 根（相3 查表用）。"""
+        from asg import build_asg, ProcRegistry
+        asg = build_asg(self._parse(self.SRC))
+        self.assertIsInstance(asg.registry, ProcRegistry)
+        # 注册表含 SECTION 与 paragraph 单元
+        names = {u.name for u in asg.registry.units}
+        self.assertIn("1000-MAIN", names)
+        self.assertIn("1000-EXIT", names)
+
+    def test_goto_target_resolved_to_unit(self):
+        """② GO TO 1000-EXIT → GotoStmt.target.unit 解析到真实 paragraph 单元（非 None）。"""
+        asg = self._import_build()(self._parse(self.SRC))
+        gotos = self._collect_gotos(asg)
+        self.assertTrue(gotos, "应至少提升出一条 GotoStmt")
+        g = gotos[0]
+        self.assertEqual(g.target.name, "1000-EXIT")
+        self.assertIsNotNone(g.target.unit, "目标在程序内 → 应解析到真实单元")
+        self.assertEqual(g.target.unit.name, "1000-EXIT")
+
+    def _import_build(self):
+        from asg import build_asg
+        return build_asg
+
+
+class TestAsgRegistryThru(unittest.TestCase):
+    """③ PERFORM THRU 区间：resolve_thru 在合成单元上取 [A..B] 闭区间，不丢中间、保守退化。"""
+
+    def _reg(self, names):
+        from asg import ProcUnit, ProcRegistry
+        units = [ProcUnit(name=n, kind="paragraph", section="S", order=i)
+                 for i, n in enumerate(names)]
+        return ProcRegistry(units)
+
+    def test_resolve_thru_closed_interval(self):
+        """A THRU B → 取 [A..B] 闭区间所有单元（含中间 M，按 order 序）。"""
+        reg = self._reg(["A", "M", "B", "Z"])
+        units = reg.resolve_thru("A", "B")
+        self.assertEqual([u.name for u in units], ["A", "M", "B"])   # 中间 M 不丢，Z 不越界
+
+    def test_resolve_thru_missing_b_degrades_single(self):
+        """B 缺失/解析不到 → 退化为单元 [A]（保守，不臆测区间）。"""
+        reg = self._reg(["A", "B"])
+        self.assertEqual([u.name for u in reg.resolve_thru("A", None)], ["A"])
+        self.assertEqual([u.name for u in reg.resolve_thru("A", "NOPE")], ["A"])
+
+    def test_resolve_thru_b_before_a_degrades(self):
+        """B 在 A 之前 → 退化为 [A]（不倒序取区间）。"""
+        reg = self._reg(["B", "A"])
+        self.assertEqual([u.name for u in reg.resolve_thru("A", "B")], ["A"])
+
+    def test_resolve_thru_unknown_a_empty(self):
+        """A 解析不到 → []（端点未知不臆测）。"""
+        reg = self._reg(["X", "Y"])
+        self.assertEqual(reg.resolve_thru("NOPE", "Y"), [])
+
+    def test_resolve_case_insensitive(self):
+        """按名解析大小写不敏感。"""
+        reg = self._reg(["1000-MAIN"])
+        self.assertIsNotNone(reg.resolve("1000-main").unit)
+
+
+class TestAsgGotoVisitor(unittest.TestCase):
+    """④ 单点 visitor 自证：GotoJavaVisitor 输出与 rules._sk_control 对同一 GO 逐字符一致。"""
+
+    def _sk_control_goto(self, target: str):
+        """非 dispatch（flow_label=None）、target 不在 known_sections 时 _sk_control 对 GO 的输出。"""
+        import translator.rules as r
+        from translator.segmenter import Stmt
+        ctx = r.Ctx(field_type_map={}, section_to_method=lambda s: s, known_sections=set())
+        st = Stmt(kind="simple", tokens=["GO", "TO", target], raw=f"GO TO {target}")
+        return r._sk_control(st, ctx, 0)
+
+    def _visitor_goto(self, target: str):
+        from asg import GotoStmt, GotoJavaVisitor, ProcRef
+        node = GotoStmt(target=ProcRef(name=target, unit=None))
+        return GotoJavaVisitor().visit(node)
+
+    def test_exit_target_char_exact(self):
+        """目标 …EXIT → 两侧均 `return;  // GO TO X`，逐字符一致。"""
+        self.assertEqual(self._visitor_goto("1000-EXIT"), self._sk_control_goto("1000-EXIT"))
+
+    def test_unknown_target_char_exact(self):
+        """未知段（非 EXIT、非 known_sections）→ 两侧均 [// TODO-GOTO…, return;]，逐字符一致。"""
+        self.assertEqual(self._visitor_goto("9000-WHERE"), self._sk_control_goto("9000-WHERE"))
+
+    def test_no_target_returns(self):
+        """目标缺失 → return;（兜底，不臆测）。"""
+        from asg import GotoStmt, GotoJavaVisitor
+        self.assertEqual(GotoJavaVisitor().visit(GotoStmt(target=None)), ["return;"])
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 步骤18 绞杀项3① MOVE 迁 visitor（抽公用 translate_move + ASG 提升/visit + 比对闸）
+#   ① translate_move 抽出后输出正确（普通/figurative/数值/结构体/FUNCTION/PARAMS 互拷）
+#   ② build_asg 把 MOVE 提升为 MoveStmt 且 tokens 与 segmenter 一致
+#   ③ LeafJavaVisitor.visit(MoveStmt) == translate_move（同函数同 ctx，逐字符自证）
+#   ④ diff_asg_vs_legacy 两路 MOVE 在整程序上逐字符一致
+# 对应设计：docs/详细设计/步骤18-绞杀项3①MOVE迁visitor设计.md §7。
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _leaf_ctx(field_type_map=None, prefixes=None, objects=None, classes=None):
+    """构造满足 LeafCtx 的 rules.Ctx（叶子译器只读其判型/结构体命名字段）。"""
+    import translator.rules as r
+    return r.Ctx(
+        field_type_map=field_type_map or {}, section_to_method=lambda s: s,
+        known_sections=set(), io_struct_prefixes=prefixes or set(),
+        struct_objects=objects or {}, struct_classes=classes or {},
+    )
+
+
+class TestLeafMoveExtract(unittest.TestCase):
+    """① 抽出的 translate_move 输出正确（覆盖 MOVE 各形态）。"""
+
+    FTM = {"wsaaName": {"type": "String"}, "wsaaCount": {"type": "int"},
+           "wsaaAmt": {"type": "BigDecimal"}, "wsaaFlag": {"type": "String"}}
+
+    def _mv(self, line, **kw):
+        from translator.leaf import translate_move
+        ctx = _leaf_ctx(field_type_map=self.FTM, **kw)
+        toks = line.split()
+        lines, ok = translate_move(toks, ctx)
+        return lines, ok, ctx
+
+    def test_figurative_blank_string(self):
+        self.assertEqual(self._mv("MOVE SPACES TO WSAA-NAME")[0], ['wsaaName = "";'])
+
+    def test_figurative_zero_int(self):
+        self.assertEqual(self._mv("MOVE ZERO TO WSAA-COUNT")[0], ["wsaaCount = 0;"])
+
+    def test_numeric_literal_to_bigdecimal(self):
+        self.assertEqual(self._mv("MOVE 100 TO WSAA-AMT")[0], ['wsaaAmt = new BigDecimal("100");'])
+
+    def test_literal_to_string(self):
+        self.assertEqual(self._mv("MOVE 'Y' TO WSAA-FLAG")[0], ['wsaaFlag = "Y";'])
+
+    def test_struct_field_setter(self):
+        lines, ok, _ = self._mv("MOVE 'Y' TO PS01CHR-CHDRCOY",
+                                prefixes={"PS01CHR"}, objects={"PS01CHR": "ps01chrParams"})
+        self.assertTrue(ok)
+        self.assertEqual(lines, ['ps01chrParams.setChdrcoy("Y");'])
+
+    def test_function_move_records_no_line(self):
+        """MOVE READR TO ELPO-FUNCTION → 不出行，仅记 struct_function（供 CALL 吸收）。"""
+        lines, ok, ctx = self._mv("MOVE READR TO ELPO-FUNCTION", prefixes={"ELPO"})
+        self.assertEqual(lines, [])
+        self.assertEqual(ctx.struct_function.get("ELPO"), "READR")
+
+    def test_params_copy_beanutils(self):
+        lines, ok, _ = self._mv(
+            "MOVE LETC-PARAMS TO PS01-PARAMS", prefixes={"LETC", "PS01"},
+            objects={"LETC": "letcParams", "PS01": "ps01Params"})
+        self.assertEqual(lines, ["BeanUtils.copyProperties(letcParams, ps01Params);"])
+
+
+class TestAsgMoveLift(unittest.TestCase):
+    """② build_asg 把 MOVE 提升为 MoveStmt，tokens 与 segmenter 切分一致。"""
+
+    SRC = (
+        "       IDENTIFICATION DIVISION.\n"
+        "       PROGRAM-ID. TMV.\n"
+        "       DATA DIVISION.\n"
+        "       WORKING-STORAGE SECTION.\n"
+        "       01 WSAA-X PIC 9(04) VALUE 0.\n"
+        "       PROCEDURE DIVISION.\n"
+        "       1000-MAIN SECTION.\n"
+        "           MOVE 1 TO WSAA-X.\n"
+    )
+
+    def _parse(self, src):
+        import tempfile, os
+        from parser.cobol_parser import parse
+        fd, path = tempfile.mkstemp(suffix=".cob")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(src)
+            return parse(path)
+        finally:
+            os.unlink(path)
+
+    def test_move_lifted_to_movestmt(self):
+        from asg import build_asg, MoveStmt
+        asg = build_asg(self._parse(self.SRC))
+        moves = [st for s in asg.sections for p in s.paragraphs
+                 for st in p.stmts if isinstance(st, MoveStmt)]
+        self.assertTrue(moves, "MOVE 应提升为 MoveStmt（不再落 Leaf）")
+        self.assertEqual([t.upper() for t in moves[0].tokens], ["MOVE", "1", "TO", "WSAA-X"])
+
+    def test_move_not_leaf(self):
+        from asg import build_asg, Leaf
+        asg = build_asg(self._parse(self.SRC))
+        leaves = [st for s in asg.sections for p in s.paragraphs
+                  for st in p.stmts if isinstance(st, Leaf)
+                  and st.tokens and st.tokens[0].upper() == "MOVE"]
+        self.assertEqual(leaves, [], "MOVE 不应再落 Leaf 兜底")
+
+
+class TestAsgMoveVisitor(unittest.TestCase):
+    """③ LeafJavaVisitor.visit(MoveStmt) == translate_move（同函数同 ctx，逐字符自证）。"""
+
+    def test_visitor_equals_translate_move(self):
+        from asg import MoveStmt, LeafJavaVisitor
+        from translator.leaf import translate_move
+        ctx = _leaf_ctx(field_type_map={"wsaaCount": {"type": "int"}})
+        toks = ["MOVE", "5", "TO", "WSAA-COUNT"]
+        node = MoveStmt(tokens=list(toks))
+        self.assertEqual(LeafJavaVisitor(ctx).visit(node), translate_move(toks, ctx)[0])
+
+
+class TestDiffAsgVsLegacy(unittest.TestCase):
+    """④ 整程序上旧/新两路 MOVE 逐字符一致（复用比对脚本的枚举/渲染逻辑）。"""
+
+    SRC = TestAsgMoveLift.SRC + (
+        "           MOVE WSAA-X TO WSAA-X.\n"
+        "           IF WSAA-X = 1\n"
+        "               MOVE 2 TO WSAA-X\n"
+        "           END-IF.\n"
+    )
+
+    def _harness(self):
+        import importlib.util, pathlib
+        p = pathlib.Path(__file__).parent / "scripts" / "diff_asg_vs_legacy.py"
+        spec = importlib.util.spec_from_file_location("diff_asg_vs_legacy", p)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_legacy_equals_asg(self):
+        from translator.skeleton_gen.body_context import build_body_ctx
+        mod = self._harness()
+        prog = TestAsgMoveLift()._parse(self.SRC)
+        ctx, _ = build_body_ctx(prog)
+        legacy = mod._legacy_moves(prog, ctx)
+        asg = mod._asg_moves(prog, ctx)
+        self.assertEqual(len(legacy), len(asg))
+        self.assertTrue(len(legacy) >= 3, "样例应含多条 MOVE（含 IF 内嵌套）")
+        self.assertEqual([x[1] for x in legacy], [x[1] for x in asg])
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 步骤19 绞杀项3② IF 迁 visitor（抽公用 translate_condition + visit_IfStmt + 比对闸扩 IF）
+#   ① translate_condition 抽出后输出正确（数值/NOT/SPACES/BigDecimal/AND-OR/复杂→None）
+#   ② visit_IfStmt 条件行 == rules._try_condition；cond=None→TODO-IF；body 直译已迁/占位未迁/嵌套递归
+#   ③ diff_asg_vs_legacy --verb IF 两路条件串逐字符一致（含嵌套/AND-OR/NOT）
+# 对应设计：docs/详细设计/步骤19-绞杀项3②IF迁visitor设计.md §7。
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestLeafCondExtract(unittest.TestCase):
+    """① 抽出的 translate_condition 输出正确（覆盖条件各形态）。"""
+
+    FTM = {"wsaaCount": {"type": "int"}, "wsaaAmt": {"type": "BigDecimal"},
+           "wsaaName": {"type": "String"}}
+
+    def _c(self, line):
+        from translator.leaf import translate_condition
+        ctx = _leaf_ctx(field_type_map=self.FTM)
+        return translate_condition(line.split(), ctx)
+
+    def test_numeric_eq(self):
+        self.assertEqual(self._c("WSAA-COUNT = 1"), "wsaaCount == 1")
+
+    def test_numeric_gt(self):
+        self.assertEqual(self._c("WSAA-COUNT > 5"), "wsaaCount > 5")
+
+    def test_not_numeric_eq_inverts(self):
+        self.assertEqual(self._c("NOT WSAA-COUNT = 1"), "wsaaCount != 1")
+
+    def test_spaces_is_blank(self):
+        self.assertEqual(self._c("WSAA-NAME = SPACES"), "StringUtils.isBlank(wsaaName)")
+
+    def test_bigdecimal_compareto(self):
+        self.assertEqual(self._c("WSAA-AMT = 100"),
+                         '(wsaaAmt.compareTo(new BigDecimal("100")) == 0)')
+
+    def test_and_or_compound(self):
+        self.assertEqual(self._c("WSAA-COUNT = 1 AND WSAA-NAME = SPACES"),
+                         "wsaaCount == 1 && StringUtils.isBlank(wsaaName)")
+
+    def test_condition_name_falls_to_none(self):
+        """88 条件名 / 无关系运算符 → None（交 LLM）。"""
+        self.assertIsNone(self._c("WSAA-STATUS-OK"))
+
+
+class TestAsgIfVisitor(unittest.TestCase):
+    """② visit_IfStmt 复刻 _sk_if 形状，条件经同一 translate_condition → 与 rules._try_condition 一致。"""
+
+    def _ctx(self):
+        return _leaf_ctx(field_type_map={"wsaaCount": {"type": "int"}})
+
+    def test_if_condition_matches_legacy(self):
+        from asg import IfStmt, MoveStmt, LeafJavaVisitor
+        import translator.rules as rules
+        ctx = self._ctx()
+        node = IfStmt(cond=["WSAA-COUNT", "=", "1"],
+                      then=[MoveStmt(tokens=["MOVE", "2", "TO", "WSAA-COUNT"])])
+        out = LeafJavaVisitor(ctx).visit(node)
+        self.assertEqual(out[0], f"if ({rules._try_condition(['WSAA-COUNT', '=', '1'], ctx)}) {{")
+        self.assertEqual(out[0], "if (wsaaCount == 1) {")
+        self.assertEqual(out[-1], "}")
+        self.assertIn("    wsaaCount = 2;", out)        # body MOVE 直译 + 一级缩进
+
+    def test_if_cond_none_falls_to_todo(self):
+        from asg import IfStmt, LeafJavaVisitor
+        node = IfStmt(cond=["WSAA-STATUS-OK"], raw="IF WSAA-STATUS-OK")
+        self.assertEqual(LeafJavaVisitor(self._ctx()).visit(node), ["// TODO-IF: IF WSAA-STATUS-OK"])
+
+    def test_if_body_unmigrated_leaf_placeholder(self):
+        from asg import IfStmt, Leaf, LeafJavaVisitor
+        node = IfStmt(cond=["WSAA-COUNT", "=", "1"],
+                      then=[Leaf(tokens=["ADD", "1", "TO", "WSAA-COUNT"], raw="ADD 1 TO WSAA-COUNT")])
+        self.assertIn("    // TODO-LEAF: ADD 1 TO WSAA-COUNT", LeafJavaVisitor(self._ctx()).visit(node))
+
+    def test_nested_if_renders_indented(self):
+        from asg import IfStmt, MoveStmt, LeafJavaVisitor
+        inner = IfStmt(cond=["WSAA-COUNT", ">", "0"],
+                       then=[MoveStmt(tokens=["MOVE", "0", "TO", "WSAA-COUNT"])])
+        node = IfStmt(cond=["WSAA-COUNT", "=", "1"], then=[inner])
+        out = LeafJavaVisitor(self._ctx()).visit(node)
+        self.assertIn("    if (wsaaCount > 0) {", out)
+
+    def test_if_else_branch(self):
+        from asg import IfStmt, MoveStmt, LeafJavaVisitor
+        node = IfStmt(cond=["WSAA-COUNT", "=", "1"],
+                      then=[MoveStmt(tokens=["MOVE", "2", "TO", "WSAA-COUNT"])],
+                      els=[MoveStmt(tokens=["MOVE", "3", "TO", "WSAA-COUNT"])])
+        out = LeafJavaVisitor(self._ctx()).visit(node)
+        self.assertIn("} else {", out)
+        self.assertIn("    wsaaCount = 3;", out)
+
+
+class TestDiffAsgVsLegacyIf(unittest.TestCase):
+    """③ 整程序上旧/新两路 IF 条件串逐字符一致（含嵌套 / AND-OR / NOT）。"""
+
+    SRC = (
+        "       IDENTIFICATION DIVISION.\n"
+        "       PROGRAM-ID. TIF.\n"
+        "       DATA DIVISION.\n"
+        "       WORKING-STORAGE SECTION.\n"
+        "       01 WSAA-X PIC 9(04) VALUE 0.\n"
+        "       01 WSAA-NM PIC X(10).\n"
+        "       PROCEDURE DIVISION.\n"
+        "       1000-MAIN SECTION.\n"
+        "           IF WSAA-X = 1 AND WSAA-NM = SPACES\n"
+        "               MOVE 2 TO WSAA-X\n"
+        "               IF NOT WSAA-X > 5\n"
+        "                   MOVE 0 TO WSAA-X\n"
+        "               END-IF\n"
+        "           END-IF.\n"
+    )
+
+    def test_legacy_equals_asg_if(self):
+        from translator.skeleton_gen.body_context import build_body_ctx
+        mod = TestDiffAsgVsLegacy()._harness()
+        prog = TestAsgMoveLift()._parse(self.SRC)
+        ctx, _ = build_body_ctx(prog)
+        legacy = mod._legacy_ifs(prog, ctx)
+        asg = mod._asg_ifs(prog, ctx)
+        self.assertEqual(len(legacy), len(asg))
+        self.assertTrue(len(legacy) >= 2, "样例应含嵌套 IF")
+        self.assertEqual([x[1] for x in legacy], [x[1] for x in asg])
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 步骤20 绞杀项3③ PERFORM 循环子句迁 visitor（抽 leaf/loop.py + visit_PerformStmt + 比对闸扩 PERFORM）
+#   ① translate_perform_loop 抽出后循环壳正确（UNTIL/TEST AFTER/TIMES/VARYING/AFTER；无循环→([],[])；兜不住→None）
+#   ② visit_PerformStmt 循环壳 == _perform_loop；inline_body 直译；out-of-line→TODO-PERFORM-CALL；None→TODO-PERFORM
+#   ③ diff_asg_vs_legacy --verb PERFORM 两路循环壳逐字符一致（UNTIL/TIMES/VARYING 多形）
+# 对应设计：docs/详细设计/步骤20-绞杀项3③PERFORM循环子句迁visitor设计.md §7。
+# 只切①循环子句；②THRU区间/③struct_rebind 留后续刀（设计 §1 非目标）。
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestLeafLoopExtract(unittest.TestCase):
+    """① 抽出的 translate_perform_loop 循环壳正确（覆盖各循环形态）。"""
+
+    FTM = {"wsaaX": {"type": "int"}, "wsaaI": {"type": "int"}, "wsaaJ": {"type": "int"}}
+
+    def _loop(self, header):
+        from translator.leaf import translate_perform_loop
+        return translate_perform_loop(header, _leaf_ctx(field_type_map=self.FTM), 0)
+
+    def test_until_while(self):
+        self.assertEqual(self._loop(["UNTIL", "WSAA-X", ">", "5"]),
+                         (["while (!(wsaaX > 5)) {"], ["}"]))
+
+    def test_until_test_after_do_while(self):
+        self.assertEqual(self._loop(["WITH", "TEST", "AFTER", "UNTIL", "WSAA-X", ">", "5"]),
+                         (["do {"], ["} while (!(wsaaX > 5));"]))
+
+    def test_times_for(self):
+        self.assertEqual(self._loop(["3", "TIMES"]),
+                         (["for (int _i = 0; _i < 3; _i++) {"], ["}"]))
+
+    def test_varying_single_for(self):
+        self.assertEqual(
+            self._loop(["VARYING", "WSAA-I", "FROM", "1", "BY", "1", "UNTIL", "WSAA-I", ">", "3"]),
+            (["for (wsaaI = 1; !(wsaaI > 3); wsaaI = wsaaI + 1) {"], ["}"]))
+
+    def test_varying_after_nested_for(self):
+        open_lines, close_lines = self._loop(
+            ["VARYING", "WSAA-I", "FROM", "1", "BY", "1", "UNTIL", "WSAA-I", ">", "3",
+             "AFTER", "WSAA-J", "FROM", "1", "BY", "1", "UNTIL", "WSAA-J", ">", "2"])
+        self.assertEqual(open_lines, ["for (wsaaI = 1; !(wsaaI > 3); wsaaI = wsaaI + 1) {",
+                                      "    for (wsaaJ = 1; !(wsaaJ > 2); wsaaJ = wsaaJ + 1) {"])
+        self.assertEqual(close_lines, ["    }", "}"])
+
+    def test_no_loop_empty(self):
+        self.assertEqual(self._loop(["2000-SUB"]), ([], []))
+
+    def test_until_uncond_falls_to_none(self):
+        """UNTIL 条件兜不住（88/无关系符）→ None（整条交 LLM）。"""
+        self.assertIsNone(self._loop(["UNTIL", "WSAA-STATUS-OK"]))
+
+    def test_varying_test_after_none(self):
+        """VARYING + TEST AFTER → None（D16-1 保守落 LLM）。"""
+        self.assertIsNone(self._loop(
+            ["VARYING", "WSAA-I", "FROM", "1", "BY", "1", "WITH", "TEST", "AFTER",
+             "UNTIL", "WSAA-I", ">", "3"]))
+
+
+class TestAsgPerformVisitor(unittest.TestCase):
+    """② visit_PerformStmt 循环壳经同一 translate_perform_loop → 与 rules._perform_loop 一致。"""
+
+    def _ctx(self):
+        return _leaf_ctx(field_type_map={"wsaaX": {"type": "int"}})
+
+    def test_loop_shell_matches_legacy(self):
+        from asg import PerformStmt, MoveStmt, LeafJavaVisitor
+        import translator.rules as rules
+        ctx = self._ctx()
+        hdr = ["UNTIL", "WSAA-X", ">", "5"]
+        node = PerformStmt(header=hdr, inline_body=[MoveStmt(tokens=["MOVE", "2", "TO", "WSAA-X"])])
+        out = LeafJavaVisitor(ctx).visit(node)
+        op, cl = rules._perform_loop(hdr, [h.upper() for h in hdr], ctx, 0)
+        self.assertEqual(out[0], op[0])            # 循环壳首行 == 旧 _perform_loop
+        self.assertEqual(out[-1], cl[-1])
+        self.assertEqual(out, ["while (!(wsaaX > 5)) {", "    wsaaX = 2;", "}"])
+
+    def test_out_of_line_target_placeholder(self):
+        from asg import PerformStmt, ProcRef, LeafJavaVisitor
+        node = PerformStmt(header=["2000-SUB"], target=ProcRef(name="2000-SUB"))
+        self.assertEqual(LeafJavaVisitor(self._ctx()).visit(node), ["// TODO-PERFORM-CALL: 2000-SUB"])
+
+    def test_out_of_line_thru_placeholder(self):
+        from asg import PerformStmt, ProcRef, LeafJavaVisitor
+        node = PerformStmt(header=["1000-A", "THRU", "2000-B"],
+                           target=ProcRef(name="1000-A"), thru=ProcRef(name="2000-B"))
+        self.assertEqual(LeafJavaVisitor(self._ctx()).visit(node),
+                         ["// TODO-PERFORM-CALL: 1000-A THRU 2000-B"])
+
+    def test_loop_none_falls_to_todo(self):
+        from asg import PerformStmt, LeafJavaVisitor
+        node = PerformStmt(header=["UNTIL", "WSAA-STATUS-OK"], raw="PERFORM UNTIL WSAA-STATUS-OK")
+        self.assertEqual(LeafJavaVisitor(self._ctx()).visit(node),
+                         ["// TODO-PERFORM: PERFORM UNTIL WSAA-STATUS-OK"])
+
+
+class TestDiffAsgVsLegacyPerform(unittest.TestCase):
+    """③ 整程序上旧/新两路 PERFORM 循环壳逐字符一致（UNTIL / TIMES / VARYING AFTER / out-of-line）。"""
+
+    SRC = (
+        "       IDENTIFICATION DIVISION.\n"
+        "       PROGRAM-ID. TPF.\n"
+        "       DATA DIVISION.\n"
+        "       WORKING-STORAGE SECTION.\n"
+        "       01 WSAA-X    PIC 9(04) VALUE 0.\n"
+        "       01 WSAA-I    PIC 9(04) VALUE 0.\n"
+        "       01 WSAA-J    PIC 9(04) VALUE 0.\n"
+        "       PROCEDURE DIVISION.\n"
+        "       1000-MAIN SECTION.\n"
+        "           PERFORM UNTIL WSAA-X > 5\n"
+        "               MOVE 1 TO WSAA-X\n"
+        "           END-PERFORM.\n"
+        "           PERFORM 3 TIMES\n"
+        "               MOVE 2 TO WSAA-X\n"
+        "           END-PERFORM.\n"
+        "           PERFORM VARYING WSAA-I FROM 1 BY 1 UNTIL WSAA-I > 3\n"
+        "                   AFTER WSAA-J FROM 1 BY 1 UNTIL WSAA-J > 2\n"
+        "               MOVE WSAA-I TO WSAA-X\n"
+        "           END-PERFORM.\n"
+        "           PERFORM 2000-SUB.\n"
+        "       2000-SUB SECTION.\n"
+        "           MOVE 9 TO WSAA-X.\n"
+    )
+
+    def test_legacy_equals_asg_perform(self):
+        from translator.skeleton_gen.body_context import build_body_ctx
+        mod = TestDiffAsgVsLegacy()._harness()
+        prog = TestAsgMoveLift()._parse(self.SRC)
+        ctx, _ = build_body_ctx(prog)
+        legacy = mod._legacy_performs(prog, ctx)
+        asg = mod._asg_performs(prog, ctx)
+        self.assertEqual(len(legacy), len(asg))
+        self.assertTrue(len(legacy) >= 4, "样例应含 UNTIL/TIMES/VARYING/out-of-line 多条 PERFORM")
+        self.assertEqual([x[1] for x in legacy], [x[1] for x in asg])
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 步骤21 绞杀项3④ CALL 迁 visitor（抽 leaf/call.py + visit_CallStmt + 比对闸扩 CALL）
+#   ① translate_call 抽出后输出正确（IO固化/功能码未设→([],False)/未映射→([],False)/系统子程序）
+#   ② visit_CallStmt 输出 == translate_call；matched=False→// TODO-CALL
+#   ③ diff_asg_vs_legacy --verb CALL 两路 (lines,matched) 逐字符一致（IO/非IO/嵌套于 IF/PERFORM）
+# 对应设计：docs/详细设计/步骤21-绞杀项3④CALL迁visitor设计.md §7。
+# 只切①散点 CALL 兜底；②结构吸收/③struct_rebind 留后续刀（设计 §1 非目标）。
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestLeafCallExtract(unittest.TestCase):
+    """① 抽出的 translate_call 输出正确（覆盖 CALL 各形态，与抽取前 rules._t_call 一致）。"""
+
+    def _ctx(self, **kw):
+        import translator.rules as r
+        base = dict(
+            field_type_map={}, section_to_method=lambda s: s, known_sections=set(),
+            io_struct_prefixes={"ELPO"},
+            io_programs={"ELPOIO": {"field_name": "elpoRepository",
+                                    "param_struct": "ELPO-PARAMS",
+                                    "operations": {"READR": "findByKey({key})"}}},
+        )
+        base.update(kw)
+        return r.Ctx(**base)
+
+    def test_io_static_when_function_set(self):
+        """功能码已知（READR，经 struct_function）→ 直出 findByKey，参数对象进出。"""
+        from translator.leaf import translate_call
+        ctx = self._ctx()
+        ctx.struct_function["ELPO"] = "READR"
+        lines, ok = translate_call("CALL 'ELPOIO' USING ELPO-PARAMS".split(), ctx)
+        self.assertTrue(ok)
+        self.assertEqual(lines, ["elpoParams = elpoRepository.findByKey(elpoParams);"])
+
+    def test_no_function_falls_to_llm(self):
+        """struct_function 未设功能码（游标/未知）→ ([],False)，交 LLM。"""
+        from translator.leaf import translate_call
+        lines, ok = translate_call("CALL 'ELPOIO' USING ELPO-PARAMS".split(), self._ctx())
+        self.assertFalse(ok)
+        self.assertEqual(lines, [])
+
+    def test_unmapped_falls_to_llm(self):
+        """未映射子程序 → ([],False)，交 LLM。"""
+        from translator.leaf import translate_call
+        lines, ok = translate_call("CALL 'FOOIO' USING FOO-PARAMS".split(), self._ctx())
+        self.assertFalse(ok)
+
+    def test_system_program_java_code(self):
+        """系统子程序（java_code）→ 直出补分号。"""
+        from translator.leaf import translate_call
+        ctx = self._ctx(system_programs={"SYSERR": {"java_code": "throw new RuntimeException()"}})
+        lines, ok = translate_call("CALL 'SYSERR' USING X".split(), ctx)
+        self.assertTrue(ok)
+        self.assertEqual(lines, ["throw new RuntimeException();"])
+
+
+class TestAsgCallVisitor(unittest.TestCase):
+    """② visit_CallStmt 经同一 translate_call → 与 rules._t_call 一致；matched=False→// TODO-CALL。"""
+
+    def _ctx(self, **kw):
+        return TestLeafCallExtract()._ctx(**kw)
+
+    def test_matched_call_matches_legacy(self):
+        from asg import CallStmt, LeafJavaVisitor
+        import translator.rules as rules
+        ctx = self._ctx()
+        ctx.struct_function["ELPO"] = "READR"
+        toks = "CALL 'ELPOIO' USING ELPO-PARAMS".split()
+        node = CallStmt(name="ELPOIO", tokens=toks, raw="CALL 'ELPOIO' USING ELPO-PARAMS")
+        out = LeafJavaVisitor(ctx).visit(node)
+        self.assertEqual(out, rules._t_call(toks, ctx)[0])
+        self.assertEqual(out, ["elpoParams = elpoRepository.findByKey(elpoParams);"])
+
+    def test_unmatched_call_todo_placeholder(self):
+        from asg import CallStmt, LeafJavaVisitor
+        node = CallStmt(name="SOMESUB", tokens="CALL 'SOMESUB' USING WSAA-X".split(),
+                        raw="CALL 'SOMESUB' USING WSAA-X")
+        self.assertEqual(LeafJavaVisitor(self._ctx()).visit(node),
+                         ["// TODO-CALL: CALL 'SOMESUB' USING WSAA-X"])
+
+
+class TestDiffAsgVsLegacyCall(unittest.TestCase):
+    """③ 整程序上旧/新两路 CALL 的 (lines,matched) 逐字符一致（IO/非IO/嵌套于 IF 与 PERFORM）。"""
+
+    SRC = (
+        "       IDENTIFICATION DIVISION.\n"
+        "       PROGRAM-ID. TCALL.\n"
+        "       DATA DIVISION.\n"
+        "       WORKING-STORAGE SECTION.\n"
+        "       01 WSAA-X    PIC 9(04) VALUE 0.\n"
+        "       01 AGNT-PARAMS.\n"
+        "          03 AGNT-FUNCTION PIC X(05).\n"
+        "       PROCEDURE DIVISION.\n"
+        "       1000-MAIN SECTION.\n"
+        "           MOVE READR TO AGNT-FUNCTION.\n"
+        "           CALL 'AGNTIO' USING AGNT-PARAMS.\n"
+        "           CALL 'SOMESUB' USING WSAA-X.\n"
+        "           IF WSAA-X = 1\n"
+        "               CALL 'CLNTIO' USING CLNT-PARAMS\n"
+        "           END-IF.\n"
+        "           PERFORM UNTIL WSAA-X > 5\n"
+        "               CALL 'CHDRENQIO' USING CHDRENQ-PARAMS\n"
+        "           END-PERFORM.\n"
+    )
+
+    def test_legacy_equals_asg_call(self):
+        from translator.skeleton_gen.body_context import build_body_ctx
+        mod = TestDiffAsgVsLegacy()._harness()
+        prog = TestAsgMoveLift()._parse(self.SRC)
+        ctx, _ = build_body_ctx(prog)
+        legacy = mod._legacy_calls(prog, ctx)
+        asg = mod._asg_calls(prog, ctx)
+        self.assertEqual(len(legacy), len(asg))
+        self.assertTrue(len(legacy) >= 4, "样例应含 IO/非IO/嵌套于 IF 与 PERFORM 多条 CALL")
+        self.assertEqual([x[1] for x in legacy], [x[1] for x in asg])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
