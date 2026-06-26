@@ -11,12 +11,39 @@
 """
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field as dc_field
 
 from config import grammar_loader               # 控制流降级策略正本（步骤08）
 from config import spec_loader                   # 命名正本（步骤13 §2.4：合成区间方法名）
 from translator.segmenter import Stmt
+# 叶子翻译公用底座（步骤18 绞杀项3①）：MOVE 译器 + 表达式底座下沉至 translator.leaf，
+# 此处只读 import 回来，原 helper 定义已删、改委托（依赖单向 rules → leaf，无环）。
+from translator.leaf.expr import (
+    _FIGURATIVE_BLANK, _FIGURATIVE_ZERO, _assign, _field_base, _is_bigdecimal,
+    _is_field, _is_numeric_field, _is_string_field, _java, _lvalue, _operand, _pascal,
+    _refmod_hi, _refmod_lo, _struct_cls, _struct_obj, _struct_prefix,
+)
+from translator.leaf.move import translate_move
+# 条件翻译（步骤19 绞杀项3②）：_try_condition 闭包下沉至 translator.leaf.cond，别名导回，
+# _sk_if / PERFORM-UNTIL / WHEN / BEGN-foreach 过滤等 4 处调用点零改（依赖单向 rules → leaf，无环）。
+from translator.leaf.cond import translate_condition as _try_condition
+# PERFORM 循环子句翻译（步骤20 绞杀项3③）：_perform_loop 三件套下沉至 translator.leaf.loop，
+# 原名导回，_sk_perform 调用点零改（依赖单向 rules → leaf，无环）。
+from translator.leaf.loop import _perform_loop
+# CALL 散点兜底翻译（步骤21 绞杀项3④）：_t_call 下沉至 translator.leaf.call，别名导回 → _dispatch_leaf 零改；
+# resolve_io_info/derive_io_info 一并下沉再导入回 → 结构吸收 4 处调用点 + rules.resolve_io_info 公开面零改
+# （graph/nodes、main、context、skeleton、regress 等外部引用照常；依赖单向 rules → leaf，无环）。
+from translator.leaf.call import translate_call as _t_call, resolve_io_info, derive_io_info
+# 算术/赋值叶子动词（步骤22 绞杀项3⑤）：_t_initialize/_t_set 下沉 translator.leaf.assign，
+# _t_add/_t_subtract/_t_multiply/_t_divide/_t_compute（及私有 _arith_val）下沉 translator.leaf.arith，
+# 别名导回 → _dispatch_leaf 7 个调用点零改；_arith_val 仅 4 算术译器内部用、随迁不再导入
+# （依赖单向 rules → leaf，无环）。
+from translator.leaf.assign import _t_initialize, _t_set
+from translator.leaf.arith import _t_add, _t_subtract, _t_multiply, _t_divide, _t_compute
+# 控制流动词（步骤23 绞杀项3⑥）：_sk_control 的 flow_label-无关分支 + _sk_evaluate 的 switch 壳判定
+# 下沉 translator.leaf.control，rules 委托（dispatch 分支保留在 _sk_control，骨架态不迁）；
+# 依赖单向 rules → leaf，无环。
+from translator.leaf.control import translate_control, translate_evaluate, evaluate_case_label
 
 
 @dataclass
@@ -59,275 +86,11 @@ class Ctx:
 # 控制流类简单语句（骨架层处理），其余 simple 视为叶子
 _CONTROL_FIRST = {"GO", "CONTINUE", "NEXT", "EXIT", "GOBACK", "STOP"}
 
-_FIGURATIVE_ZERO = {"ZERO", "ZEROS", "ZEROES"}
-_FIGURATIVE_BLANK = {"SPACE", "SPACES", "LOW-VALUE", "LOW-VALUES", "HIGH-VALUES"}
 _REL_OPS = {"=": "==", ">": ">", "<": "<", ">=": ">=", "<=": "<=", "NOT": "NOT"}
 
 
 def _ind(n: int) -> str:
     return "    " * n
-
-
-def _field_base(name: str) -> str:
-    """去掉下标后的 java 基名：WSAA-NAME(IX) → wsaaName。"""
-    return _java(name).split("(")[0]
-
-
-def _is_field(name: str, ctx: Ctx) -> bool:
-    return _field_base(name) in ctx.field_type_map
-
-
-def _java(cobol: str) -> str:
-    """WSAA-POLICY-NO → wsaaPolicyNo（与 variable_resolver 一致，含下标原样保留）。"""
-    base = cobol
-    sub = ""
-    m = re.match(r"^([A-Za-z0-9\-]+)(\(.*\))$", cobol)
-    if m:
-        base, sub = m.group(1), m.group(2)
-    parts = base.lower().replace("-", "_").split("_")
-    jn = parts[0] + "".join(p.capitalize() for p in parts[1:])
-    return jn + sub
-
-
-def _is_numeric_field(name: str, ctx: Ctx) -> bool:
-    info = ctx.field_type_map.get(_java(name).split("(")[0])
-    return bool(info) and info["type"] in ("int", "long", "BigDecimal")
-
-
-def _is_bigdecimal(name: str, ctx: Ctx) -> bool:
-    info = ctx.field_type_map.get(_java(name).split("(")[0])
-    return bool(info) and info["type"] == "BigDecimal"
-
-
-def _is_string_field(name: str, ctx: Ctx) -> bool:
-    """已知的字符串字段（用于条件判断里防止把字符串误判成数值比较）。"""
-    info = ctx.field_type_map.get(_java(name).split("(")[0])
-    return bool(info) and info["type"] == "String"
-
-
-def _refmod_lo(start: str) -> str:
-    """COBOL 子串起点是 1-based → Java 0-based。常量则直接折算。"""
-    if re.fullmatch(r"\d+", start):
-        return str(int(start) - 1)
-    return f"{start} - 1"
-
-
-def _refmod_hi(lo: str, length: str) -> str:
-    """substring 上界 = lo + len。两端皆常量则折算。"""
-    if re.fullmatch(r"-?\d+", lo) and re.fullmatch(r"\d+", length):
-        return str(int(lo) + int(length))
-    return f"{lo} + {length}"
-
-
-def _pascal(cobol: str) -> str:
-    """REQUEST-COMPANY → RequestCompany（用于 getter/setter 后缀）。"""
-    parts = cobol.lower().replace("-", "_").split("_")
-    return "".join(p.capitalize() for p in parts)
-
-
-def _struct_prefix(tok: str, ctx: Ctx):
-    """若 tok 是 IO/linkage 参数结构体字段（PS01CHR-CHDRCOY），返回 (前缀大写, 余名大写)；否则 None。"""
-    if "-" not in tok:
-        return None
-    pre, rest = tok.split("-", 1)
-    if pre.upper() in ctx.io_struct_prefixes:
-        return pre.upper(), rest.upper()
-    return None
-
-
-def _struct_obj(prefix: str, ctx: Ctx) -> str:
-    """前缀 → 结构体 Java 对象名。优先用 config/copy_mappings 派生的映射，兜底按默认后缀。"""
-    obj = ctx.struct_objects.get(prefix.upper())
-    return obj if obj else _java(prefix) + ctx.struct_default_suffix
-
-
-def _struct_cls(prefix: str, ctx: Ctx) -> str:
-    """前缀 → 结构体 Java 类名。"""
-    cls = ctx.struct_classes.get(prefix.upper())
-    if cls:
-        return cls
-    o = _struct_obj(prefix, ctx)
-    return o[0].upper() + o[1:]
-
-
-def _operand(tok: str, ctx: Ctx) -> str:
-    """把单个 COBOL 操作数转成 Java 表达式（裸字段名 / 字面量 / 下标访问 / 结构体读取）。"""
-    u = tok.upper()
-    if tok.startswith("'") or tok.startswith('"'):
-        return '"' + tok[1:-1] + '"'
-    if u in _FIGURATIVE_ZERO:
-        return "0"
-    if re.fullmatch(r"[+-]?\d+(\.\d+)?", tok):
-        return tok
-    # 引用修改（取子串）：X(start:len) → base.substring(start-1, start-1+len)
-    m = re.match(r"^([A-Za-z0-9\-]+)\(([^:]+):([^)]*)\)$", tok)
-    if m:
-        base, start_t, len_t = m.group(1), m.group(2).strip(), m.group(3).strip()
-        base_expr = _operand(base, ctx)
-        s0 = _refmod_lo(_operand(start_t, ctx))
-        if len_t:
-            return f"{base_expr}.substring({s0}, {_refmod_hi(s0, _operand(len_t, ctx))})"
-        return f"{base_expr}.substring({s0})"
-    # 下标访问：WSAA-NAME(IX) → wsaaName(ix)（后处理转 [ix-1]）
-    m = re.match(r"^([A-Za-z0-9\-]+)\((.+)\)$", tok)
-    if m and _is_field(m.group(1), ctx):
-        return f"{_field_base(m.group(1))}({_operand(m.group(2), ctx)})"
-    if _is_field(tok, ctx):
-        return _field_base(tok)
-    # IO/linkage 参数结构体字段：PS01CHR-CHDRCOY → ps01chrParams.getChdrcoy()
-    # （拷贝簿不在盘上、字段未进 field_type_map，但绝不能当字符串字面量）
-    sp = _struct_prefix(tok, ctx)
-    if sp:
-        pre, rest = sp
-        if rest == "PARAMS":
-            return _struct_obj(pre, ctx)                  # 结构体对象本身
-        return f"{_struct_obj(pre, ctx)}.{ctx.struct_getter}{_pascal(rest)}()"  # 字段读取
-    # 非字段裸词（如 O-K / BEGN / 88 条件值 / 命名常量）→ 字符串字面量
-    if re.fullmatch(r"[A-Za-z0-9\-]+", tok):
-        return '"' + tok + '"'
-    return _java(tok)
-
-
-def _lvalue(dst: str, ctx: Ctx) -> str:
-    """赋值左值（MOVE/SET/COMPUTE 的目标）→ Java 左值表达式。
-
-    照 wsaa_translation_spec.procedure_semantics.assignment_target：目标语义上必为字段，
-    绝不退化为字符串字面量。下标/引用修改目标复用 _operand 解析；裸词（含未登记字段）→
-    _field_base（camelCase 标识符），修 Bug 2：`"WSAA-A65086" = ""` → `wsaaA65086 = ""`。
-    """
-    if re.match(r"^[A-Za-z0-9\-]+\(", dst):     # X(IX) 下标 / X(s:l) 引用修改 → 同 RHS 解析
-        return _operand(dst, ctx)
-    return _field_base(dst)                      # 裸字段目标：必为字段，不退化字面量
-
-
-def _assign(dst: str, val: str, ctx: Ctx) -> str:
-    """生成赋值语句：结构体字段走 setter，结构体整体走 new，普通字段走 = 。"""
-    sp = _struct_prefix(dst, ctx)
-    if sp:
-        pre, rest = sp
-        if rest == "PARAMS":
-            if val in ('""', "0", "BigDecimal.ZERO", "null"):
-                return f"{_struct_obj(pre, ctx)} = new {_struct_cls(pre, ctx)}();"  # MOVE SPACES/INITIALIZE 重置
-            return f"{_struct_obj(pre, ctx)} = {val};"                                # MOVE 结构体→结构体 拷贝
-        return f"{_struct_obj(pre, ctx)}.{ctx.struct_setter}{_pascal(rest)}({val});"
-    return f"{_lvalue(dst, ctx)} = {val};"                                            # 左值必为字段（Bug 2）
-
-
-# ── 条件翻译 ──────────────────────────────────────────────────────────────────
-
-def _try_condition(tokens: list[str], ctx: Ctx) -> str | None:
-    """翻译 IF / UNTIL / WHEN 条件为 Java 布尔表达式；失败返回 None。"""
-    if not tokens:
-        return None
-    # 按 AND/OR 切分（保留连接符）
-    parts: list[str] = []
-    cur: list[str] = []
-    for t in tokens:
-        if t.upper() in ("AND", "OR"):
-            parts.append(cur)
-            parts.append([t.upper()])
-            cur = []
-        else:
-            cur.append(t)
-    parts.append(cur)
-
-    out: list[str] = []
-    for seg in parts:
-        if len(seg) == 1 and seg[0] in ("AND", "OR"):
-            out.append("&&" if seg[0] == "AND" else "||")
-            continue
-        expr = _try_comparison(seg, ctx)
-        if expr is None:
-            return None
-        out.append(expr)
-    return " ".join(out)
-
-
-def _try_comparison(seg: list[str], ctx: Ctx) -> str | None:
-    if not seg:
-        return None
-    # 定位关系运算符
-    negate = False
-    op_idx = -1
-    op = ""
-    for i, t in enumerate(seg):
-        u = t.upper()
-        if u == "NOT":
-            negate = True
-            continue
-        if u in ("=", "EQUAL"):
-            op, op_idx = "=", i
-            break
-        if u in (">", "GREATER"):
-            op, op_idx = ">", i
-            break
-        if u in ("<", "LESS"):
-            op, op_idx = "<", i
-            break
-        if u in (">=",):
-            op, op_idx = ">=", i
-            break
-        if u in ("<=",):
-            op, op_idx = "<=", i
-            break
-    if op_idx < 0:
-        return None  # 88 条件名 / 复杂条件 → 交 LLM
-    left = [t for t in seg[:op_idx] if t.upper() != "NOT"]
-    right = seg[op_idx + 1:]
-    if len(left) != 1 or len(right) < 1:
-        return None
-    lname = left[0]
-    ljava = _operand(lname, ctx)
-    rtok = right[0]
-    ru = rtok.upper()
-
-    # = SPACES / NOT = SPACES
-    if ru in _FIGURATIVE_BLANK:
-        base = f"StringUtils.isBlank({ljava})"
-        if op != "=":
-            return None
-        return f"!{base}" if negate else base
-
-    rjava = _operand(rtok, ctx)
-    # 数值比较判定：左/右任一为已知数值字段，或右为数字字面量/figurative ZERO。
-    # 右操作数为数值字段时，左侧若是「已知字符串字段」则不强转数值（防 String 与 long 误比）；
-    # 左侧类型未知（如 IO 结构体 getter）则随右侧按数值处理（修 field>field 漏判 → 整块掉 LLM）。
-    numeric = (
-        _is_numeric_field(lname, ctx)
-        or ru in _FIGURATIVE_ZERO
-        or re.fullmatch(r"[+-]?\d+(\.\d+)?", rtok)
-        or (_is_numeric_field(rtok, ctx) and not _is_string_field(lname, ctx))
-    )
-    if numeric:
-        if _is_bigdecimal(lname, ctx) or _is_bigdecimal(rtok, ctx):
-            j = f"{ljava}.compareTo({_bd(rjava)})"
-            cmp = {"=": "== 0", ">": "> 0", "<": "< 0", ">=": ">= 0", "<=": "<= 0"}[op]
-            base = f"{j} {cmp}"
-            if negate:
-                base = _negate_numeric(j, op)
-            return f"({base})"
-        jop = {"=": "==", ">": ">", "<": "<", ">=": ">=", "<=": "<="}[op]
-        if negate:
-            jop = {"==": "!=", ">": "<=", "<": ">=", ">=": "<", "<=": ">"}[jop]
-        return f"{ljava} {jop} {rjava}"
-    # 字符串比较
-    if op != "=":
-        return None
-    base = f"{rjava}.equals({ljava})"
-    return f"!{base}" if negate else base
-
-
-def _bd(expr: str) -> str:
-    if expr == "0":
-        return "BigDecimal.ZERO"
-    if re.fullmatch(r"[+-]?\d+(\.\d+)?", expr):
-        return f"new BigDecimal(\"{expr}\")"
-    return expr
-
-
-def _negate_numeric(cmp_expr: str, op: str) -> str:
-    inv = {"=": "!= 0", ">": "<= 0", "<": ">= 0", ">=": "< 0", "<=": "> 0"}[op]
-    return f"{cmp_expr} {inv}"
 
 
 # ── 段内控制流（paragraph + GO TO）─────────────────────────────────────────────
@@ -1144,21 +907,16 @@ def _sk_if(st: Stmt, ctx: Ctx, indent: int) -> list[str]:
 
 
 def _sk_evaluate(st: Stmt, ctx: Ctx, indent: int) -> list[str]:
-    subj = " ".join(st.tokens).strip()
-    if subj.upper() in ("TRUE", "") or not st.whens:
-        # EVALUATE TRUE（条件式）较复杂，交 LLM
+    # switch 主体判定下沉 leaf.control.translate_evaluate（步骤23 绞杀项3⑥，委托）；
+    # WHEN 体渲染/递归仍在骨架层；EVALUATE TRUE/复杂 subject/无 whens → 交 LLM。
+    if not st.whens:
         return [_ind(indent) + ctx.new_leaf(st)]
-    subj_java = _operand(st.tokens[0], ctx) if len(st.tokens) == 1 else None
+    subj_java = translate_evaluate(st.tokens, ctx)
     if subj_java is None:
         return [_ind(indent) + ctx.new_leaf(st)]
-    lines = [f"{_ind(indent)}switch ({subj_java}.trim()) {{"]
+    lines = [f"{_ind(indent)}switch ({subj_java}) {{"]
     for cond, body in st.whens:
-        cu = " ".join(cond).upper()
-        if cu in ("OTHER", ""):
-            lines.append(f"{_ind(indent + 1)}default: {{")
-        else:
-            val = _operand(cond[0], ctx) if cond else '""'
-            lines.append(f"{_ind(indent + 1)}case {val}: {{")
+        lines.append(f"{_ind(indent + 1)}{evaluate_case_label(cond, ctx)}: {{")
         lines.extend(build_skeleton(body, ctx, indent + 2))
         lines.append(f"{_ind(indent + 2)}break;")
         lines.append(f"{_ind(indent + 1)}}}")
@@ -1252,62 +1010,6 @@ def _perform_range_paragraph(a: str, b: str, ctx: Ctx, indent: int) -> list[str]
             f"{_ind(indent)}this.{mname}();"]
 
 
-def _has_test_after(hu: list) -> bool:
-    """WITH TEST AFTER 检测：TEST 紧跟 AFTER（区别于 VARYING 的 AFTER——后者前邻 UNTIL 条件）。"""
-    return any(hu[i] == "TEST" and i + 1 < len(hu) and hu[i + 1] == "AFTER" for i in range(len(hu)))
-
-
-def _parse_varying_clauses(header: list, hu: list, ctx: Ctx):
-    """把 VARYING…AFTER… 切成子句序列 [(v, a, b, cond), …]（步骤16 §2.3，D16-2 任意层）。
-    每子句 <var> FROM <a> BY <b> UNTIL <cond>，cond 自 UNTIL 后延至下一 AFTER/header 末。
-    任一子句兜不住 → None（调用方落 LLM，all-or-nothing，D16-3）。"""
-    starts = [i for i, t in enumerate(hu) if t in ("VARYING", "AFTER")] + [len(header)]
-    clauses = []
-    for s in range(len(starts) - 1):
-        seg = header[starts[s] + 1: starts[s + 1]]   # VARYING/AFTER 关键字后到下一子句前
-        su = [t.upper() for t in seg]
-        try:
-            v = _operand(seg[0], ctx)
-            a = _operand(seg[su.index("FROM") + 1], ctx)
-            b = _operand(seg[su.index("BY") + 1], ctx)
-            cond = _try_condition(seg[su.index("UNTIL") + 1:], ctx)
-        except (ValueError, IndexError):
-            return None
-        if cond is None:
-            return None
-        clauses.append((v, a, b, cond))
-    return clauses
-
-
-def _perform_loop(header: list, hu: list, ctx: Ctx, indent: int):
-    """PERFORM 循环子句 → (open_lines, close_lines)。无循环 → ([], [])；兜不住 → None（落 LLM 叶子）。
-    步骤16：WITH TEST AFTER→do-while（仅无 VARYING，D16-1）；VARYING…AFTER→嵌套 for（D16-2）；UNTIL/TIMES 基本形不变。"""
-    test_after = _has_test_after(hu)
-    if "VARYING" in hu:
-        if test_after:
-            return None                       # D16-1：VARYING+TEST AFTER 保守落 LLM，不臆造
-        clauses = _parse_varying_clauses(header, hu, ctx)
-        if clauses is None:
-            return None
-        open_lines, close_lines = [], []
-        for k, (v, a, b, cond) in enumerate(clauses):
-            open_lines.append(f"{_ind(indent + k)}for ({v} = {a}; !({cond}); {v} = {v} + {b}) {{")
-            close_lines.insert(0, f"{_ind(indent + k)}}}")
-        return open_lines, close_lines
-    if "UNTIL" in hu:
-        cond = _try_condition(header[hu.index("UNTIL") + 1:], ctx)
-        if cond is None:
-            return None
-        if test_after:                        # do { … } while (!(cond));
-            return [f"{_ind(indent)}do {{"], [f"{_ind(indent)}}} while (!({cond}));"]
-        return [f"{_ind(indent)}while (!({cond})) {{"], [f"{_ind(indent)}}}"]
-    if "TIMES" in hu:
-        ti = hu.index("TIMES")
-        cnt = _operand(header[ti - 1], ctx) if ti > 0 else "1"
-        return [f"{_ind(indent)}for (int _i = 0; _i < {cnt}; _i++) {{"], [f"{_ind(indent)}}}"]
-    return [], []
-
-
 def _sk_perform(st: Stmt, ctx: Ctx, indent: int) -> list[str]:
     header = st.tokens
     hu = [h.upper() for h in header]
@@ -1335,37 +1037,19 @@ def _sk_perform(st: Stmt, ctx: Ctx, indent: int) -> list[str]:
 
 
 def _sk_control(st: Stmt, ctx: Ctx, indent: int) -> list[str]:
+    # dispatch 模式（flow_label 真）：骨架装配态，本刀不迁，先于委托判定并保留原样（步骤23 §1 非目标）。
     toks = [t.upper() for t in st.tokens]
     first = toks[0]
     if first == "GO":
-        # GO TO target
-        target = None
-        for t in toks:
-            if t not in ("GO", "TO"):
-                target = t
-                break
-        # dispatch 模式下，目标是本段 paragraph → 状态机跳转（保住循环/分支语义）
+        target = next((t for t in toks if t not in ("GO", "TO")), None)
         if target and ctx.flow_label and target in ctx.flow_paragraphs:
             return [f'{_ind(indent)}__pc = "{target}"; continue {ctx.flow_label};  // GO TO {target}']
-        if target and target.endswith("EXIT"):
-            return [f"{_ind(indent)}return;  // GO TO {target}"]
-        if target:
-            line = f"{_ind(indent)}// TODO-GOTO: 跳转 {target}，需人工核对控制流"
-            if target in ctx.known_sections:
-                return [line, f"{_ind(indent)}{_proc_call(target, ctx)}", f"{_ind(indent)}return;"]
-            return [line, f"{_ind(indent)}return;"]
-        return [f"{_ind(indent)}return;"]
-    if first in ("GOBACK", "STOP"):
-        return [f"{_ind(indent)}return;"]
-    if first == "EXIT":
-        # dispatch 模式下 EXIT paragraph = 退出状态机循环
-        if ctx.flow_label:
-            return [f"{_ind(indent)}break {ctx.flow_label};  // EXIT"]
-        return [f"{_ind(indent)}return;  // EXIT"]
-    if first == "CONTINUE":
-        return [f"{_ind(indent)};  // CONTINUE"]
-    if first == "NEXT":
-        return [f"{_ind(indent)};  // NEXT SENTENCE"]
+    if first == "EXIT" and ctx.flow_label:
+        return [f"{_ind(indent)}break {ctx.flow_label};  // EXIT"]
+    # flow_label-无关分支委托 leaf.control.translate_control（步骤23 绞杀项3⑥，裸行 + 本层施加 _ind）。
+    lines, ok = translate_control(st.tokens, ctx)
+    if ok:
+        return [_ind(indent) + l for l in lines]
     return [_ind(indent) + ctx.new_leaf(st)]
 
 
@@ -1397,7 +1081,7 @@ def _dispatch_leaf(toks: list[str], ctx: Ctx) -> tuple[list[str], bool]:
     verb = toks[0].upper()
     try:
         if verb == "MOVE":
-            return _t_move(toks, ctx)
+            return translate_move(toks, ctx)
         if verb == "INITIALIZE":
             return _t_initialize(toks, ctx)
         if verb == "SET":
@@ -1417,339 +1101,3 @@ def _dispatch_leaf(toks: list[str], ctx: Ctx) -> tuple[list[str], bool]:
     except (ValueError, IndexError):
         return [], False
     return [], False
-
-
-def derive_io_info(name: str, pattern: dict | None) -> dict | None:
-    """按 io_mappings.yaml 的 `io_default_pattern` 范式为 CALL 'xxxIO' 兜底派生 Repository 映射。
-
-    所有映射关系（类/字段后缀、包名、参数结构体后缀、操作码→方法）都来自配置表 pattern，
-    py 只负责套用命名范式（base → PascalCase/camelCase），不写死任何业务映射。
-    例（pattern 后缀=Repository、包=com.example.repository）：
-      SCF4CHRIO → Scf4chrRepository / scf4chrRepository / SCF4CHR-PARAMS。
-    仅对 *IO 结尾的子程序生效；pattern 缺失或非 *IO → 返回 None（不派生）。
-    """
-    if not pattern:
-        return None
-    if not name or not name.upper().endswith("IO") or len(name) <= 2:
-        return None
-    base = name[:-2].upper()              # SCF4CHR
-    cls_base = base.lower().capitalize()  # Scf4chr（PascalCase）
-    field = cls_base[0].lower() + cls_base[1:]  # scf4chr（camelCase）
-    cls = f"{cls_base}{pattern.get('class_suffix', '')}"
-    return {
-        "java_class": cls,
-        "field_name": f"{field}{pattern.get('field_suffix', '')}",
-        "param_struct": f"{base}{pattern.get('param_struct_suffix', '')}",
-        "import": f"{pattern.get('import_package', '').rstrip('.')}.{cls}",
-        "operations": dict(pattern.get("operations", {})),
-        "_derived": True,
-    }
-
-
-def resolve_io_info(name: str, io_programs: dict, pattern: dict | None) -> dict | None:
-    """统一解析 CALL 'xxxIO' 的映射：派生范式做基底，io_programs 显式条目按字段/操作码深合并覆盖。
-
-    这样 io_mappings.yaml 的 io_programs 只需登记「非标准的增量」（如某表 READR 用
-    findByPolicyNo），java_class/field_name/param_struct/import 与标准操作码全部由
-    io_default_pattern 自动派生，无需逐表重复抄写。
-    非 *IO 子程序（无法派生）→ 直接返回显式条目或 None。
-    """
-    base = derive_io_info(name, pattern)
-    entry = io_programs.get(name)
-    if not base:
-        return entry            # 非 *IO：只认显式登记
-    if not entry:
-        return base             # 纯标准 *IO：全靠范式
-    merged = {**base, **entry}  # 顶层字段：显式覆盖派生
-    ops = dict(base.get("operations", {}))
-    ops.update(entry.get("operations", {}))   # 操作码：逐码覆盖，未覆盖的保留标准派生
-    merged["operations"] = ops
-    return merged
-
-
-def _t_call(toks: list[str], ctx: Ctx) -> tuple[list[str], bool]:
-    """
-    CALL 'xxxIO' USING xxx-PARAMS → 固化 Repository 调用（叶子级退路）。
-
-    单条「读」(READR/READS) 的标准形态 setup+CALL+IF 由 _rewrite_begn_loops 的结构化吸收
-    （_match_readr_single / _render_readr_single）整段改写为 `Rec r = repo.findBy…Readr(键)`，
-    不会走到这里。本函数只兜底未被结构吸收的散点 CALL：
-      · 功能码由前一句 MOVE … TO xxx-FUNCTION 设，记在 ctx.struct_function。
-      · 功能码在 io_default_pattern.operations 有对应方法（如 UPDAT/WRITE→save）
-        → 直出 obj = repo.method(obj);
-      · 否则（含游标 BEGN/NEXTR、功能码不在 operations）→ matched=False，交 LLM 兜底。
-        决策 D（步骤10）：功能码恒为 CALL 前显性字面量、静态恒可得，原 execute() 运行时分发
-        是为不存在场景写的死代码，已移除。
-      · 未映射的子程序 → matched=False，交 LLM 兜底。
-    """
-    if len(toks) < 2:
-        return [], False
-    name = toks[1].strip("'\"").upper()
-
-    # 取 USING 后第一个实参作为参数结构体
-    u = [t.upper() for t in toks]
-    arg = None
-    if "USING" in u:
-        ui = u.index("USING")
-        if ui + 1 < len(toks):
-            arg = toks[ui + 1]
-
-    # 表里有用表里的；没有但符合 *IO 查表范式 → 按命名规范兜底派生（固定化翻译）
-    info = resolve_io_info(name, ctx.io_programs, ctx.io_default_pattern)
-    if info:
-        repo = info["field_name"]
-        ops = info.get("operations", {})
-        prefix = (arg.split("-", 1)[0].upper() if arg and "-" in arg
-                  else info.get("param_struct", "").split("-", 1)[0].upper())
-        obj = _struct_obj(prefix, ctx) if prefix else "params"
-        func = ctx.struct_function.get(prefix)
-        if func and func in ops:
-            method = re.sub(r"\{[^}]*\}", obj, ops[func])           # save({entity}) → save(elpoParams)
-            return [f"{obj} = {repo}.{method};"], True               # 静态固化
-        return [], False    # 功能码不在 operations（游标/未知）→ 交 LLM（决策 D：移除 execute 死代码退路）
-
-    # 日期子程序：dateConversionService.convertDateN(params)
-    dinfo = ctx.date_programs.get(name)
-    if dinfo and dinfo.get("method") and dinfo.get("field_name"):
-        prefix = (arg.split("-", 1)[0].upper() if arg and "-" in arg else name)
-        obj = _struct_obj(prefix, ctx)
-        method = re.sub(r"\{[^}]*\}", obj, dinfo["method"])
-        return [f"{dinfo['field_name']}.{method};"], True
-
-    # 系统子程序（SYSERR 等）：直出 java_code，否则 service.method
-    sinfo = ctx.system_programs.get(name)
-    if sinfo:
-        if sinfo.get("java_code"):
-            code = sinfo["java_code"].strip()
-            return [code if code.endswith(";") else code + ";"], True
-        if sinfo.get("method") and sinfo.get("field_name"):
-            prefix = (arg.split("-", 1)[0].upper() if arg and "-" in arg else name)
-            obj = _struct_obj(prefix, ctx)
-            method = re.sub(r"\{[^}]*\}", obj, sinfo["method"])
-            return [f"{sinfo['field_name']}.{method};"], True
-
-    return [], False    # 未映射 → LLM 兜底
-
-
-def _t_move(toks: list[str], ctx: Ctx) -> tuple[list[str], bool]:
-    # MOVE src TO dst1 [dst2 ...]
-    if "TO" not in [t.upper() for t in toks]:
-        return [], False
-    ti = [t.upper() for t in toks].index("TO")
-    src_toks = toks[1:ti]
-    dsts = toks[ti + 1:]
-    if len(src_toks) != 1 or not dsts:
-        return [], False
-    src = src_toks[0]
-    su = src.upper()
-    sp_src = _struct_prefix(src, ctx)
-    src_is_params = bool(sp_src and sp_src[1] == "PARAMS")
-    lines: list[str] = []
-    for dst in dsts:
-        sp_dst = _struct_prefix(dst, ctx)
-        # 调用约定吸收（步骤10）：FUNCTION/FORMAT 不是真实字段，一律不生成 setter。
-        #   · MOVE READR TO ELPO-FUNCTION → 仅记 struct_function（供 CALL 吸收功能码）。
-        #   · MOVE ELPOREC TO ELPO-FORMAT → 仅校验记录格式，Java 侧无对应，直接吞掉。
-        if sp_dst and sp_dst[1] in ("FUNCTION", "FORMAT"):
-            if sp_dst[1] == "FUNCTION":
-                ctx.struct_function[sp_dst[0]] = su.strip("'\"")
-            continue
-        # 决策 C（步骤10）：组级 params 互拷 MOVE xxx-PARAMS TO yyy-PARAMS →
-        #   BeanUtils.copyProperties(src, dst)：运行时按同名属性互拷、名字对不上的自动忽略，
-        #   恰好等价「同名字段互拷」，且无需拷贝簿字段表（字段不在盘上时静态无法逐字段枚举）。
-        if src_is_params and sp_dst and sp_dst[1] == "PARAMS":
-            lines.append(f"BeanUtils.copyProperties("
-                         f"{_struct_obj(sp_src[0], ctx)}, {_struct_obj(sp_dst[0], ctx)});")
-            continue
-        if su in _FIGURATIVE_BLANK:
-            val = '""' if not _is_numeric_field(dst, ctx) else ("BigDecimal.ZERO" if _is_bigdecimal(dst, ctx) else "0")
-        elif su in _FIGURATIVE_ZERO:
-            val = "BigDecimal.ZERO" if _is_bigdecimal(dst, ctx) else "0"
-        else:
-            val = _operand(src, ctx)
-            if _is_bigdecimal(dst, ctx) and re.fullmatch(r"[+-]?\d+(\.\d+)?", val):
-                val = _bd(val)
-        lines.append(_assign(dst, val, ctx))
-    return lines, True
-
-
-def _t_initialize(toks: list[str], ctx: Ctx) -> tuple[list[str], bool]:
-    """INITIALIZE dst1 [dst2 ...] → 重置为默认值。
-      · 结构体参数（X-PARAMS）→ obj = new XParams();（与 MOVE SPACES 重置一致）
-      · 数值字段 → 0 / BigDecimal.ZERO；字符串字段 → ""
-      · 带 REPLACING/含未识别目标 → 整体交 LLM（避免半翻）。
-    """
-    dsts = toks[1:]
-    if not dsts:
-        return [], False
-    lines: list[str] = []
-    for dst in dsts:
-        if dst.upper() in ("REPLACING", "TO", "VALUE", "ALL"):
-            return [], False
-        sp = _struct_prefix(dst, ctx)
-        if sp and sp[1] == "PARAMS":
-            lines.append(f"{_struct_obj(sp[0], ctx)} = new {_struct_cls(sp[0], ctx)}();")
-        elif _is_field(dst, ctx):
-            if _is_bigdecimal(dst, ctx):
-                val = "BigDecimal.ZERO"
-            elif _is_numeric_field(dst, ctx):
-                val = "0"
-            else:
-                val = '""'
-            lines.append(_assign(dst, val, ctx))
-        else:
-            return [], False
-    return lines, True
-
-
-def _t_set(toks: list[str], ctx: Ctx) -> tuple[list[str], bool]:
-    # SET a [b] TO value  （仅处理 TO 数值/字段；TO TRUE/ON 等交 LLM）
-    u = [t.upper() for t in toks]
-    if "TO" not in u:
-        return [], False
-    ti = u.index("TO")
-    targets = toks[1:ti]
-    val_toks = toks[ti + 1:]
-    if len(val_toks) != 1 or not targets:
-        return [], False
-    vu = val_toks[0].upper()
-    if vu in ("TRUE", "FALSE", "ON", "OFF"):
-        return [], False
-    val = _operand(val_toks[0], ctx)
-    return [_assign(t, val, ctx) for t in targets], True
-
-
-def _arith_val(name: str, expr: str, ctx: Ctx) -> str:
-    return _bd(expr) if _is_bigdecimal(name, ctx) and re.fullmatch(r"[+-]?\d+(\.\d+)?", expr) else expr
-
-
-def _t_add(toks: list[str], ctx: Ctx) -> tuple[list[str], bool]:
-    # ADD a TO b [GIVING c]
-    u = [t.upper() for t in toks]
-    if "TO" not in u:
-        return [], False
-    ti = u.index("TO")
-    a_toks = toks[1:ti]
-    if len(a_toks) != 1:
-        return [], False
-    a = a_toks[0]
-    rest = toks[ti + 1:]
-    ru = [t.upper() for t in rest]
-    if "GIVING" in ru:
-        gi = ru.index("GIVING")
-        b = rest[gi - 1]
-        c = rest[gi + 1]
-        if _is_bigdecimal(c, ctx):
-            return [f"{_lvalue(c, ctx)} = {_operand(b, ctx)}.add({_arith_val(c, _operand(a, ctx), ctx)});"], True
-        return [f"{_lvalue(c, ctx)} = {_operand(b, ctx)} + {_operand(a, ctx)};"], True
-    b = rest[0]
-    if _is_bigdecimal(b, ctx):
-        return [f"{_lvalue(b, ctx)} = {_operand(b, ctx)}.add({_arith_val(b, _operand(a, ctx), ctx)});"], True
-    return [f"{_lvalue(b, ctx)} += {_operand(a, ctx)};"], True
-
-
-def _t_subtract(toks: list[str], ctx: Ctx) -> tuple[list[str], bool]:
-    # SUBTRACT a FROM b [GIVING c]
-    u = [t.upper() for t in toks]
-    if "FROM" not in u:
-        return [], False
-    fi = u.index("FROM")
-    a_toks = toks[1:fi]
-    if len(a_toks) != 1:
-        return [], False
-    a = a_toks[0]
-    rest = toks[fi + 1:]
-    ru = [t.upper() for t in rest]
-    if "GIVING" in ru:
-        gi = ru.index("GIVING")
-        b = rest[gi - 1]
-        c = rest[gi + 1]
-        if _is_bigdecimal(c, ctx):
-            return [f"{_lvalue(c, ctx)} = {_operand(b, ctx)}.subtract({_arith_val(c, _operand(a, ctx), ctx)});"], True
-        return [f"{_lvalue(c, ctx)} = {_operand(b, ctx)} - {_operand(a, ctx)};"], True
-    b = rest[0]
-    if _is_bigdecimal(b, ctx):
-        return [f"{_lvalue(b, ctx)} = {_operand(b, ctx)}.subtract({_arith_val(b, _operand(a, ctx), ctx)});"], True
-    return [f"{_lvalue(b, ctx)} -= {_operand(a, ctx)};"], True
-
-
-def _t_multiply(toks: list[str], ctx: Ctx) -> tuple[list[str], bool]:
-    # MULTIPLY a BY b [GIVING c]
-    u = [t.upper() for t in toks]
-    if "BY" not in u:
-        return [], False
-    bi = u.index("BY")
-    a = toks[1:bi]
-    if len(a) != 1:
-        return [], False
-    a = a[0]
-    rest = toks[bi + 1:]
-    ru = [t.upper() for t in rest]
-    if "GIVING" in ru:
-        gi = ru.index("GIVING")
-        b = rest[gi - 1]
-        c = rest[gi + 1]
-    else:
-        b = c = rest[0]
-    if _is_bigdecimal(c, ctx):
-        return [f"{_lvalue(c, ctx)} = {_operand(b, ctx)}.multiply({_arith_val(c, _operand(a, ctx), ctx)});"], True
-    return [f"{_lvalue(c, ctx)} = {_operand(b, ctx)} * {_operand(a, ctx)};"], True
-
-
-def _t_divide(toks: list[str], ctx: Ctx) -> tuple[list[str], bool]:
-    # DIVIDE a INTO b [GIVING c] | DIVIDE a BY b GIVING c [ROUNDED]
-    u = [t.upper() for t in toks]
-    rounded = "ROUNDED" in u
-    if "INTO" in u:
-        ki = u.index("INTO")
-        divisor = toks[1]          # a INTO b: a 是除数
-        rest = toks[ki + 1:]
-    elif "BY" in u:
-        ki = u.index("BY")
-        dividend_pre = toks[1:ki]
-        rest = toks[ki + 1:]
-        if len(dividend_pre) != 1:
-            return [], False
-        # a BY b: a/b
-        dividend = dividend_pre[0]
-        ru = [t.upper() for t in rest]
-        divisor = rest[0]
-        if "GIVING" in ru:
-            c = rest[ru.index("GIVING") + 1]
-        else:
-            c = dividend
-        if _is_bigdecimal(c, ctx):
-            scale = "2" if rounded else "2"
-            return [f"{_lvalue(c, ctx)} = {_operand(dividend, ctx)}.divide({_operand(divisor, ctx)}, {scale}, RoundingMode.HALF_UP);"], True
-        return [f"{_lvalue(c, ctx)} = {_operand(dividend, ctx)} / {_operand(divisor, ctx)};"], True
-    else:
-        return [], False
-    # INTO 形式
-    ru = [t.upper() for t in rest]
-    b = rest[0]
-    c = rest[ru.index("GIVING") + 1] if "GIVING" in ru else b
-    if _is_bigdecimal(c, ctx):
-        return [f"{_lvalue(c, ctx)} = {_operand(b, ctx)}.divide({_operand(divisor, ctx)}, 2, RoundingMode.HALF_UP);"], True
-    return [f"{_lvalue(c, ctx)} = {_operand(b, ctx)} / {_operand(divisor, ctx)};"], True
-
-
-def _t_compute(toks: list[str], ctx: Ctx) -> tuple[list[str], bool]:
-    # COMPUTE dst [ROUNDED] = expr  （仅固化整型；BigDecimal 表达式交 LLM）
-    u = [t.upper() for t in toks]
-    if "=" not in u:
-        return [], False
-    eq = u.index("=")
-    dst_toks = [t for t in toks[1:eq] if t.upper() != "ROUNDED"]
-    if len(dst_toks) != 1:
-        return [], False
-    dst = dst_toks[0]
-    if _is_bigdecimal(dst, ctx):
-        return [], False  # BigDecimal 中缀转链式不可靠 → LLM
-    expr_toks = toks[eq + 1:]
-    parts = []
-    for t in expr_toks:
-        if t in ("+", "-", "*", "/", "(", ")"):
-            parts.append(t)
-        else:
-            parts.append(_operand(t, ctx))
-    return [f"{_lvalue(dst, ctx)} = {' '.join(parts)};"], True
