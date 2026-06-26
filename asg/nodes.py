@@ -23,6 +23,16 @@ class Leaf:
 
 
 @dataclass
+class Raw:
+    """预渲染的 Java 行节点（步骤24C 绞杀项4 骨架装配③）：IO 形态吸收（BEGN for-each / findBy…Begn /
+    repo.save…）由 skel.io_rewrite.rewrite_io_paras 命中后产出整段 Java，包成 Raw 替换原段节点。
+    visit_Raw 直接吐 .lines（缩进由段体渲染统一施加），镜像旧 Stmt(kind="raw") 的 build_skeleton 分支。"""
+    lines: list[str] = field(default_factory=list)
+    raw: str = ""
+    lineno: int = 0
+
+
+@dataclass
 class MoveStmt:
     """MOVE src TO dst…（步骤18 绞杀项3①）：本步只保 token，语义由公用 translate_move 解析。"""
     tokens: list[str] = field(default_factory=list)

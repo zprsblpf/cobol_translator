@@ -1409,17 +1409,27 @@ class TestAsgPerformVisitor(unittest.TestCase):
         self.assertEqual(out[-1], cl[-1])
         self.assertEqual(out, ["while (!(wsaaX > 5)) {", "    wsaaX = 2;", "}"])
 
-    def test_out_of_line_target_placeholder(self):
+    def test_out_of_line_target_migrated(self):
+        """步骤24A 绞杀项4①：out-of-line PERFORM 占位转正 → 与旧 rules._perform_range 同函数同 ctx 一致。"""
         from asg import PerformStmt, ProcRef, LeafJavaVisitor
+        import translator.rules as rules
         node = PerformStmt(header=["2000-SUB"], target=ProcRef(name="2000-SUB"))
-        self.assertEqual(LeafJavaVisitor(self._ctx()).visit(node), ["// TODO-PERFORM-CALL: 2000-SUB"])
+        out = LeafJavaVisitor(self._ctx()).visit(node)
+        legacy = rules._perform_range(["2000-SUB"], ["2000-SUB"], "2000-SUB", self._ctx(), 0)
+        self.assertEqual(out, legacy)                      # 绞杀不变式：两路同函数同 ctx
+        self.assertEqual(out[-1], "this.2000-SUB();")      # 兜不住（空 proc_order）→ TODO + 调用
 
-    def test_out_of_line_thru_placeholder(self):
+    def test_out_of_line_thru_migrated(self):
+        """步骤24A：THRU 端点不在 section_order/proc_order → ③ 退化 pA() + 可见 TODO，与旧路一致。"""
         from asg import PerformStmt, ProcRef, LeafJavaVisitor
+        import translator.rules as rules
         node = PerformStmt(header=["1000-A", "THRU", "2000-B"],
                            target=ProcRef(name="1000-A"), thru=ProcRef(name="2000-B"))
-        self.assertEqual(LeafJavaVisitor(self._ctx()).visit(node),
-                         ["// TODO-PERFORM-CALL: 1000-A THRU 2000-B"])
+        out = LeafJavaVisitor(self._ctx()).visit(node)
+        legacy = rules._perform_range(["1000-A", "THRU", "2000-B"],
+                                      ["1000-A", "THRU", "2000-B"], "1000-A", self._ctx(), 0)
+        self.assertEqual(out, legacy)
+        self.assertEqual(out[-1], "this.1000-A();")
 
     def test_loop_none_falls_to_todo(self):
         from asg import PerformStmt, LeafJavaVisitor
@@ -1466,6 +1476,499 @@ class TestDiffAsgVsLegacyPerform(unittest.TestCase):
         self.assertEqual(len(legacy), len(asg))
         self.assertTrue(len(legacy) >= 4, "样例应含 UNTIL/TIMES/VARYING/out-of-line 多条 PERFORM")
         self.assertEqual([x[1] for x in legacy], [x[1] for x in asg])
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 步骤24A 绞杀项4 骨架装配① out-of-line PERFORM 迁 visitor
+#   （抽 translator/skel/perform_call.py + SkelCtx；rules 委托/别名导回；visit_PerformStmt 占位转正；
+#    比对闸扩 --verb PERFORMCALL：调用体行 + pending_range_methods 登记副作用）
+#   ① render_perform_call 三形态正确（单段 / SECTION 级 THRU 展开 / paragraph 合成 + 登记 / 兜不住 TODO）
+#   ② visit_PerformStmt out-of-line == rules._perform_range（同函数同 ctx）
+#   ③ diff_asg_vs_legacy --verb PERFORMCALL 整程序两路 (调用体, pending) 逐字符/逐项一致
+# 对应设计：docs/详细设计/步骤24A-绞杀项4骨架装配①out-of-line-PERFORM迁visitor设计.md §5。
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestSkelPerformCall(unittest.TestCase):
+    """① render_perform_call 各形态正确（用真实 build_body_ctx 的 proc_order/section_order 跑）。"""
+
+    SRC = (
+        "       IDENTIFICATION DIVISION.\n"
+        "       PROGRAM-ID. TPC.\n"
+        "       DATA DIVISION.\n"
+        "       WORKING-STORAGE SECTION.\n"
+        "       01 WSAA-X    PIC 9(04) VALUE 0.\n"
+        "       PROCEDURE DIVISION.\n"
+        "       1000-MAIN SECTION.\n"
+        "           PERFORM 1100-PARA.\n"
+        "       1100-PARA.\n"
+        "           MOVE 2 TO WSAA-X.\n"
+        "       2000-SUB SECTION.\n"
+        "           MOVE 9 TO WSAA-X.\n"
+        "       3000-END SECTION.\n"
+        "           MOVE 1 TO WSAA-X.\n"
+    )
+
+    def _ctx(self):
+        from translator.skeleton_gen.body_context import build_body_ctx
+        prog = TestAsgMoveLift()._parse(self.SRC)
+        ctx, _ = build_body_ctx(prog)
+        return ctx
+
+    def _call(self, header, ctx=None):
+        from translator.skel import render_perform_call
+        ctx = ctx or self._ctx()
+        return render_perform_call(header, [h.upper() for h in header], header[0].upper(), ctx, 0)
+
+    def test_single_section_call(self):
+        out = self._call(["2000-SUB"])
+        self.assertEqual(out, ["this.sub2000();"])      # 已知 SECTION → 真实方法调用，零登记
+
+    def test_section_level_thru_expands(self):
+        out = self._call(["2000-SUB", "THRU", "3000-END"])
+        self.assertEqual(out[0], "// PERFORM 2000-SUB THRU 3000-END（步骤12 §2：THRU 跨段，按段顺序展开 2 段）")
+        self.assertEqual(out[1:], ["this.sub2000();", "this.end3000();"])   # 不丢中间段
+
+    def test_paragraph_synth_registers_pending(self):
+        ctx = self._ctx()
+        out = self._call(["1100-PARA"], ctx)
+        self.assertEqual(out, ["this.para1100();"])     # paragraph 唯一 → 合成单单元方法
+        self.assertIn("para1100", ctx.pending_range_methods)   # 登记副作用
+
+    def test_unresolved_thru_falls_to_todo(self):
+        out = self._call(["9999-NOPE", "THRU", "8888-NIX"])
+        self.assertTrue(out[0].startswith("// TODO PERFORM 9999-NOPE THRU 8888-NIX"))
+        self.assertEqual(out[-1], "this.nope9999();")   # ③ 退化 pA() + 可见 TODO，不臆测中间段
+
+
+class TestDiffAsgVsLegacyPerformCall(unittest.TestCase):
+    """③ 整程序上旧/新两路 out-of-line PERFORM 调用体 + pending 登记逐字符/逐项一致。"""
+
+    SRC = TestSkelPerformCall.SRC.replace(
+        "           PERFORM 1100-PARA.\n",
+        "           PERFORM 1100-PARA.\n"
+        "           PERFORM 2000-SUB.\n"
+        "           PERFORM 2000-SUB THRU 3000-END.\n",
+    )
+
+    def test_legacy_equals_asg_perform_call(self):
+        mod = TestDiffAsgVsLegacy()._harness()
+        prog = TestAsgMoveLift()._parse(self.SRC)
+        legacy = mod._legacy_perform_calls(prog, None)   # 各建独立 fresh ctx，隔离 pending 副作用
+        asg = mod._asg_perform_calls(prog, None)
+        self.assertEqual(len(legacy), len(asg))
+        self.assertTrue(len(legacy) >= 3, "样例应含单段/SECTION-THRU/paragraph 合成多条 out-of-line PERFORM")
+        self.assertEqual([x[1] for x in legacy], [x[1] for x in asg])   # (调用体行, pending 快照) 全等
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 步骤24B 绞杀项4 骨架装配②：GO TO dispatch 状态机迁 visitor（skel/flow_dispatch + visit_Section
+#    + _sk_control 委托 + 比对闸扩 --verb FLOW）
+#   ① render_flow_dispatch 段级装配四形态（扁平/状态机/fall-through/段尾 transfer）+ dispatch_goto/exit
+#   ② visit_Section 段级状态机 == rules.build_section（同 render_flow_dispatch 装配）
+#   ③ diff_asg_vs_legacy --verb FLOW 整程序两路（状态机壳 + dispatch 行 + flow 副作用复位）逐字符一致
+# 对应设计：docs/详细设计/步骤24B-绞杀项4骨架装配②GOTO-dispatch状态机迁visitor设计.md §5。
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestSkelFlowDispatch(unittest.TestCase):
+    """① render_flow_dispatch 段级装配 + dispatch_goto/exit 各形态正确（路径中立，用 stub 回调隔离装配逻辑）。"""
+
+    class _Ctx:
+        def __init__(self):
+            self.flow_label = None
+            self.flow_paragraphs = set()
+
+    def _rb(self, stmts, indent):
+        """stub render_body：每条 stmt → 一行标记，按 indent 下沉（仿 build_skeleton 缩进语义）。"""
+        return ["    " * indent + f"/*{s}*/" for s in stmts]
+
+    def test_no_jump_flat_concat(self):
+        from translator.skel import render_flow_dispatch
+        ctx = self._Ctx()
+        paras = [("AAA", ["a"]), ("BBB", ["b"])]
+        out = render_flow_dispatch(paras, ctx, 0, render_body=self._rb,
+                                   collect_gotos=lambda s: [], ends_transfer=lambda s: False)
+        self.assertEqual(out, ["// paragraph AAA", "/*a*/", "// paragraph BBB", "/*b*/"])
+        self.assertIsNone(ctx.flow_label)          # 无跳转 → 不建状态机
+
+    def test_back_edge_builds_state_machine(self):
+        from translator.skel import render_flow_dispatch
+        ctx = self._Ctx()
+        paras = [("AAA", ["a"]), ("BBB", ["g"])]   # BBB 体回跳 AAA（j=0<=i=1）→ 状态机
+        out = render_flow_dispatch(
+            paras, ctx, 0, render_body=self._rb,
+            collect_gotos=lambda s: ["AAA"] if "g" in s else [], ends_transfer=lambda s: False)
+        joined = "\n".join(out)
+        self.assertEqual(out[0], 'String __pc = "AAA";   // 段内 GO TO 回跳 → 状态机')
+        self.assertIn("FLOW: while (true) {", joined)
+        self.assertIn('case "AAA": {', joined)
+        self.assertIn('__pc = "BBB"; continue FLOW;  // fall-through', joined)
+        self.assertIsNone(ctx.flow_label)          # 收尾复位
+        self.assertEqual(ctx.flow_paragraphs, set())
+
+    def test_ends_transfer_suppresses_fallthrough(self):
+        from translator.skel import render_flow_dispatch
+        ctx = self._Ctx()
+        paras = [("AAA", ["a"]), ("BBB", ["g"])]
+        out = "\n".join(render_flow_dispatch(
+            paras, ctx, 0, render_body=self._rb,
+            collect_gotos=lambda s: ["AAA"] if "g" in s else [], ends_transfer=lambda s: True))
+        self.assertNotIn("fall-through", out)      # 段尾 transfer → 不补 fall-through
+
+    def test_dispatch_goto_and_exit(self):
+        from translator.skel import dispatch_goto, dispatch_exit
+        ctx = self._Ctx()
+        self.assertIsNone(dispatch_goto("X", ctx, 0))        # 非状态机态 → None
+        self.assertIsNone(dispatch_exit(["EXIT"], ctx, 0))
+        ctx.flow_label = "FLOW"; ctx.flow_paragraphs = {"X"}
+        self.assertEqual(dispatch_goto("X", ctx, 0), ['__pc = "X"; continue FLOW;  // GO TO X'])
+        self.assertIsNone(dispatch_goto("Y", ctx, 0))        # 不在段内标签 → None（交前向译法）
+        self.assertEqual(dispatch_exit(["EXIT"], ctx, 0), ["break FLOW;  // EXIT"])
+        self.assertIsNone(dispatch_exit(["STOP", "RUN"], ctx, 0))   # 非 EXIT → None
+
+
+class TestDiffAsgVsLegacyFlow(unittest.TestCase):
+    """③ 整程序上旧/新两路段级 GO TO dispatch 状态机（壳 + dispatch 行 + flow 副作用复位）逐字符一致。
+
+    样例覆盖（设计 §5）：回跳→状态机 / 前向 GO TO dispatch / EXIT→break FLOW / 段尾 transfer / 扁平段；
+    守界：无 begn 循环、段体动词均已迁（MOVE/ADD/IF/GO/EXIT）→ 两路可逐字符比对。"""
+
+    SRC = (
+        "       IDENTIFICATION DIVISION.\n       PROGRAM-ID. TFL.\n       DATA DIVISION.\n"
+        "       WORKING-STORAGE SECTION.\n       01 WSAA-X    PIC 9(04) VALUE 0.\n"
+        "       PROCEDURE DIVISION.\n"
+        "       1000-MAIN SECTION.\n           MOVE 0 TO WSAA-X.\n"
+        "       1100-LOOP.\n           ADD 1 TO WSAA-X.\n           IF WSAA-X > 9\n"
+        "               GO TO 1300-FIN\n           END-IF.\n           GO TO 1100-LOOP.\n"
+        "       1300-FIN.\n           EXIT.\n"
+        "       2000-FLAT SECTION.\n           MOVE 1 TO WSAA-X.\n"
+        "       2100-MORE.\n           MOVE 2 TO WSAA-X.\n"
+    )
+
+    def test_legacy_equals_asg_flow(self):
+        mod = TestDiffAsgVsLegacy()._harness()
+        prog = TestAsgMoveLift()._parse(self.SRC)
+        legacy = mod._legacy_flows(prog, None)   # 各建独立 fresh ctx，隔离 flow 副作用
+        asg = mod._asg_flows(prog, None)
+        self.assertEqual(len(legacy), len(asg))
+        self.assertEqual(len(legacy), 2, "样例应含状态机段 + 扁平段两个 SECTION")
+        self.assertEqual([x[1] for x in legacy], [x[1] for x in asg])   # (装配行, flow 复位快照) 全等
+        # 状态机段确实建机（防退化为扁平的伪通过）
+        sm_lines = "\n".join(legacy[0][1][0])
+        self.assertIn("FLOW: while (true) {", sm_lines)
+        self.assertIn("break FLOW;  // EXIT", sm_lines)
+        self.assertIn('continue FLOW;  // GO TO 1100-LOOP', sm_lines)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 步骤24C 绞杀项4 骨架装配③：BEGN/READR/WRITE IO 形态识别 + struct_rebind 迁 visitor
+#   ① rewrite_io_paras（skel.io_rewrite，路径中立）经 STMT_ACCESS 把四形态吸收为 raw（旧路接线自证）
+#   ② visit_Section 内 rewrite_io_paras（ASG_ACCESS）→ 与 rules.build_section 全链逐字符一致（四形态 + rebind）
+#   ③ diff_asg_vs_legacy --verb IO 整程序两路（IO 吸收体 + flow/struct_objects 副作用复位）逐字符一致
+# 对应设计：docs/详细设计/步骤24C-绞杀项4骨架装配③BEGN-READR-WRITE-IO形态迁visitor设计.md §5。
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestSkelIoRewrite(unittest.TestCase):
+    """① 路径中立 rewrite_io_paras（STMT_ACCESS / build_skeleton / Stmt-raw）四形态吸收为预渲染 raw。"""
+
+    def _ctx(self):
+        import translator.rules as r
+        return r.Ctx(
+            field_type_map={n: {"type": "String"} for n in ("wsaaCompany", "wsaaData", "wsaaVal")},
+            section_to_method=lambda s: s, known_sections=set(),
+            io_struct_prefixes={"ELPO", "TMLC", "SUBL", "SUBS"},
+            io_programs={},
+            io_default_pattern={
+                "class_suffix": "Repository", "field_suffix": "Repository",
+                "param_struct_suffix": "-PARAMS", "import_package": "com.example.repository",
+                "operations": {"READR": "findByKeyReadr({key})", "WRITR": "save({entity})"}},
+        )
+
+    def _rewrite(self, ctx, sec_lines):
+        """切段 → rewrite_io_paras（旧路注入）→ 收集各段首 raw 行（叶子占位即时回填便于断言）。"""
+        from translator.segmenter import segment, split_paragraphs
+        from translator.skel import rewrite_io_paras, STMT_ACCESS
+        import translator.rules as r
+        paras = [(lbl, segment(body)) for lbl, body in split_paragraphs(sec_lines)]
+        out = rewrite_io_paras(
+            paras, ctx, acc=STMT_ACCESS,
+            render_body=lambda s, i: r.build_skeleton(s, ctx, i),
+            make_raw=r._raw_stmt,
+        )
+        return out
+
+    def test_readr_single_absorbed(self):
+        ctx = self._ctx()
+        out = self._rewrite(ctx, [
+            "1510-START.",
+            "           MOVE SPACES       TO ELPO-PARAMS.",
+            "           MOVE WSAA-COMPANY TO ELPO-CHDRCOY.",
+            "           MOVE READR        TO ELPO-FUNCTION.",
+            "           CALL 'ELPOIO' USING ELPO-PARAMS.",
+            "           IF ELPO-STATUZ = O-K",
+            "              MOVE ELPO-DATA TO WSAA-DATA",
+            "           END-IF.",
+        ])
+        raw = out[0][1][0]
+        self.assertEqual(raw.kind, "raw")
+        joined = "\n".join(raw.lines)
+        self.assertIn("ElpoRecord elpo = elpoRepository.findByChdrcoyReadr(wsaaCompany);", joined)
+        self.assertIn("if (elpo != null) {", joined)
+
+    def test_write_single_absorbed(self):
+        ctx = self._ctx()
+        out = self._rewrite(ctx, [
+            "6000-INSERT.",
+            "           MOVE SPACES   TO TMLC-PARAMS.",
+            "           MOVE WSAA-VAL TO TMLC-FIELD.",
+            "           MOVE WRITR    TO TMLC-FUNCTION.",
+            "           CALL 'TMLCIO' USING TMLC-PARAMS.",
+        ])
+        joined = "\n".join(out[0][1][0].lines)
+        self.assertIn("TmlcRecord tmlc = new TmlcRecord();", joined)
+        self.assertIn("tmlcRepository.save(tmlc);", joined)
+
+    def test_begn_foreach_absorbed(self):
+        ctx = self._ctx()
+        out = self._rewrite(ctx, [
+            "4010-INIT.",
+            "           MOVE SPACES       TO SUBL-PARAMS.",
+            "           MOVE WSAA-COMPANY TO SUBL-CHDRCOY.",
+            "           MOVE BEGN         TO SUBL-FUNCTION.",
+            "4020-LOOP.",
+            "           CALL 'SUBLIO' USING SUBL-PARAMS.",
+            "           IF SUBL-STATUZ NOT = O-K OR SUBL-CHDRCOY NOT = WSAA-COMPANY",
+            "              GO TO 4030-EXIT",
+            "           END-IF.",
+            "           MOVE SUBL-DATA TO WSAA-DATA.",
+            "           MOVE NEXTR     TO SUBL-FUNCTION.",
+            "           GO TO 4020-LOOP.",
+            "4030-EXIT.",
+            "           EXIT.",
+        ])
+        joined = "\n".join(out[1][1][0].lines)   # 循环段（4020-LOOP）被改写为 raw
+        self.assertIn("List<SublRecord> sublList = sublRepository.findByChdrcoyBegn(wsaaCompany);", joined)
+        self.assertIn("for (SublRecord subl : sublList) {", joined)
+
+
+class TestDiffAsgVsLegacyIo(unittest.TestCase):
+    """③ 整程序上旧/新两路四形态 IO 吸收（吸收体 + flow/struct_objects 副作用复位）逐字符一致。
+
+    样例覆盖（设计24C §5）：① BEGN+NEXTR foreach、② 单次 BEGN、③ READR 单条读、④ WRITR 单条写、
+    + 无 IO 扁平对照段；段体动词均已迁（MOVE/IF/GO/EXIT）→ 两路可逐字符比对。
+    rebind 关键：foreach/readr 体内 <pfx>-FIELD 在新路一趟内联（ctx.struct_objects）/旧路两趟回填
+    （struct_rebind）下产出同一 record/loop 变量字段访问 → 自证 §3.5 一致性论证。"""
+
+    SRC = (
+        "       IDENTIFICATION DIVISION.\n       PROGRAM-ID. TIO.\n       DATA DIVISION.\n"
+        "       WORKING-STORAGE SECTION.\n"
+        "       01 WSAA-X    PIC 9(04) VALUE 0.\n"
+        "       01 WSAA-COMPANY PIC X(01) VALUE SPACES.\n"
+        "       01 WSAA-DATA PIC X(10) VALUE SPACES.\n"
+        "       01 WSAA-VAL  PIC X(10) VALUE SPACES.\n"
+        "       PROCEDURE DIVISION.\n"
+        "       3000-READR SECTION.\n       3010-START.\n"
+        "           MOVE SPACES         TO ELPO-PARAMS.\n"
+        "           MOVE WSAA-COMPANY   TO ELPO-CHDRCOY.\n"
+        "           MOVE READR          TO ELPO-FUNCTION.\n"
+        "           CALL 'ELPOIO'   USING ELPO-PARAMS.\n"
+        "           IF ELPO-STATUZ = O-K\n              MOVE ELPO-DATA TO WSAA-DATA\n           END-IF.\n"
+        "       3090-EXIT.\n           EXIT.\n"
+        "       5000-WRITE SECTION.\n       5010-START.\n"
+        "           MOVE SPACES   TO TMLC-PARAMS.\n"
+        "           MOVE WSAA-VAL TO TMLC-FIELD.\n"
+        "           MOVE WRITR    TO TMLC-FUNCTION.\n"
+        "           CALL 'TMLCIO' USING TMLC-PARAMS.\n"
+        "       5090-EXIT.\n           EXIT.\n"
+        "       4000-BEGNLOOP SECTION.\n       4010-INIT.\n"
+        "           MOVE SPACES       TO SUBL-PARAMS.\n"
+        "           MOVE WSAA-COMPANY TO SUBL-CHDRCOY.\n"
+        "           MOVE BEGN         TO SUBL-FUNCTION.\n"
+        "       4020-LOOP.\n           CALL 'SUBLIO' USING SUBL-PARAMS.\n"
+        "           IF SUBL-STATUZ NOT = O-K OR SUBL-CHDRCOY NOT = WSAA-COMPANY\n"
+        "              GO TO 4030-EXIT\n           END-IF.\n"
+        "           MOVE SUBL-DATA TO WSAA-DATA.\n           MOVE NEXTR     TO SUBL-FUNCTION.\n"
+        "           GO TO 4020-LOOP.\n       4030-EXIT.\n           EXIT.\n"
+        "       4500-BEGNSINGLE SECTION.\n       4510-START.\n"
+        "           MOVE SPACES       TO SUBS-PARAMS.\n"
+        "           MOVE WSAA-COMPANY TO SUBS-CHDRCOY.\n"
+        "           MOVE BEGN         TO SUBS-FUNCTION.\n"
+        "           CALL 'SUBSIO' USING SUBS-PARAMS.\n"
+        "           IF SUBS-STATUZ NOT = O-K OR SUBS-CHDRCOY NOT = WSAA-COMPANY\n"
+        "              MOVE WSAA-VAL TO WSAA-DATA\n           END-IF.\n"
+        "       4590-EXIT.\n           EXIT.\n"
+        "       2000-FLAT SECTION.\n           MOVE 1 TO WSAA-X.\n"
+        "       2100-MORE.\n           MOVE 2 TO WSAA-X.\n"
+    )
+
+    def test_legacy_equals_asg_io(self):
+        mod = TestDiffAsgVsLegacy()._harness()
+        prog = TestAsgMoveLift()._parse(self.SRC)
+        legacy = mod._legacy_ios(prog, None)   # 各建独立 fresh ctx，隔离 flow/struct_objects 副作用
+        asg = mod._asg_ios(prog, None)
+        self.assertEqual(len(legacy), len(asg))
+        self.assertEqual(len(legacy), 5, "样例应含 READR/WRITE/BEGNLOOP/BEGNSINGLE/FLAT 五个 SECTION")
+        self.assertEqual([x[1] for x in legacy], [x[1] for x in asg])   # (吸收体, flow+struct 复位快照) 全等
+        # 防退化：四形态确实吸收（而非两路同样未吸收的伪通过）
+        full = "\n".join(ln for _n, (lines, _s) in legacy for ln in lines)
+        self.assertIn("findByChdrcoyReadr(wsaaCompany)", full)              # ③ READR
+        self.assertIn("if (elpo != null) {", full)
+        self.assertIn("tmlcRepository.save(tmlc);", full)                   # ④ WRITE
+        self.assertIn("for (SublRecord subl : sublList) {", full)          # ① BEGN foreach
+        self.assertIn("subsList.isEmpty()", full)                          # ② 单次 BEGN
+        # 收尾副作用复位（struct_objects 不残留 record/loop 变量）：快照 flow=None
+        for _n, (_lines, snap) in legacy:
+            self.assertEqual(snap[0], None)
+            self.assertEqual(snap[1], ())
+
+    # ── 24C-2/3/4 加固选样（设计 §9）：逐形态扩边角样本，两路逐字符比对 + 防退化 ──────────
+    #   24C-1 已验四形态「基本形」（O-K/单键/扁平段）；本组只验 24C-1 比对闸未触达的分支：
+    #   多键 finder(And-join) / error 形 try-catch / READS 变体 / UPDAT 复用 / DELET /
+    #   吸收体 body 内嵌套 IF(含 else)+EVALUATE 引用 <pfx>-FIELD（验 acc.children/else_children/whens 递归口径）。
+    HEADER = (
+        "       IDENTIFICATION DIVISION.\n       PROGRAM-ID. TIO2.\n       DATA DIVISION.\n"
+        "       WORKING-STORAGE SECTION.\n"
+        "       01 WSAA-COMPANY   PIC X(01) VALUE SPACES.\n"
+        "       01 WSAA-NUM       PIC X(02) VALUE SPACES.\n"
+        "       01 WSAA-DATA      PIC X(10) VALUE SPACES.\n"
+        "       01 WSAA-VAL       PIC X(10) VALUE SPACES.\n"
+        "       01 WSAA-ITEM      PIC X(08) VALUE SPACES.\n"
+        "       01 WSAA-VALUE     PIC X(10) VALUE SPACES.\n"
+        "       01 WSAA-NEW-VALUE PIC X(10) VALUE SPACES.\n"
+        "       PROCEDURE DIVISION.\n"
+    )
+    # 错误段：error 形 try/catch 的 PERFORM 目标（两路同样解析，仅需存在）
+    ERRSEC = (
+        "       580-DB-ERROR SECTION.\n       580-START.\n"
+        "           MOVE 9 TO WSAA-DATA.\n       580-EXIT.\n           EXIT.\n"
+    )
+
+    def _run_pair(self, body_src):
+        """跑 legacy/asg 两路 IO 采样，断言 (吸收体, flow+struct 复位快照) 逐字符/逐项一致 +
+        收尾 flow 复位；返回 {section_name: lines} 供逐段防退化断言。fresh ctx 隔离。"""
+        mod = TestDiffAsgVsLegacy()._harness()
+        prog = TestAsgMoveLift()._parse(self.HEADER + body_src)
+        legacy = mod._legacy_ios(prog, None)
+        asg = mod._asg_ios(prog, None)
+        self.assertEqual(len(legacy), len(asg))
+        self.assertEqual([x[1] for x in legacy], [x[1] for x in asg],
+                         "两路 (吸收体, flow+struct_objects 复位快照) 须逐字符/逐项一致")
+        for _n, (_lines, snap) in legacy:
+            self.assertEqual(snap[0], None)        # flow_label 复位
+            self.assertEqual(snap[1], ())          # flow_paragraphs 复位
+        # 注：struct_objects（snap[2]）收尾合法保留 pfx→Params 绑定，非泄漏；
+        #     IO 渲染期的临时 record/loop 重绑定复位由两路快照全等校验（_run_pair 顶部断言）。
+        return {n: lines for n, (lines, _s) in legacy}
+
+    def test_24c2_begn_single_multikey(self):
+        """24C-2 形态②：单次 BEGN 多键等值定位 → findBy<键…>And<键…>Begn(实参…)。"""
+        secs = self._run_pair(
+            "       3000-BEGNMULTI SECTION.\n       3010-START.\n"
+            "           MOVE SPACES       TO SUBS-PARAMS.\n"
+            "           MOVE WSAA-COMPANY TO SUBS-CHDRCOY.\n"
+            "           MOVE WSAA-NUM     TO SUBS-CHDRNUM.\n"
+            "           MOVE BEGN         TO SUBS-FUNCTION.\n"
+            "           CALL 'SUBSIO' USING SUBS-PARAMS.\n"
+            # 长条件拆续行（单行超 COBOL 固定格式第 72 列会被截断）；解析器拼接续行 → 多键
+            "           IF SUBS-STATUZ NOT = O-K\n"
+            "              OR SUBS-CHDRCOY NOT = WSAA-COMPANY\n"
+            "              OR SUBS-CHDRNUM NOT = WSAA-NUM\n"
+            "              MOVE WSAA-VAL TO WSAA-DATA\n           END-IF.\n"
+            "       3090-EXIT.\n           EXIT.\n"
+        )
+        full = "\n".join(secs["3000-BEGNMULTI"])
+        self.assertIn(
+            "findByChdrcoyAndChdrnumBegn(wsaaCompany, wsaaNum)", full,
+            f"多键 finder 未按 And-join 派生：\n{full}")
+        self.assertIn("subsList.isEmpty()", full)
+
+    def test_24c3_readr_error_reads_multikey_nested(self):
+        """24C-3 形态③：error 形 try-catch + READS 变体 + 多键 + then 体内嵌套 IF(含 else) 引用 <pfx>-FIELD。
+
+        注（发现）：then 体内嵌套 EVALUATE 两路分歧（旧 build_skeleton 叶子占位→// TODO-LEAF；
+        新 visitor 递归→// TODO-EVALUATE），属两种 render_body 模型对体内复合语句的固有差异，
+        非 ASG_ACCESS 映射问题、超 24C 加固守界（§9.4），故本样本只验嵌套 IF(children/else_children
+        递归)、不含 EVALUATE；该分歧记入设计 §9 + 操作记录，留 24D cutover 决策。"""
+        secs = self._run_pair(
+            # (b) error 形：IF STATUZ NOT=O-K AND NOT=ENDP（PERFORM 580）→ try{finder+try_tail} catch{580}
+            "       2000-READERR SECTION.\n       2010-START.\n"
+            "           MOVE SPACES    TO ITDM-PARAMS.\n"
+            "           MOVE WSAA-ITEM TO ITDM-ITEMKEY.\n"
+            "           MOVE READR     TO ITDM-FUNCTION.\n"
+            "           CALL 'ITDMIO' USING ITDM-PARAMS.\n"
+            "           IF ITDM-STATUZ NOT = O-K AND ITDM-STATUZ NOT = ENDP\n"
+            "              PERFORM 580-DB-ERROR\n           END-IF.\n"
+            "           MOVE ITDM-VALUE TO WSAA-VALUE.\n"
+            "       2090-EXIT.\n           EXIT.\n"
+            # (c)(d) READS 变体 + 多键
+            "       2100-READSMULTI SECTION.\n       2110-START.\n"
+            "           MOVE SPACES       TO ELPO-PARAMS.\n"
+            "           MOVE WSAA-COMPANY TO ELPO-CHDRCOY.\n"
+            "           MOVE WSAA-NUM     TO ELPO-CHDRNUM.\n"
+            "           MOVE READS        TO ELPO-FUNCTION.\n"
+            "           CALL 'ELPOIO' USING ELPO-PARAMS.\n"
+            "           IF ELPO-STATUZ = O-K\n              MOVE ELPO-DATA TO WSAA-DATA\n           END-IF.\n"
+            "       2190-EXIT.\n           EXIT.\n"
+            # (e) then 体内嵌套 IF(含 else) 引用 ELPO-FIELD → 验 acc.children/else_children 递归 + rebind
+            "       2200-READNEST SECTION.\n       2210-START.\n"
+            "           MOVE SPACES       TO ELPO-PARAMS.\n"
+            "           MOVE WSAA-COMPANY TO ELPO-CHDRCOY.\n"
+            "           MOVE READR        TO ELPO-FUNCTION.\n"
+            "           CALL 'ELPOIO' USING ELPO-PARAMS.\n"
+            "           IF ELPO-STATUZ = O-K\n"
+            "              IF ELPO-DATA = SPACES\n"
+            "                 MOVE WSAA-VAL TO WSAA-DATA\n"
+            "              ELSE\n"
+            "                 MOVE ELPO-DATA TO WSAA-DATA\n"
+            "              END-IF\n"
+            "           END-IF.\n"
+            "       2290-EXIT.\n           EXIT.\n"
+            + self.ERRSEC
+        )
+        err = "\n".join(secs["2000-READERR"])
+        self.assertIn("try {", err)
+        self.assertIn("findByItemkeyReadr(wsaaItem)", err)
+        self.assertIn("} catch (Exception e) {", err)
+        self.assertIn("wsaaValue = itdm.getValue();", err)        # try_tail rebind
+        reads = "\n".join(secs["2100-READSMULTI"])
+        self.assertIn("findByChdrcoyAndChdrnumReads(wsaaCompany, wsaaNum)", reads)  # 多键 + READS
+        nest = "\n".join(secs["2200-READNEST"])
+        self.assertIn("elpo.getData()", nest)                      # 嵌套 IF/EVALUATE 体内 rebind 字段访问
+
+    def test_24c4_write_updat_reuse_delet_error(self):
+        """24C-4 形态④：UPDAT 复用既有 record（无 new）+ DELET（delete）+ write error 形 try-catch。"""
+        secs = self._run_pair(
+            # (f) UPDAT 复用：无 MOVE SPACES TO pfx-PARAMS → 不 new，setter + save
+            "       5000-UPDATE SECTION.\n       5010-START.\n"
+            "           MOVE WSAA-NEW-VALUE TO TMLCLST-FIELD.\n"
+            "           MOVE UPDAT          TO TMLCLST-FUNCTION.\n"
+            "           CALL 'TMLCLSTIO' USING TMLCLST-PARAMS.\n"
+            "       5090-EXIT.\n           EXIT.\n"
+            # (g) DELET → repo.delete(实体)
+            "       6000-DELETE SECTION.\n       6010-START.\n"
+            "           MOVE DELET TO TMLCLST-FUNCTION.\n"
+            "           CALL 'TMLCLSTIO' USING TMLCLST-PARAMS.\n"
+            "       6090-EXIT.\n           EXIT.\n"
+            # (h) write error 形：MOVE SPACES(new) + IF STATUZ NOT=O-K（PERFORM 580）→ new+setter+try{save} catch{580}
+            "       7000-WRITEERR SECTION.\n       7010-START.\n"
+            "           MOVE SPACES   TO TMLCLST-PARAMS.\n"
+            "           MOVE WSAA-VAL TO TMLCLST-FIELD.\n"
+            "           MOVE WRITR    TO TMLCLST-FUNCTION.\n"
+            "           CALL 'TMLCLSTIO' USING TMLCLST-PARAMS.\n"
+            "           IF TMLCLST-STATUZ NOT = O-K\n"
+            "              PERFORM 580-DB-ERROR\n           END-IF.\n"
+            "       7090-EXIT.\n           EXIT.\n"
+            + self.ERRSEC
+        )
+        upd = "\n".join(secs["5000-UPDATE"])
+        self.assertIn("tmlclstRepository.save(tmlclst);", upd)
+        self.assertNotIn("new TmlclstRecord", upd, f"UPDAT 复用不应 new 实体：\n{upd}")
+        dele = "\n".join(secs["6000-DELETE"])
+        self.assertIn("tmlclstRepository.delete(tmlclst);", dele)
+        werr = "\n".join(secs["7000-WRITEERR"])
+        self.assertIn("new TmlclstRecord();", werr)                # MOVE SPACES → 插入新实体
+        self.assertIn("try {", werr)
+        self.assertIn("tmlclstRepository.save(tmlclst);", werr)
+        self.assertIn("} catch (Exception e) {", werr)
 
 
 # ──────────────────────────────────────────────────────────────────────────────

@@ -41,6 +41,7 @@ from translator.leaf import (  # noqa: E402
     translate_control, translate_evaluate, evaluate_case_label,
 )
 from translator import rules                                          # noqa: E402
+from translator.skel import render_perform_call                        # noqa: E402
 from asg import build_asg                                              # noqa: E402
 from asg import nodes as asg_nodes                                     # noqa: E402
 from asg.visitor import AsgVisitor, LeafJavaVisitor                    # noqa: E402
@@ -296,10 +297,162 @@ def _asg_control(program, ctx) -> list[tuple[str, object]]:
     return col.out
 
 
+# out-of-line PERFORM 调用体（步骤24A 绞杀项4 骨架装配①）：比对调用体行 + pending_range_methods 登记副作用。
+# 两路各建**独立 fresh ctx**（隔离 pending 副作用），每条 out-of-line PERFORM 收 (raw, (lines, pending 快照))。
+def _perform_target(header: list, hu: list) -> str | None:
+    """复刻 _sk_perform 的 target 提取：首 token 非循环关键字且非纯数字 → 大写过程名，否则 None。"""
+    if header and hu[0] not in {"VARYING", "UNTIL", "WITH", "TEST"} and not header[0].isdigit():
+        return header[0].upper()
+    return None
+
+
+def _pending_snapshot(ctx) -> dict:
+    """深拷贝 ctx.pending_range_methods（值为 [(label, body_lines), …]），隔离后续累积突变以便逐条比对。"""
+    return {k: [(lbl, list(body)) for lbl, body in v] for k, v in ctx.pending_range_methods.items()}
+
+
+def _legacy_perform_calls(program, _ctx) -> list[tuple[str, object]]:
+    """旧路：枚举每条 out-of-line PERFORM（无内联体、有 target）→ rules._perform_range 输出 + pending 快照，源码序。
+
+    委托后 rules._perform_range 即 skel.render_perform_call 同一函数；取 rules 侧调用以验证别名接线无误。
+    用独立 fresh ctx 跑，pending_range_methods 登记副作用与 asg 侧隔离对比（步骤24A §5）。"""
+    ctx, _ws = build_body_ctx(program)
+    out: list[tuple[str, object]] = []
+    for s in program.sections:
+        for _lbl, body in split_paragraphs(s.lines):
+            for st in segment(body):
+                for sub in _walk_segmenter_stmts(st):
+                    if sub.kind == "perform" and not sub.children:
+                        hdr = list(sub.tokens)
+                        hu = [h.upper() for h in hdr]
+                        tgt = _perform_target(hdr, hu)
+                        if tgt:
+                            lines = rules._perform_range(hdr, hu, tgt, ctx, 0)
+                            out.append((sub.raw, (lines, _pending_snapshot(ctx))))
+    return out
+
+
+class _PerformCallCollector(AsgVisitor):
+    """遍历 ASG，对每个 out-of-line PerformStmt（无 inline_body、有 target）收 (raw, (render_perform_call, pending 快照))。"""
+
+    def __init__(self, ctx):
+        self.ctx = ctx
+        self.out: list[tuple[str, object]] = []
+
+    def visit_PerformStmt(self, node):
+        if not node.inline_body and node.target:
+            hu = [h.upper() for h in node.header]
+            lines = render_perform_call(node.header, hu, node.target.name, self.ctx, 0)
+            self.out.append((node.raw, (lines, _pending_snapshot(self.ctx))))
+        self.generic_visit(node)          # 递归 inline_body → 嵌套 out-of-line PERFORM 入列（源码序）
+
+
+def _asg_perform_calls(program, _ctx) -> list[tuple[str, object]]:
+    ctx, _ws = build_body_ctx(program)   # 独立 fresh ctx，隔离 pending 副作用
+    col = _PerformCallCollector(ctx)
+    col.visit(build_asg(program))
+    return col.out
+
+
+# 段内 GO TO dispatch 状态机（步骤24B 绞杀项4 骨架装配②）：以 SECTION 为采样单位，比对
+#   ① 段级装配输出行（状态机壳 / 扁平拼接 / 段内 GO TO·EXIT dispatch 行）逐字符；
+#   ② 收尾后 flow_label/flow_paragraphs 复位（证装配副作用洁净）。
+# 两路各建 fresh ctx 隔离。选样守界（设计 §5）：样例须**无 begn 循环**（避 24C 分流）且
+#   **段体动词均已迁**（未迁动词新路落 // TODO-LEAF 与旧路 build_skeleton 体不等，属渐进预期）。
+def _flow_snapshot(ctx) -> tuple:
+    """收尾后状态机副作用快照：装配收尾两路均须复位 → (None, ())；非空即装配漏复位。"""
+    return (ctx.flow_label, tuple(sorted(ctx.flow_paragraphs)))
+
+
+def _fill_legacy_leaves(lines: list[str], ctx) -> list[str]:
+    """旧路 build_section 把叶子留 /*__LEAF_n__*/ 占位（二趟架构），此处用 translate_leaf 回填
+    （= visitor 一趟内联直译同一函数同 ctx），隔离 24B 段级装配的比对（单行叶子在占位处原位替换，不改缩进）。"""
+    fills = {}
+    for lid, leaf in ctx.leaves:
+        flines, matched = rules.translate_leaf(leaf, ctx)
+        raw = (leaf.raw or " ".join(leaf.tokens)).strip()
+        fills[f"/*__LEAF_{lid}__*/"] = "\n".join(flines) if matched else f"// TODO-LEAF: {raw}"
+    out: list[str] = []
+    for ln in lines:
+        for ph, fill in fills.items():
+            if ph in ln:
+                ln = ln.replace(ph, fill)
+                break
+        out.append(ln)
+    return out
+
+
+def _legacy_flows(program, _ctx) -> list[tuple[str, object]]:
+    """旧路：每个 SECTION 切 [(label, [Stmt])] → rules.build_section（= 委托 render_flow_dispatch）+ 叶子回填 + 收尾快照，源码序。
+
+    取 rules.build_section 侧调用以验证委托接线无误；非 begn 段 _rewrite_begn_loops 为 no-op，
+    故与 asg 侧 visit_Section（同 render_flow_dispatch）逐字符可比。fresh ctx 隔离 flow 副作用。
+    build_section 叶子留占位，回填后与 visitor 内联直译对齐（单行叶子；多行叶子非本闸选样形态）。"""
+    ctx, _ws = build_body_ctx(program)
+    out: list[tuple[str, object]] = []
+    for s in program.sections:
+        paras = [(lbl, segment(body)) for lbl, body in split_paragraphs(s.lines)]
+        lines = _fill_legacy_leaves(rules.build_section(paras, ctx, 0), ctx)
+        out.append((s.name, (lines, _flow_snapshot(ctx))))
+    return out
+
+
+def _asg_flows(program, _ctx) -> list[tuple[str, object]]:
+    """新路：遍历 ASG Section → LeafJavaVisitor.visit_Section（内部 render_flow_dispatch）+ 收尾快照，源码序。"""
+    ctx, _ws = build_body_ctx(program)
+    vis = LeafJavaVisitor(ctx)
+    out: list[tuple[str, object]] = []
+    for sec in build_asg(program).sections:
+        lines = vis.visit_Section(sec)
+        out.append((sec.name, (lines, _flow_snapshot(ctx))))
+    return out
+
+
+# BEGN/READR/WRITE IO 形态吸收（步骤24C 绞杀项4 骨架装配③）：以 SECTION 为采样单位，比对
+#   ① 段级 IO 吸收体 + 状态机装配输出行（List+for-each / findBy…Begn / record!=null / repo.save…）逐字符；
+#   ② 收尾后 flow 副作用 + struct_objects 复位（证 IO 渲染期 rebind 洁净、不跨段污染）。
+# 两路各建 fresh ctx 隔离；rewrite_io_paras 经 build_section（旧）/ visit_Section（新）同一匹配/渲染。
+# 选样守界（设计24C §5）：覆盖四形态 ①②③④ + 无 IO 对照段；段体动词均已迁（绞杀项3 已覆盖）。
+def _io_snapshot(ctx) -> tuple:
+    """收尾后副作用快照：flow 复位 + struct_objects 复位 → 装配洁净。
+    IO 渲染期临时设 struct_objects[pfx]=loop/record 变量，收尾必复位 → 非空即漏复位。"""
+    return (ctx.flow_label, tuple(sorted(ctx.flow_paragraphs)),
+            tuple(sorted((k, str(v)) for k, v in ctx.struct_objects.items())))
+
+
+def _legacy_ios(program, _ctx) -> list[tuple[str, object]]:
+    """旧路：每 SECTION → rules.build_section（含 _rewrite_begn_loops 委托 rewrite_io_paras）+ 叶子回填 + 快照。
+
+    build_section 把 IO 形态吸收为预渲染 raw（体内叶子留 /*__LEAF_n__*/ 占位、带 struct_rebind 标记），
+    _fill_legacy_leaves 经 translate_leaf 二趟回填（读 struct_rebind → 字段重绑定）→ 与新路一趟内联对齐。
+    fresh ctx 隔离 flow / struct_objects 副作用。"""
+    ctx, _ws = build_body_ctx(program)
+    out: list[tuple[str, object]] = []
+    for s in program.sections:
+        paras = [(lbl, segment(body)) for lbl, body in split_paragraphs(s.lines)]
+        lines = _fill_legacy_leaves(rules.build_section(paras, ctx, 0), ctx)
+        out.append((s.name, (lines, _io_snapshot(ctx))))
+    return out
+
+
+def _asg_ios(program, _ctx) -> list[tuple[str, object]]:
+    """新路：遍历 ASG Section → visit_Section（内部 rewrite_io_paras 一趟内联渲染 + render_flow_dispatch）+ 快照。"""
+    ctx, _ws = build_body_ctx(program)
+    vis = LeafJavaVisitor(ctx)
+    out: list[tuple[str, object]] = []
+    for sec in build_asg(program).sections:
+        lines = vis.visit_Section(sec)
+        out.append((sec.name, (lines, _io_snapshot(ctx))))
+    return out
+
+
 _SAMPLERS = {
     "MOVE": (_legacy_moves, _asg_moves),
     "IF": (_legacy_ifs, _asg_ifs),
     "PERFORM": (_legacy_performs, _asg_performs),
+    "PERFORMCALL": (_legacy_perform_calls, _asg_perform_calls),
+    "FLOW": (_legacy_flows, _asg_flows),
+    "IO": (_legacy_ios, _asg_ios),
     "CALL": (_legacy_calls, _asg_calls),
     "ARITH": (_legacy_arith, _asg_arith),
     "CONTROL": (_legacy_control, _asg_control),
