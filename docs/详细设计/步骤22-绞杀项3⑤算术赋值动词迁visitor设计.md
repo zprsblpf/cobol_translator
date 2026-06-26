@@ -1,6 +1,6 @@
 # 步骤22　绞杀项3⑤ 算术/赋值动词迁 visitor 设计（rules 逐类迁 visitor·第五刀）
 
-状态：🔶待认可（设计完成，待用户认可后按 §6 落地）
+状态：✅已认可（2026-06-26 用户认可，并修正文件结构为「拆 arith.py + assign.py」两文件，见 §2[文件]；按 §6 落地中）
 
 定位：落地 `架构演进-三相分层(预处理-ASG-visitor)初步设计.md` **§5 迁移分期第 3 项「rules 逐类迁 visitor」的第五刀**——
 承步骤18（MOVE）/19（IF）/20（PERFORM）/21（CALL）同范式。前四刀已把 MOVE/CALL 升为带类型节点、IF/PERFORM 控制结构迁入 visitor，
@@ -57,8 +57,13 @@
 
 - [范围] 本刀切 **7 个算术/赋值叶子动词**（INITIALIZE/SET/ADD/SUBTRACT/MULTIPLY/DIVIDE/COMPUTE）；STRING 等留可选后续。
 - [策略] 沿用 A 案「抽公用、两路共调」：`leaf/arith.py` 持 7 译器 + `translate_arith` 分派，rules 委托、visit_Leaf 共调 → `(lines,matched)` 逐字符一致，零 diff。
-- [文件] **单文件 `translator/leaf/arith.py`** 承载 7 译器 + `_arith_val` + `translate_arith`（逻辑行 ≈ 140，< 200）。
-  "arith" 取**算术与赋值类叶子动词**的统称（含 INITIALIZE/SET 重置/赋值）——三点理由合一刀：① 同 `(tokens)→(lines,bool)` 形态、② 同 `leaf.expr` 底座、③ 同落 `Leaf` 节点。**若你倾向拆 `arith.py`(5算术)+`assign.py`(INITIALIZE/SET)两文件，请指出**（设计可改，dispatch 改为依次试两个译器）。
+- [文件] **✅已认可（修正）：拆两文件**——`translator/leaf/assign.py`（`_t_initialize`/`_t_set` + 分派器 `translate_assign`，仅 INITIALIZE/SET）、
+  `translator/leaf/arith.py`（`_arith_val` + 5 算术译器 + 分派器 `translate_arith`，仅 ADD/SUBTRACT/MULTIPLY/DIVIDE/COMPUTE）。
+  两文件各自瘦而专（逻辑行各 < 100），均只依赖 `leaf.expr`、互不依赖（同级 sibling）。
+  **统一入口** `translate_arith_assign(tokens, ctx)`（host 于 `arith.py`，import `assign.translate_assign`）：**依次试 `translate_assign` → `translate_arith`**，
+  两译器 verb 集互斥（{INITIALIZE,SET} ∩ {ADD…COMPUTE}=∅）→ 任一 token 串至多一路命中、另一路即 `([],False)`，
+  与旧 `_dispatch_leaf` 按 verb 单路路由**产物逐字符一致**；visit_Leaf / diff 单点调 `translate_arith_assign`。
+  （原单文件 `arith.py` 承载 7 译器方案作废；下文 §3 凡述「单文件 arith.py 持 7 译器」均以本条为准。）
 - [节点] **不动 nodes/builder**——7 类已落 `Leaf`，visit_Leaf 单点委托（本刀与 MOVE/CALL 刀的差异：不新增节点）。
 - [visit_Leaf 语义] 由"恒 `// TODO-LEAF`"改为"先试 `translate_arith`、兜不住再占位"——**占位单调收敛**（只减不增）。
 - [比对] 比对单位＝`translate_arith(tokens,ctx)` 的 `(lines, matched)`，与 `rules._dispatch_leaf` 逐字符比（含 try/except 兜底同形）。
@@ -197,6 +202,29 @@ def visit_Leaf(self, node) -> list[str]:
 
 ---
 
-## 9. 实现结果（落地后回填）
+## 9. 实现结果（2026-06-26 落地回填）
 
-（待 §6 落地后补：公用包 / rules 改造 / 相3 visit_Leaf 改委托 / 比对闸扩 ARITH / 与设计偏差 / 验收回归闸。）
+**与设计的唯一偏差**：按 §2[文件] 用户认可的修正，拆 **两文件**（非原单文件 `arith.py`）：
+
+| 文件 | 内容 | 逻辑行 |
+|---|---|---|
+| `translator/leaf/assign.py`（新建） | `_t_initialize`/`_t_set` + 分派器 `translate_assign`（仅 INITIALIZE/SET，含 try/except 兜底） | ~63（含注释，< 200） |
+| `translator/leaf/arith.py`（新建） | `_arith_val` + 5 算术译器 + 分派器 `translate_arith` + **统一入口 `translate_arith_assign`**（依次试 assign→arith） | ~148（含注释，< 200） |
+
+- **公用包**：`leaf/__init__.py` 门面增导出 `translate_assign`/`translate_arith`/`translate_arith_assign`。
+  依赖单向无环：`rules → leaf.arith → leaf.assign → leaf.expr`、`asg.visitor → leaf.arith`。
+- **rules 改造**：删 8 定义（7 译器 + `_arith_val`）+ 顺带删因迁移而失效的 `import re` / `_bd` 导入；
+  顶部 `from translator.leaf.assign import _t_initialize, _t_set` + `from translator.leaf.arith import _t_add, _t_subtract, _t_multiply, _t_divide, _t_compute`
+  → `_dispatch_leaf` 7 调用点零改。
+- **相3 visit_Leaf 改委托**：`asg/visitor.LeafJavaVisitor.visit_Leaf` 由「恒 `// TODO-LEAF`」改为
+  `lines, ok = translate_arith_assign(node.tokens, ctx); return lines if ok else ['// TODO-LEAF: …']`。
+- **比对闸扩 ARITH**：`scripts/diff_asg_vs_legacy.py` 加 `_ARITH_VERBS`（7 类）+ `_legacy_arith`（跑 `rules._dispatch_leaf`）
+  + `_ArithCollector`（filter 7 类 Leaf）/`_asg_arith` + `_SAMPLERS["ARITH"]`，`--verb` choices 自动含 ARITH。
+
+**验收回归闸（全绿，证据）**：
+- 旧路径零影响硬闸：`python -m unittest test_translation` → **135 tests OK（skipped=2）**；
+  `regress_config_snapshot.py` before/after 逐字节 **零 diff**（git stash -u 取 HEAD 基线对比）。
+- **§7 预期占位收敛**：`test_if_body_unmigrated_leaf_placeholder` 原以 `ADD 1 TO WSAA-COUNT` 验 TODO-LEAF，
+  ADD 已迁→改用仍未固化的 `STRING` 验占位（语义不变、例子更替，留痕于测试注释）。
+- 新增单测 16 条：`TestLeafArithExtract`(12) / `TestAsgLeafArithVisitor`(3) / `TestDiffAsgVsLegacyArith`(1，内联程序 ≥5 条 ARITH 含嵌套于 IF，两路 `(lines,matched)` 逐字符一致）。
+- **占位单调收敛**：本刀后 7 类算术/赋值在 Leaf 位置（含 IF/PERFORM body 内）直译可见，余类占位不变。

@@ -7,16 +7,17 @@
 
 用法：
     from parser.cobol_parser import parse
-    from asg import build_asg, GotoJavaVisitor
+    from asg import build_asg, LeafJavaVisitor
     prog = build_asg(parse("X.cob"))
-    # 单点验证：对某 GotoStmt 节点 GotoJavaVisitor().visit(node) → Java 行
+    # 相3 翻译：LeafJavaVisitor(ctx).visit(node) → Java 行（visit_MoveStmt/IfStmt/PerformStmt/
+    # CallStmt/EvaluateStmt/GotoStmt/Leaf）。GotoJavaVisitor 步骤17 demo 已于步骤23 退役并入 LeafJavaVisitor。
 """
 from asg.nodes import (
     Program, Section, Paragraph,
     IfStmt, EvaluateStmt, PerformStmt, GotoStmt, CallStmt, MoveStmt, Leaf,
 )
 from asg.registry import ProcUnit, ProcRef, ProcRegistry, SymbolTable
-from asg.visitor import AsgVisitor, GotoJavaVisitor, LeafJavaVisitor
+from asg.visitor import AsgVisitor, LeafJavaVisitor
 from asg.builder import build as _build
 
 __all__ = [
@@ -24,7 +25,7 @@ __all__ = [
     "Program", "Section", "Paragraph",
     "IfStmt", "EvaluateStmt", "PerformStmt", "GotoStmt", "CallStmt", "MoveStmt", "Leaf",
     "ProcUnit", "ProcRef", "ProcRegistry", "SymbolTable",
-    "AsgVisitor", "GotoJavaVisitor", "LeafJavaVisitor",
+    "AsgVisitor", "LeafJavaVisitor",
 ]
 
 

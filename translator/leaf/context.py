@@ -27,3 +27,6 @@ class LeafCtx(Protocol):
     io_default_pattern: dict      # *IO 查表派生范式（class_suffix / operations 等）
     date_programs: dict           # 日期子程序映射，名 → info
     system_programs: dict         # 系统子程序映射（SYSERR 等），名 → info
+    # ── 控制流叶子词翻译读取的过程结构信息（步骤23 绞杀项3⑥；稳定结构，非骨架瞬态）──
+    known_sections: set           # 所有 SECTION 名（大写）——GO TO known_section → proc_call 判定
+    section_to_method: object     # callable: 段/paragraph 名 → java 方法名（GO TO → this.<m>();）

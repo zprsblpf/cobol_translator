@@ -11,7 +11,6 @@
 """
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field as dc_field
 
 from config import grammar_loader               # 控制流降级策略正本（步骤08）
@@ -20,7 +19,7 @@ from translator.segmenter import Stmt
 # 叶子翻译公用底座（步骤18 绞杀项3①）：MOVE 译器 + 表达式底座下沉至 translator.leaf，
 # 此处只读 import 回来，原 helper 定义已删、改委托（依赖单向 rules → leaf，无环）。
 from translator.leaf.expr import (
-    _FIGURATIVE_BLANK, _FIGURATIVE_ZERO, _assign, _bd, _field_base, _is_bigdecimal,
+    _FIGURATIVE_BLANK, _FIGURATIVE_ZERO, _assign, _field_base, _is_bigdecimal,
     _is_field, _is_numeric_field, _is_string_field, _java, _lvalue, _operand, _pascal,
     _refmod_hi, _refmod_lo, _struct_cls, _struct_obj, _struct_prefix,
 )
@@ -35,6 +34,16 @@ from translator.leaf.loop import _perform_loop
 # resolve_io_info/derive_io_info 一并下沉再导入回 → 结构吸收 4 处调用点 + rules.resolve_io_info 公开面零改
 # （graph/nodes、main、context、skeleton、regress 等外部引用照常；依赖单向 rules → leaf，无环）。
 from translator.leaf.call import translate_call as _t_call, resolve_io_info, derive_io_info
+# 算术/赋值叶子动词（步骤22 绞杀项3⑤）：_t_initialize/_t_set 下沉 translator.leaf.assign，
+# _t_add/_t_subtract/_t_multiply/_t_divide/_t_compute（及私有 _arith_val）下沉 translator.leaf.arith，
+# 别名导回 → _dispatch_leaf 7 个调用点零改；_arith_val 仅 4 算术译器内部用、随迁不再导入
+# （依赖单向 rules → leaf，无环）。
+from translator.leaf.assign import _t_initialize, _t_set
+from translator.leaf.arith import _t_add, _t_subtract, _t_multiply, _t_divide, _t_compute
+# 控制流动词（步骤23 绞杀项3⑥）：_sk_control 的 flow_label-无关分支 + _sk_evaluate 的 switch 壳判定
+# 下沉 translator.leaf.control，rules 委托（dispatch 分支保留在 _sk_control，骨架态不迁）；
+# 依赖单向 rules → leaf，无环。
+from translator.leaf.control import translate_control, translate_evaluate, evaluate_case_label
 
 
 @dataclass
@@ -898,21 +907,16 @@ def _sk_if(st: Stmt, ctx: Ctx, indent: int) -> list[str]:
 
 
 def _sk_evaluate(st: Stmt, ctx: Ctx, indent: int) -> list[str]:
-    subj = " ".join(st.tokens).strip()
-    if subj.upper() in ("TRUE", "") or not st.whens:
-        # EVALUATE TRUE（条件式）较复杂，交 LLM
+    # switch 主体判定下沉 leaf.control.translate_evaluate（步骤23 绞杀项3⑥，委托）；
+    # WHEN 体渲染/递归仍在骨架层；EVALUATE TRUE/复杂 subject/无 whens → 交 LLM。
+    if not st.whens:
         return [_ind(indent) + ctx.new_leaf(st)]
-    subj_java = _operand(st.tokens[0], ctx) if len(st.tokens) == 1 else None
+    subj_java = translate_evaluate(st.tokens, ctx)
     if subj_java is None:
         return [_ind(indent) + ctx.new_leaf(st)]
-    lines = [f"{_ind(indent)}switch ({subj_java}.trim()) {{"]
+    lines = [f"{_ind(indent)}switch ({subj_java}) {{"]
     for cond, body in st.whens:
-        cu = " ".join(cond).upper()
-        if cu in ("OTHER", ""):
-            lines.append(f"{_ind(indent + 1)}default: {{")
-        else:
-            val = _operand(cond[0], ctx) if cond else '""'
-            lines.append(f"{_ind(indent + 1)}case {val}: {{")
+        lines.append(f"{_ind(indent + 1)}{evaluate_case_label(cond, ctx)}: {{")
         lines.extend(build_skeleton(body, ctx, indent + 2))
         lines.append(f"{_ind(indent + 2)}break;")
         lines.append(f"{_ind(indent + 1)}}}")
@@ -1033,37 +1037,19 @@ def _sk_perform(st: Stmt, ctx: Ctx, indent: int) -> list[str]:
 
 
 def _sk_control(st: Stmt, ctx: Ctx, indent: int) -> list[str]:
+    # dispatch 模式（flow_label 真）：骨架装配态，本刀不迁，先于委托判定并保留原样（步骤23 §1 非目标）。
     toks = [t.upper() for t in st.tokens]
     first = toks[0]
     if first == "GO":
-        # GO TO target
-        target = None
-        for t in toks:
-            if t not in ("GO", "TO"):
-                target = t
-                break
-        # dispatch 模式下，目标是本段 paragraph → 状态机跳转（保住循环/分支语义）
+        target = next((t for t in toks if t not in ("GO", "TO")), None)
         if target and ctx.flow_label and target in ctx.flow_paragraphs:
             return [f'{_ind(indent)}__pc = "{target}"; continue {ctx.flow_label};  // GO TO {target}']
-        if target and target.endswith("EXIT"):
-            return [f"{_ind(indent)}return;  // GO TO {target}"]
-        if target:
-            line = f"{_ind(indent)}// TODO-GOTO: 跳转 {target}，需人工核对控制流"
-            if target in ctx.known_sections:
-                return [line, f"{_ind(indent)}{_proc_call(target, ctx)}", f"{_ind(indent)}return;"]
-            return [line, f"{_ind(indent)}return;"]
-        return [f"{_ind(indent)}return;"]
-    if first in ("GOBACK", "STOP"):
-        return [f"{_ind(indent)}return;"]
-    if first == "EXIT":
-        # dispatch 模式下 EXIT paragraph = 退出状态机循环
-        if ctx.flow_label:
-            return [f"{_ind(indent)}break {ctx.flow_label};  // EXIT"]
-        return [f"{_ind(indent)}return;  // EXIT"]
-    if first == "CONTINUE":
-        return [f"{_ind(indent)};  // CONTINUE"]
-    if first == "NEXT":
-        return [f"{_ind(indent)};  // NEXT SENTENCE"]
+    if first == "EXIT" and ctx.flow_label:
+        return [f"{_ind(indent)}break {ctx.flow_label};  // EXIT"]
+    # flow_label-无关分支委托 leaf.control.translate_control（步骤23 绞杀项3⑥，裸行 + 本层施加 _ind）。
+    lines, ok = translate_control(st.tokens, ctx)
+    if ok:
+        return [_ind(indent) + l for l in lines]
     return [_ind(indent) + ctx.new_leaf(st)]
 
 
@@ -1115,185 +1101,3 @@ def _dispatch_leaf(toks: list[str], ctx: Ctx) -> tuple[list[str], bool]:
     except (ValueError, IndexError):
         return [], False
     return [], False
-
-
-def _t_initialize(toks: list[str], ctx: Ctx) -> tuple[list[str], bool]:
-    """INITIALIZE dst1 [dst2 ...] → 重置为默认值。
-      · 结构体参数（X-PARAMS）→ obj = new XParams();（与 MOVE SPACES 重置一致）
-      · 数值字段 → 0 / BigDecimal.ZERO；字符串字段 → ""
-      · 带 REPLACING/含未识别目标 → 整体交 LLM（避免半翻）。
-    """
-    dsts = toks[1:]
-    if not dsts:
-        return [], False
-    lines: list[str] = []
-    for dst in dsts:
-        if dst.upper() in ("REPLACING", "TO", "VALUE", "ALL"):
-            return [], False
-        sp = _struct_prefix(dst, ctx)
-        if sp and sp[1] == "PARAMS":
-            lines.append(f"{_struct_obj(sp[0], ctx)} = new {_struct_cls(sp[0], ctx)}();")
-        elif _is_field(dst, ctx):
-            if _is_bigdecimal(dst, ctx):
-                val = "BigDecimal.ZERO"
-            elif _is_numeric_field(dst, ctx):
-                val = "0"
-            else:
-                val = '""'
-            lines.append(_assign(dst, val, ctx))
-        else:
-            return [], False
-    return lines, True
-
-
-def _t_set(toks: list[str], ctx: Ctx) -> tuple[list[str], bool]:
-    # SET a [b] TO value  （仅处理 TO 数值/字段；TO TRUE/ON 等交 LLM）
-    u = [t.upper() for t in toks]
-    if "TO" not in u:
-        return [], False
-    ti = u.index("TO")
-    targets = toks[1:ti]
-    val_toks = toks[ti + 1:]
-    if len(val_toks) != 1 or not targets:
-        return [], False
-    vu = val_toks[0].upper()
-    if vu in ("TRUE", "FALSE", "ON", "OFF"):
-        return [], False
-    val = _operand(val_toks[0], ctx)
-    return [_assign(t, val, ctx) for t in targets], True
-
-
-def _arith_val(name: str, expr: str, ctx: Ctx) -> str:
-    return _bd(expr) if _is_bigdecimal(name, ctx) and re.fullmatch(r"[+-]?\d+(\.\d+)?", expr) else expr
-
-
-def _t_add(toks: list[str], ctx: Ctx) -> tuple[list[str], bool]:
-    # ADD a TO b [GIVING c]
-    u = [t.upper() for t in toks]
-    if "TO" not in u:
-        return [], False
-    ti = u.index("TO")
-    a_toks = toks[1:ti]
-    if len(a_toks) != 1:
-        return [], False
-    a = a_toks[0]
-    rest = toks[ti + 1:]
-    ru = [t.upper() for t in rest]
-    if "GIVING" in ru:
-        gi = ru.index("GIVING")
-        b = rest[gi - 1]
-        c = rest[gi + 1]
-        if _is_bigdecimal(c, ctx):
-            return [f"{_lvalue(c, ctx)} = {_operand(b, ctx)}.add({_arith_val(c, _operand(a, ctx), ctx)});"], True
-        return [f"{_lvalue(c, ctx)} = {_operand(b, ctx)} + {_operand(a, ctx)};"], True
-    b = rest[0]
-    if _is_bigdecimal(b, ctx):
-        return [f"{_lvalue(b, ctx)} = {_operand(b, ctx)}.add({_arith_val(b, _operand(a, ctx), ctx)});"], True
-    return [f"{_lvalue(b, ctx)} += {_operand(a, ctx)};"], True
-
-
-def _t_subtract(toks: list[str], ctx: Ctx) -> tuple[list[str], bool]:
-    # SUBTRACT a FROM b [GIVING c]
-    u = [t.upper() for t in toks]
-    if "FROM" not in u:
-        return [], False
-    fi = u.index("FROM")
-    a_toks = toks[1:fi]
-    if len(a_toks) != 1:
-        return [], False
-    a = a_toks[0]
-    rest = toks[fi + 1:]
-    ru = [t.upper() for t in rest]
-    if "GIVING" in ru:
-        gi = ru.index("GIVING")
-        b = rest[gi - 1]
-        c = rest[gi + 1]
-        if _is_bigdecimal(c, ctx):
-            return [f"{_lvalue(c, ctx)} = {_operand(b, ctx)}.subtract({_arith_val(c, _operand(a, ctx), ctx)});"], True
-        return [f"{_lvalue(c, ctx)} = {_operand(b, ctx)} - {_operand(a, ctx)};"], True
-    b = rest[0]
-    if _is_bigdecimal(b, ctx):
-        return [f"{_lvalue(b, ctx)} = {_operand(b, ctx)}.subtract({_arith_val(b, _operand(a, ctx), ctx)});"], True
-    return [f"{_lvalue(b, ctx)} -= {_operand(a, ctx)};"], True
-
-
-def _t_multiply(toks: list[str], ctx: Ctx) -> tuple[list[str], bool]:
-    # MULTIPLY a BY b [GIVING c]
-    u = [t.upper() for t in toks]
-    if "BY" not in u:
-        return [], False
-    bi = u.index("BY")
-    a = toks[1:bi]
-    if len(a) != 1:
-        return [], False
-    a = a[0]
-    rest = toks[bi + 1:]
-    ru = [t.upper() for t in rest]
-    if "GIVING" in ru:
-        gi = ru.index("GIVING")
-        b = rest[gi - 1]
-        c = rest[gi + 1]
-    else:
-        b = c = rest[0]
-    if _is_bigdecimal(c, ctx):
-        return [f"{_lvalue(c, ctx)} = {_operand(b, ctx)}.multiply({_arith_val(c, _operand(a, ctx), ctx)});"], True
-    return [f"{_lvalue(c, ctx)} = {_operand(b, ctx)} * {_operand(a, ctx)};"], True
-
-
-def _t_divide(toks: list[str], ctx: Ctx) -> tuple[list[str], bool]:
-    # DIVIDE a INTO b [GIVING c] | DIVIDE a BY b GIVING c [ROUNDED]
-    u = [t.upper() for t in toks]
-    rounded = "ROUNDED" in u
-    if "INTO" in u:
-        ki = u.index("INTO")
-        divisor = toks[1]          # a INTO b: a 是除数
-        rest = toks[ki + 1:]
-    elif "BY" in u:
-        ki = u.index("BY")
-        dividend_pre = toks[1:ki]
-        rest = toks[ki + 1:]
-        if len(dividend_pre) != 1:
-            return [], False
-        # a BY b: a/b
-        dividend = dividend_pre[0]
-        ru = [t.upper() for t in rest]
-        divisor = rest[0]
-        if "GIVING" in ru:
-            c = rest[ru.index("GIVING") + 1]
-        else:
-            c = dividend
-        if _is_bigdecimal(c, ctx):
-            scale = "2" if rounded else "2"
-            return [f"{_lvalue(c, ctx)} = {_operand(dividend, ctx)}.divide({_operand(divisor, ctx)}, {scale}, RoundingMode.HALF_UP);"], True
-        return [f"{_lvalue(c, ctx)} = {_operand(dividend, ctx)} / {_operand(divisor, ctx)};"], True
-    else:
-        return [], False
-    # INTO 形式
-    ru = [t.upper() for t in rest]
-    b = rest[0]
-    c = rest[ru.index("GIVING") + 1] if "GIVING" in ru else b
-    if _is_bigdecimal(c, ctx):
-        return [f"{_lvalue(c, ctx)} = {_operand(b, ctx)}.divide({_operand(divisor, ctx)}, 2, RoundingMode.HALF_UP);"], True
-    return [f"{_lvalue(c, ctx)} = {_operand(b, ctx)} / {_operand(divisor, ctx)};"], True
-
-
-def _t_compute(toks: list[str], ctx: Ctx) -> tuple[list[str], bool]:
-    # COMPUTE dst [ROUNDED] = expr  （仅固化整型；BigDecimal 表达式交 LLM）
-    u = [t.upper() for t in toks]
-    if "=" not in u:
-        return [], False
-    eq = u.index("=")
-    dst_toks = [t for t in toks[1:eq] if t.upper() != "ROUNDED"]
-    if len(dst_toks) != 1:
-        return [], False
-    dst = dst_toks[0]
-    if _is_bigdecimal(dst, ctx):
-        return [], False  # BigDecimal 中缀转链式不可靠 → LLM
-    expr_toks = toks[eq + 1:]
-    parts = []
-    for t in expr_toks:
-        if t in ("+", "-", "*", "/", "(", ")"):
-            parts.append(t)
-        else:
-            parts.append(_operand(t, ctx))
-    return [f"{_lvalue(dst, ctx)} = {' '.join(parts)};"], True

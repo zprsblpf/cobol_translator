@@ -48,7 +48,8 @@ def _lift(st, proc: ProcRegistry):
     if first == "MOVE":
         return nodes.MoveStmt(tokens=list(st.tokens), raw=st.raw)
     if first == "GO":
-        return nodes.GotoStmt(target=proc.resolve(_goto_target(st.tokens)), raw=st.raw)
+        return nodes.GotoStmt(target=proc.resolve(_goto_target(st.tokens)),
+                              tokens=list(st.tokens), raw=st.raw)
     if first == "CALL":
         name, using = _call_parts(st.tokens)
         return nodes.CallStmt(name=name, using=using, tokens=list(st.tokens), raw=st.raw)

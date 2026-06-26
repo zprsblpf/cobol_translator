@@ -8,7 +8,10 @@
 from __future__ import annotations
 
 from asg import nodes
-from translator.leaf import translate_move, translate_condition, translate_perform_loop, translate_call
+from translator.leaf import (
+    translate_move, translate_condition, translate_perform_loop, translate_call,
+    translate_arith_assign, translate_control, translate_evaluate, evaluate_case_label,
+)
 
 
 class AsgVisitor:
@@ -31,26 +34,6 @@ def _children(node) -> list:
         for _cond, body in node.whens:
             out += body
     return out
-
-
-class GotoJavaVisitor(AsgVisitor):
-    """单点 demo：GotoStmt → Java，复刻 rules._sk_control 的 flow_label=None GO 分支
-    （目标 …EXIT → return；未知段 → TODO-GOTO + return），证明访问 target 可替代 token 嗅探。
-
-    范围：dispatch 模式(flow_label 状态机跳转)与「已知段 proc_call」平价留项3（§7-Q2）。
-    """
-
-    def __init__(self, known_sections: set | None = None):
-        self.known_sections = known_sections or set()
-
-    def visit_GotoStmt(self, node) -> list[str]:
-        target = node.target.name if node.target else None
-        if not target:
-            return ["return;"]
-        if target.endswith("EXIT"):
-            return [f"return;  // GO TO {target}"]
-        # 未知段（非 dispatch 模式）：与 _sk_control 末两支逐字符一致
-        return [f"// TODO-GOTO: 跳转 {target}，需人工核对控制流", "return;"]
 
 
 class LeafJavaVisitor(AsgVisitor):
@@ -95,8 +78,48 @@ class LeafJavaVisitor(AsgVisitor):
         return out
 
     def visit_Leaf(self, node) -> list[str]:
-        """未迁动词（CALL/算术/GOTO…）：诚实占位，使非空 body 可见、不静默吞行。"""
-        return [f"// TODO-LEAF: {node.raw}"]
+        """已迁的叶子动词直译；其余未迁动词仍诚实占位。
+
+        依次试：① 算术/赋值（translate_arith_assign，步骤22）→ ② 控制流叶子词
+        （translate_control，步骤23：落 Leaf 的 CONTINUE/STOP/EXIT/GOBACK/NEXT）。
+        两者 verb 集互斥、均与旧 rules 同函数同 ctx → 产物逐字符一致；俱兜不住（STRING/未固化/
+        解析失败）→ // TODO-LEAF 占位。占位单调收敛（只减不增）。"""
+        lines, ok = translate_arith_assign(node.tokens, self.ctx)
+        if ok:
+            return lines
+        lines, ok = translate_control(node.tokens, self.ctx)
+        return lines if ok else [f"// TODO-LEAF: {node.raw}"]
+
+    def visit_GotoStmt(self, node) -> list[str]:
+        """复刻 rules._sk_control 的 GO 分支（步骤23 绞杀项3⑥，并入自退役的 GotoJavaVisitor）：
+
+        经公用 translate_control（与旧 _sk_control flow_label=None 分支同函数同 ctx → 逐字符一致）
+        译 GO TO（…EXIT→return / known_section→proc_call+return / 未知段→TODO-GOTO+return / 无 target→return）。
+        GotoStmt 恒为 GO、translate_control 全覆盖；无 token 的退化节点 → return;（步骤17 demo 语义）。
+        dispatch 模式（__pc/continue FLOW）依赖 flow_label 骨架态，留骨架装配刀（设计 §1 非目标）。"""
+        lines, ok = translate_control(node.tokens, self.ctx)
+        return lines if ok else ["return;"]
+
+    def visit_EvaluateStmt(self, node) -> list[str]:
+        """复刻 rules._sk_evaluate 的 switch 壳（步骤23 绞杀项3⑥）：
+
+        subject 经公用 translate_evaluate（单 token 非 TRUE → `x.trim()`；否则 None→交 LLM），
+        每 WHEN 的 case 标签经 evaluate_case_label（与 _sk_evaluate 同函数 → 壳逐字符一致）；
+        WHEN 体递归直译已迁动词（未迁落 visit_Leaf 占位，同 IF body 渐进）。
+        subject=None / 无 whens → // TODO-EVALUATE 占位（EVALUATE TRUE/复杂 subject 交 LLM）。"""
+        subj = translate_evaluate(node.subject, self.ctx)
+        if subj is None or not node.whens:
+            return [f"// TODO-EVALUATE: {node.raw}"]
+        lines = [f"switch ({subj}) {{"]
+        for cond, body in node.whens:
+            lines.append(f"    {evaluate_case_label(cond, self.ctx)}: {{")
+            for c in body:
+                for ln in self.visit(c):
+                    lines.append(f"        {ln}")
+            lines.append("        break;")
+            lines.append("    }")
+        lines.append("}")
+        return lines
 
     def visit_PerformStmt(self, node) -> list[str]:
         """复刻 rules._sk_perform 的循环壳（步骤20 绞杀项3③·只切①循环子句）：

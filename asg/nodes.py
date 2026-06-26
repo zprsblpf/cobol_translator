@@ -33,6 +33,7 @@ class MoveStmt:
 @dataclass
 class GotoStmt:
     target: ProcRef | None = None     # 已解析的过程引用（解析失败为 None）
+    tokens: list[str] = field(default_factory=list)   # 原始 token 串（供 leaf.translate_control 复刻 _sk_control，镜像 CallStmt 步骤21）
     raw: str = ""
     lineno: int = 0
 

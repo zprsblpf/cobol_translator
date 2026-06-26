@@ -16,7 +16,7 @@
 对应设计：步骤18 §5（MOVE）、步骤19 §5（IF）、步骤20-绞杀项3③PERFORM循环子句迁visitor设计.md §5。
 
 用法：
-    python scripts/diff_asg_vs_legacy.py <program.cob> [--verb MOVE|IF|PERFORM]
+    python scripts/diff_asg_vs_legacy.py <program.cob> [--verb MOVE|IF|PERFORM|CALL|ARITH|CONTROL]
 退出码：全等 0；有差异 1（CI/回归可断言）。
 
 范围：
@@ -36,7 +36,10 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from parser.cobol_parser import parse                                   # noqa: E402
 from translator.segmenter import segment, split_paragraphs             # noqa: E402
 from translator.skeleton_gen.body_context import build_body_ctx        # noqa: E402
-from translator.leaf import translate_move, translate_condition, translate_perform_loop, translate_call  # noqa: E402
+from translator.leaf import (  # noqa: E402
+    translate_move, translate_condition, translate_perform_loop, translate_call, translate_arith_assign,
+    translate_control, translate_evaluate, evaluate_case_label,
+)
 from translator import rules                                          # noqa: E402
 from asg import build_asg                                              # noqa: E402
 from asg import nodes as asg_nodes                                     # noqa: E402
@@ -194,11 +197,112 @@ def _asg_calls(program, ctx) -> list[tuple[str, object]]:
     return col.out
 
 
+# 算术/赋值叶子动词（步骤22 绞杀项3⑤）：INITIALIZE/SET + 5 算术，均落 ASG Leaf
+_ARITH_VERBS = {"INITIALIZE", "SET", "ADD", "SUBTRACT", "MULTIPLY", "DIVIDE", "COMPUTE"}
+
+
+def _legacy_arith(program, ctx) -> list[tuple[str, object]]:
+    """旧路：segmenter 切分树枚举每条 7 类算术/赋值语句 → (raw, rules._dispatch_leaf 输出 (lines, matched))，源码序。
+
+    比对单位是 _dispatch_leaf 对这 7 类的 (lines, matched)；迁后 _dispatch_leaf 内部即委托
+    leaf.assign/leaf.arith 同译器，取 rules 侧调用以验证别名接线无误（含 try/except 兜底同形）。
+    """
+    out: list[tuple[str, object]] = []
+    for s in program.sections:
+        for _lbl, body in split_paragraphs(s.lines):
+            for st in segment(body):
+                for sub in _walk_segmenter_stmts(st):
+                    toks = getattr(sub, "tokens", None) or []
+                    if sub.kind == "simple" and toks and toks[0].upper() in _ARITH_VERBS:
+                        out.append((sub.raw, rules._dispatch_leaf(list(toks), ctx)))
+    return out
+
+
+class _ArithCollector(AsgVisitor):
+    """遍历 ASG，对每个 7 类算术/赋值 Leaf 收 (raw, translate_arith_assign 输出)。
+
+    非 7 类 Leaf（STRING 等）滤除——与 legacy 仅收 7 类对齐；IF/PERFORM 等容器由基类
+    generic_visit 默认递归，嵌套于 body 内的 Leaf 自然按源码序入列（同 _CallCollector 范式）。
+    """
+
+    def __init__(self, ctx):
+        self.ctx = ctx
+        self.out: list[tuple[str, object]] = []
+
+    def visit_Leaf(self, node):
+        toks = node.tokens or []
+        if toks and toks[0].upper() in _ARITH_VERBS:
+            self.out.append((node.raw, translate_arith_assign(node.tokens, self.ctx)))
+
+
+def _asg_arith(program, ctx) -> list[tuple[str, object]]:
+    col = _ArithCollector(ctx)
+    col.visit(build_asg(program))
+    return col.out
+
+
+# 控制流动词（步骤23 绞杀项3⑥）：EVALUATE + 控制叶子词。比对单位＝可迁的「壳」：
+#   · 控制词 → translate_control 的 (lines)；· EVALUATE → (subject 串, case 标签元组)。
+# honest 边界（设计 §4.2）：仅 flow_label=None；dispatch 模式留骨架刀，喂 flow_label=None ctx 规避伪差异。
+# WHEN 体/IF body 旧 build_skeleton vs 新递归本就渐进不等，故 EVALUATE 只比壳（同 IF 只比条件）。
+_CONTROL_VERBS = {"GO", "GOBACK", "STOP", "EXIT", "CONTINUE", "NEXT"}
+
+
+def _eval_shell(subject, whens, ctx):
+    return ("E", translate_evaluate(subject, ctx), tuple(evaluate_case_label(c, ctx) for c, _ in whens))
+
+
+def _legacy_control(program, ctx) -> list[tuple[str, object]]:
+    """旧路：segmenter 切分树枚举每条 EVALUATE / 控制叶子词。
+    控制词跑 rules._sk_control（flow_label=None → 内部委托 translate_control，验 rules 接线）；EVALUATE 取壳。"""
+    out: list[tuple[str, object]] = []
+    for s in program.sections:
+        for _lbl, body in split_paragraphs(s.lines):
+            for st in segment(body):
+                for sub in _walk_segmenter_stmts(st):
+                    if sub.kind == "evaluate":
+                        out.append((sub.raw, _eval_shell(list(sub.tokens), sub.whens, ctx)))
+                    elif sub.kind == "simple" and sub.tokens and sub.tokens[0].upper() in _CONTROL_VERBS:
+                        out.append((sub.raw, ("C", tuple(rules._sk_control(sub, ctx, 0)))))
+    return out
+
+
+class _ControlCollector(AsgVisitor):
+    """遍历 ASG，对 GotoStmt / 控制词 Leaf 收 translate_control 壳、对 EvaluateStmt 收壳。
+
+    IF/PERFORM 容器由基类 generic_visit 默认递归；EvaluateStmt 记录后递归 whens 体捕嵌套控制词（源码序）。
+    """
+
+    def __init__(self, ctx):
+        self.ctx = ctx
+        self.out: list[tuple[str, object]] = []
+
+    def visit_GotoStmt(self, node):
+        self.out.append((node.raw, ("C", tuple(translate_control(node.tokens, self.ctx)[0]))))
+
+    def visit_Leaf(self, node):
+        toks = node.tokens or []
+        if toks and toks[0].upper() in _CONTROL_VERBS:
+            self.out.append((node.raw, ("C", tuple(translate_control(node.tokens, self.ctx)[0]))))
+
+    def visit_EvaluateStmt(self, node):
+        self.out.append((node.raw, _eval_shell(node.subject, node.whens, self.ctx)))
+        self.generic_visit(node)          # 递归 whens 体 → 嵌套控制词入列（源码序）
+
+
+def _asg_control(program, ctx) -> list[tuple[str, object]]:
+    col = _ControlCollector(ctx)
+    col.visit(build_asg(program))
+    return col.out
+
+
 _SAMPLERS = {
     "MOVE": (_legacy_moves, _asg_moves),
     "IF": (_legacy_ifs, _asg_ifs),
     "PERFORM": (_legacy_performs, _asg_performs),
     "CALL": (_legacy_calls, _asg_calls),
+    "ARITH": (_legacy_arith, _asg_arith),
+    "CONTROL": (_legacy_control, _asg_control),
 }
 
 

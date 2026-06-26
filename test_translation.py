@@ -1043,9 +1043,10 @@ class TestAsgGotoVisitor(unittest.TestCase):
         return r._sk_control(st, ctx, 0)
 
     def _visitor_goto(self, target: str):
-        from asg import GotoStmt, GotoJavaVisitor, ProcRef
-        node = GotoStmt(target=ProcRef(name=target, unit=None))
-        return GotoJavaVisitor().visit(node)
+        # 步骤23：GotoJavaVisitor demo 退役，能力并入 LeafJavaVisitor.visit_GotoStmt（经 translate_control）
+        from asg import GotoStmt, LeafJavaVisitor, ProcRef
+        node = GotoStmt(target=ProcRef(name=target, unit=None), tokens=["GO", "TO", target])
+        return LeafJavaVisitor(_leaf_ctx()).visit(node)
 
     def test_exit_target_char_exact(self):
         """目标 …EXIT → 两侧均 `return;  // GO TO X`，逐字符一致。"""
@@ -1056,9 +1057,9 @@ class TestAsgGotoVisitor(unittest.TestCase):
         self.assertEqual(self._visitor_goto("9000-WHERE"), self._sk_control_goto("9000-WHERE"))
 
     def test_no_target_returns(self):
-        """目标缺失 → return;（兜底，不臆测）。"""
-        from asg import GotoStmt, GotoJavaVisitor
-        self.assertEqual(GotoJavaVisitor().visit(GotoStmt(target=None)), ["return;"])
+        """目标缺失（退化节点，无 token）→ return;（兜底，不臆测）。"""
+        from asg import GotoStmt, LeafJavaVisitor
+        self.assertEqual(LeafJavaVisitor(_leaf_ctx()).visit(GotoStmt(target=None)), ["return;"])
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1276,10 +1277,12 @@ class TestAsgIfVisitor(unittest.TestCase):
         self.assertEqual(LeafJavaVisitor(self._ctx()).visit(node), ["// TODO-IF: IF WSAA-STATUS-OK"])
 
     def test_if_body_unmigrated_leaf_placeholder(self):
+        # 步骤22：ADD 已迁 visitor（占位单调收敛），原例改用仍未固化的 STRING 验诚实占位
         from asg import IfStmt, Leaf, LeafJavaVisitor
         node = IfStmt(cond=["WSAA-COUNT", "=", "1"],
-                      then=[Leaf(tokens=["ADD", "1", "TO", "WSAA-COUNT"], raw="ADD 1 TO WSAA-COUNT")])
-        self.assertIn("    // TODO-LEAF: ADD 1 TO WSAA-COUNT", LeafJavaVisitor(self._ctx()).visit(node))
+                      then=[Leaf(tokens=["STRING", "WSAA-A", "INTO", "WSAA-B"],
+                                 raw="STRING WSAA-A INTO WSAA-B")])
+        self.assertIn("    // TODO-LEAF: STRING WSAA-A INTO WSAA-B", LeafJavaVisitor(self._ctx()).visit(node))
 
     def test_nested_if_renders_indented(self):
         from asg import IfStmt, MoveStmt, LeafJavaVisitor
@@ -1578,6 +1581,290 @@ class TestDiffAsgVsLegacyCall(unittest.TestCase):
         asg = mod._asg_calls(prog, ctx)
         self.assertEqual(len(legacy), len(asg))
         self.assertTrue(len(legacy) >= 4, "样例应含 IO/非IO/嵌套于 IF 与 PERFORM 多条 CALL")
+        self.assertEqual([x[1] for x in legacy], [x[1] for x in asg])
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 步骤22 绞杀项3⑤ 算术/赋值动词迁 visitor（拆 leaf/assign.py + leaf/arith.py）
+#   ① translate_assign/translate_arith/translate_arith_assign 抽出后输出正确
+#   ② visit_Leaf 经 translate_arith_assign → 7 类直译；未固化（STRING）→ // TODO-LEAF；IF/PERFORM body 内直译可见
+#   ③ diff_asg_vs_legacy --verb ARITH 两路 (lines,matched) 逐字符一致（含嵌套于 IF）
+# 对应设计：docs/详细设计/步骤22-绞杀项3⑤算术赋值动词迁visitor设计.md §7。
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestLeafArithExtract(unittest.TestCase):
+    """① 抽出的 translate_assign/translate_arith/translate_arith_assign 输出正确。"""
+
+    FTM = {"wsaaCount": {"type": "int"}, "wsaaAmt": {"type": "BigDecimal"},
+           "wsaaFlag": {"type": "String"}}
+
+    def _ctx(self, **kw):
+        return _leaf_ctx(field_type_map=self.FTM, **kw)
+
+    def test_add_int_compound(self):
+        from translator.leaf import translate_arith_assign
+        self.assertEqual(translate_arith_assign("ADD 1 TO WSAA-COUNT".split(), self._ctx()),
+                         (["wsaaCount += 1;"], True))
+
+    def test_add_bigdecimal_chain(self):
+        from translator.leaf import translate_arith_assign
+        self.assertEqual(translate_arith_assign("ADD 1 TO WSAA-AMT".split(), self._ctx()),
+                         (['wsaaAmt = wsaaAmt.add(new BigDecimal("1"));'], True))
+
+    def test_subtract_int(self):
+        from translator.leaf import translate_arith_assign
+        self.assertEqual(translate_arith_assign("SUBTRACT 1 FROM WSAA-COUNT".split(), self._ctx()),
+                         (["wsaaCount -= 1;"], True))
+
+    def test_multiply_int(self):
+        from translator.leaf import translate_arith_assign
+        self.assertEqual(translate_arith_assign("MULTIPLY 2 BY WSAA-COUNT".split(), self._ctx()),
+                         (["wsaaCount = wsaaCount * 2;"], True))
+
+    def test_divide_into_giving(self):
+        from translator.leaf import translate_arith_assign
+        self.assertEqual(translate_arith_assign("DIVIDE 10 INTO WSAA-COUNT".split(), self._ctx()),
+                         (["wsaaCount = wsaaCount / 10;"], True))
+
+    def test_compute_int_infix(self):
+        from translator.leaf import translate_arith_assign
+        self.assertEqual(translate_arith_assign("COMPUTE WSAA-COUNT = WSAA-COUNT + 1".split(), self._ctx()),
+                         (["wsaaCount = wsaaCount + 1;"], True))
+
+    def test_initialize_numeric_field(self):
+        from translator.leaf import translate_arith_assign
+        self.assertEqual(translate_arith_assign("INITIALIZE WSAA-COUNT".split(), self._ctx()),
+                         (["wsaaCount = 0;"], True))
+
+    def test_initialize_params_struct(self):
+        from translator.leaf import translate_arith_assign
+        ctx = self._ctx(prefixes={"ELPO"})
+        self.assertEqual(translate_arith_assign("INITIALIZE ELPO-PARAMS".split(), ctx),
+                         (["elpoParams = new ElpoParams();"], True))
+
+    def test_set_to_number(self):
+        from translator.leaf import translate_arith_assign
+        self.assertEqual(translate_arith_assign("SET WSAA-COUNT TO 5".split(), self._ctx()),
+                         (["wsaaCount = 5;"], True))
+
+    def test_set_to_true_falls_to_llm(self):
+        from translator.leaf import translate_arith_assign
+        self.assertEqual(translate_arith_assign("SET WSAA-FLAG TO TRUE".split(), self._ctx()),
+                         ([], False))
+
+    def test_non_arith_verb_falls_through(self):
+        from translator.leaf import translate_arith_assign
+        self.assertEqual(translate_arith_assign("STRING WSAA-A INTO WSAA-B".split(), self._ctx()),
+                         ([], False))
+
+    def test_disjoint_dispatch(self):
+        """两子分派器 verb 集互斥：assign 不接算术、arith 不接赋值。"""
+        from translator.leaf import translate_assign, translate_arith
+        self.assertEqual(translate_assign("ADD 1 TO WSAA-COUNT".split(), self._ctx()), ([], False))
+        self.assertEqual(translate_arith("SET WSAA-COUNT TO 5".split(), self._ctx()), ([], False))
+
+
+class TestAsgLeafArithVisitor(unittest.TestCase):
+    """② visit_Leaf 经同一 translate_arith_assign → 与之逐字符一致；未固化→// TODO-LEAF；IF body 内直译可见。"""
+
+    def _ctx(self):
+        return _leaf_ctx(field_type_map={"wsaaCount": {"type": "int"}})
+
+    def test_leaf_arith_matches_translate(self):
+        from asg import Leaf, LeafJavaVisitor
+        from translator.leaf import translate_arith_assign
+        ctx = self._ctx()
+        toks = "ADD 1 TO WSAA-COUNT".split()
+        node = Leaf(tokens=list(toks), raw="ADD 1 TO WSAA-COUNT")
+        self.assertEqual(LeafJavaVisitor(ctx).visit(node), translate_arith_assign(toks, ctx)[0])
+        self.assertEqual(LeafJavaVisitor(ctx).visit(node), ["wsaaCount += 1;"])
+
+    def test_unmigrated_leaf_placeholder(self):
+        from asg import Leaf, LeafJavaVisitor
+        node = Leaf(tokens="STRING WSAA-A INTO WSAA-B".split(), raw="STRING WSAA-A INTO WSAA-B")
+        self.assertEqual(LeafJavaVisitor(self._ctx()).visit(node),
+                         ["// TODO-LEAF: STRING WSAA-A INTO WSAA-B"])
+
+    def test_arith_inside_if_body_direct(self):
+        from asg import IfStmt, Leaf, LeafJavaVisitor
+        node = IfStmt(cond=["WSAA-COUNT", "=", "1"],
+                      then=[Leaf(tokens="ADD 2 TO WSAA-COUNT".split(), raw="ADD 2 TO WSAA-COUNT")])
+        out = LeafJavaVisitor(self._ctx()).visit(node)
+        self.assertIn("    wsaaCount += 2;", out)
+        self.assertNotIn("    // TODO-LEAF: ADD 2 TO WSAA-COUNT", out)
+
+
+class TestDiffAsgVsLegacyArith(unittest.TestCase):
+    """③ 整程序上旧/新两路 ARITH 的 (lines,matched) 逐字符一致（INITIALIZE/SET/ADD/SUBTRACT/COMPUTE，含嵌套于 IF）。"""
+
+    SRC = (
+        "       IDENTIFICATION DIVISION.\n"
+        "       PROGRAM-ID. TARITH.\n"
+        "       DATA DIVISION.\n"
+        "       WORKING-STORAGE SECTION.\n"
+        "       01 WSAA-COUNT    PIC 9(04) VALUE 0.\n"
+        "       PROCEDURE DIVISION.\n"
+        "       1000-MAIN SECTION.\n"
+        "           INITIALIZE WSAA-COUNT.\n"
+        "           SET WSAA-COUNT TO 5.\n"
+        "           ADD 1 TO WSAA-COUNT.\n"
+        "           SUBTRACT 1 FROM WSAA-COUNT.\n"
+        "           COMPUTE WSAA-COUNT = WSAA-COUNT + 1.\n"
+        "           IF WSAA-COUNT = 1\n"
+        "               ADD 2 TO WSAA-COUNT\n"
+        "           END-IF.\n"
+    )
+
+    def test_legacy_equals_asg_arith(self):
+        from translator.skeleton_gen.body_context import build_body_ctx
+        mod = TestDiffAsgVsLegacy()._harness()
+        prog = TestAsgMoveLift()._parse(self.SRC)
+        ctx, _ = build_body_ctx(prog)
+        legacy = mod._legacy_arith(prog, ctx)
+        asg = mod._asg_arith(prog, ctx)
+        self.assertEqual(len(legacy), len(asg))
+        self.assertTrue(len(legacy) >= 5, "样例应含 INITIALIZE/SET/ADD/SUBTRACT/COMPUTE + 嵌套于 IF 的 ADD")
+        self.assertEqual([x[1] for x in legacy], [x[1] for x in asg])
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 步骤23 绞杀项3⑥ 控制流动词 EVALUATE/GOTO 迁 visitor（leaf/control.py）
+#   ① translate_control（各控制词 flow_label-无关）/ translate_evaluate / evaluate_case_label 抽出后正确
+#   ② visit_GotoStmt==translate_control；CONTINUE 经 visit_Leaf 兜底；visit_EvaluateStmt 渲 switch 壳
+#   ③ diff_asg_vs_legacy --verb CONTROL 两路壳逐字符一致（EVALUATE+GO TO+CONTINUE，含嵌套）
+# 对应设计：docs/详细设计/步骤23-绞杀项3⑥控制流动词EVALUATE-GOTO迁visitor设计.md §7。
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestLeafControlExtract(unittest.TestCase):
+    """① translate_control / translate_evaluate / evaluate_case_label 输出正确。"""
+
+    def _c(self, line, known=None):
+        from translator.leaf import translate_control
+        ctx = _leaf_ctx()
+        if known:
+            ctx.known_sections = set(known)
+        return translate_control(line.split(), ctx)
+
+    def test_goto_exit(self):
+        self.assertEqual(self._c("GO TO 1000-EXIT"), (["return;  // GO TO 1000-EXIT"], True))
+
+    def test_goto_unknown(self):
+        self.assertEqual(self._c("GO TO 9000-WHERE"),
+                         (["// TODO-GOTO: 跳转 9000-WHERE，需人工核对控制流", "return;"], True))
+
+    def test_goto_known_section_proc_call(self):
+        lines, ok = self._c("GO TO 2000-SEC", known={"2000-SEC"})
+        self.assertTrue(ok)
+        self.assertEqual(lines, ["// TODO-GOTO: 跳转 2000-SEC，需人工核对控制流",
+                                 "this.2000-SEC();", "return;"])
+
+    def test_goto_no_target(self):
+        self.assertEqual(self._c("GO"), (["return;"], True))
+
+    def test_goback_stop_return(self):
+        self.assertEqual(self._c("GOBACK"), (["return;"], True))
+        self.assertEqual(self._c("STOP RUN"), (["return;"], True))
+
+    def test_exit_non_dispatch(self):
+        self.assertEqual(self._c("EXIT"), (["return;  // EXIT"], True))
+
+    def test_continue_next(self):
+        self.assertEqual(self._c("CONTINUE"), ([";  // CONTINUE"], True))
+        self.assertEqual(self._c("NEXT SENTENCE"), ([";  // NEXT SENTENCE"], True))
+
+    def test_non_control_falls_through(self):
+        self.assertEqual(self._c("MOVE A TO B"), ([], False))
+
+    def test_evaluate_subject_single_token(self):
+        from translator.leaf import translate_evaluate
+        ctx = _leaf_ctx(field_type_map={"wsaaX": {"type": "String"}})
+        self.assertEqual(translate_evaluate(["WSAA-X"], ctx), "wsaaX.trim()")
+
+    def test_evaluate_true_and_multitoken_none(self):
+        from translator.leaf import translate_evaluate
+        ctx = _leaf_ctx()
+        self.assertIsNone(translate_evaluate(["TRUE"], ctx))
+        self.assertIsNone(translate_evaluate(["WSAA-X", "WSAA-Y"], ctx))
+        self.assertIsNone(translate_evaluate([], ctx))
+
+    def test_evaluate_case_label(self):
+        from translator.leaf import evaluate_case_label
+        ctx = _leaf_ctx()
+        self.assertEqual(evaluate_case_label(["OTHER"], ctx), "default")
+        self.assertEqual(evaluate_case_label([], ctx), "default")
+        self.assertEqual(evaluate_case_label(["'A'"], ctx), 'case "A"')
+
+
+class TestAsgControlVisitor(unittest.TestCase):
+    """② visit_GotoStmt==translate_control；CONTINUE 经 visit_Leaf 兜底；visit_EvaluateStmt 渲 switch 壳。"""
+
+    def test_goto_via_visitor(self):
+        from asg import GotoStmt, LeafJavaVisitor
+        from translator.leaf import translate_control
+        ctx = _leaf_ctx()
+        node = GotoStmt(tokens="GO TO 1000-EXIT".split(), raw="GO TO 1000-EXIT")
+        self.assertEqual(LeafJavaVisitor(ctx).visit(node),
+                         translate_control(node.tokens, ctx)[0])
+
+    def test_continue_via_visit_leaf(self):
+        from asg import Leaf, LeafJavaVisitor
+        node = Leaf(tokens=["CONTINUE"], raw="CONTINUE")
+        self.assertEqual(LeafJavaVisitor(_leaf_ctx()).visit(node), [";  // CONTINUE"])
+
+    def test_evaluate_switch_shell(self):
+        from asg import EvaluateStmt, Leaf, LeafJavaVisitor
+        ctx = _leaf_ctx(field_type_map={"wsaaX": {"type": "String"}})
+        node = EvaluateStmt(subject=["WSAA-X"],
+                            whens=[(["'A'"], [Leaf(tokens=["CONTINUE"], raw="CONTINUE")]),
+                                   (["OTHER"], [])],
+                            raw="EVALUATE WSAA-X")
+        out = LeafJavaVisitor(ctx).visit(node)
+        self.assertEqual(out[0], "switch (wsaaX.trim()) {")
+        self.assertIn('    case "A": {', out)
+        self.assertIn("        ;  // CONTINUE", out)   # WHEN 体直译可见（CONTINUE 经 visit_Leaf）
+        self.assertIn("    default: {", out)
+        self.assertEqual(out[-1], "}")
+
+    def test_evaluate_true_todo(self):
+        from asg import EvaluateStmt, LeafJavaVisitor
+        node = EvaluateStmt(subject=["TRUE"], whens=[(["'A'"], [])], raw="EVALUATE TRUE")
+        self.assertEqual(LeafJavaVisitor(_leaf_ctx()).visit(node), ["// TODO-EVALUATE: EVALUATE TRUE"])
+
+
+class TestDiffAsgVsLegacyControl(unittest.TestCase):
+    """③ 整程序上旧/新两路控制流壳逐字符一致（EVALUATE + GO TO + CONTINUE，含嵌套于 IF）。"""
+
+    SRC = (
+        "       IDENTIFICATION DIVISION.\n"
+        "       PROGRAM-ID. TCTRL.\n"
+        "       DATA DIVISION.\n"
+        "       WORKING-STORAGE SECTION.\n"
+        "       01 WSAA-X    PIC X(02) VALUE SPACE.\n"
+        "       PROCEDURE DIVISION.\n"
+        "       1000-MAIN SECTION.\n"
+        "           EVALUATE WSAA-X\n"
+        "               WHEN 'A'\n"
+        "                   CONTINUE\n"
+        "               WHEN OTHER\n"
+        "                   GO TO 1000-EXIT\n"
+        "           END-EVALUATE.\n"
+        "           IF WSAA-X = 'B'\n"
+        "               GO TO 1000-EXIT\n"
+        "           END-IF.\n"
+        "           CONTINUE.\n"
+        "       1000-EXIT.\n"
+        "           EXIT.\n"
+    )
+
+    def test_legacy_equals_asg_control(self):
+        from translator.skeleton_gen.body_context import build_body_ctx
+        mod = TestDiffAsgVsLegacy()._harness()
+        prog = TestAsgMoveLift()._parse(self.SRC)
+        ctx, _ = build_body_ctx(prog)
+        legacy = mod._legacy_control(prog, ctx)
+        asg = mod._asg_control(prog, ctx)
+        self.assertEqual(len(legacy), len(asg))
+        self.assertTrue(len(legacy) >= 4, "样例应含 EVALUATE + GO TO（嵌套于 EVALUATE/IF）+ CONTINUE + EXIT")
         self.assertEqual([x[1] for x in legacy], [x[1] for x in asg])
 
 
