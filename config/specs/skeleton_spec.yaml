@@ -69,6 +69,17 @@ block_grammar:
       body: [END-PERFORM]        # 内联循环体 stop 集
     closed_by: { explicit: END-PERFORM, implicit: none }
     java_skeleton: loop_or_call  # 有 UNTIL/VARYING/TIMES → while/for；裸过程名 → method-call
+    # 循环子句复杂变体（步骤16 正本；rules._perform_loop 实现跟随）：
+    loop:
+      test_before:  "默认 / WITH TEST BEFORE：UNTIL cond → while (!(cond)) {…}（先判后做，零回归）"
+      test_after:   "WITH TEST AFTER（仅无 VARYING，D16-1）：UNTIL cond → do {…} while (!(cond));（先做一次再判，do-while）"
+      varying_after: "VARYING i … UNTIL ci AFTER j … UNTIL cj [AFTER k …]（D16-2）→ 逐子句嵌套 for（i 最外、末子句最内），任意层"
+      conservative: "VARYING+TEST AFTER 叠加 / 任一子句条件兜不住 → 整条 PERFORM 落 LLM 叶子（all-or-nothing，不出半个/误译循环，D16-3）"
+    # 单条 PERFORM <过程名>（无 THRU、无循环；步骤15 C-3 正本；rules._perform_single_paragraph 实现跟随）：
+    single:
+      section:    "target 是已知 SECTION → this.<sec>();（真实方法已在，零回归）"
+      paragraph:  "target 是 paragraph（proc_order 中恰一次、非 SECTION、合成名不撞 SECTION 方法名）→ 登记单单元合成方法 pXxx()（体=该 paragraph）、调用点 this.pXxx();（渲染期补出方法定义，B1 补实参）"
+      unresolved: "target 不在 proc_order / 重名 / 撞 SECTION 方法名 → 保守 this.pXxx() + 前置可见 // TODO 人工核对，不臆造（消除静默坏调用）"
     # PERFORM A THRU B 范围语义（步骤12 §2 正本；rules._perform_range 实现跟随）：
     #   COBOL THRU = 顺序执行「源码中从段 A 到段 B 之间的全部段」。绝不能只译 A 而丢中间段。
     thru:
@@ -78,9 +89,15 @@ block_grammar:
       # paragraph 级 THRU（步骤13 §2.2/§2.3 正本；rules._perform_range 第二级查找实现跟随）：
       paragraph_intra_section: "A、B 为 paragraph 且在全程序 proc_order 中各恰出现一次、B 在 A 之后 → 路线b：合成区间方法 aThruB()，方法体=区间内各过程单元体按 proc_order 顺序拼接后整体翻译一次，调用点单次 this.aThruB();（同段、跨段同一套实现，D2）"
       cross_section_paragraph: "区间跨 SECTION 同样走 paragraph 级合成（proc_order 含 SECTION 头单元，天然覆盖）；端点缺失/重名/B 在 A 之前/区间夹畸形单元（D3 保守）→ 退化 pA() + // TODO 人工核对，不臆测"
+      # 区间内 GO TO（步骤14 §2.2 正本；合成区间方法保留 paragraph 标签后，由 build_section 状态机路由）：
+      goto_intra_range:  "区间内 GO TO 目标 ∈ 区间各单元标签 → 合成方法体内状态机精确跳转 __pc=\"target\"; continue FLOW;（回跳=循环、前向=跳过中间单元，D14-3=a 前向亦建状态机；仅作用于合成区间方法，普通 SECTION 渲染不变）"
+      goto_range_exit:   "区间内 GO TO 目标 = 区间出口（B 的 EXIT 段 / GOBACK / STOP）→ return;（提前结束本次 PERFORM，返回调用点）"
+      goto_out_of_range: "区间内 GO TO 目标 ∉ 区间标签（他段 paragraph / SECTION）→ 保守 // TODO-GOTO 人工核对（目标为已知 SECTION 时保留 call+return），不臆测跳出后物理落点（D14-4）"
     sample:
       - cobol: "PERFORM 2000-INIT THRU 2000-INIT-EXIT   (区间仅本段)"
         java:  "p2000Init();"
+      - cobol: "PERFORM 2000-PA THRU 2000-PC   (区间内 2000-PB 回跳 GO TO 2000-PA，步骤14)"
+        java:  'this.pa2000ThruPc2000(wsaa);   // 合成方法体内 switch(__pc) 状态机，回跳 __pc="2000-PA"; continue FLOW; 循环不丢'
       - cobol: "PERFORM 1000-A THRU 3000-C   (跨段：A→B→C 三段)"
         java:  "p1000A(); p2000B(); p3000C();   // PERFORM 1000-A THRU 3000-C（展开 3 段）"
       - cobol: "PERFORM UNTIL WSAA-EOF = 'Y' READ ELPO-FILE END-PERFORM"

@@ -23,8 +23,17 @@ class Leaf:
 
 
 @dataclass
+class MoveStmt:
+    """MOVE src TO dst…（步骤18 绞杀项3①）：本步只保 token，语义由公用 translate_move 解析。"""
+    tokens: list[str] = field(default_factory=list)
+    raw: str = ""
+    lineno: int = 0
+
+
+@dataclass
 class GotoStmt:
     target: ProcRef | None = None     # 已解析的过程引用（解析失败为 None）
+    tokens: list[str] = field(default_factory=list)   # 原始 token 串（供 leaf.translate_control 复刻 _sk_control，镜像 CallStmt 步骤21）
     raw: str = ""
     lineno: int = 0
 
@@ -33,6 +42,7 @@ class GotoStmt:
 class CallStmt:
     name: str | None = None           # 取自 CALL 'XXX'
     using: list[str] = field(default_factory=list)
+    tokens: list[str] = field(default_factory=list)   # 原始 token 串（供 leaf.translate_call 解析 USING/参数，镜像 MoveStmt）
     raw: str = ""
     lineno: int = 0
 
