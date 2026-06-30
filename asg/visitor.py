@@ -11,6 +11,7 @@ from asg import nodes
 from translator.leaf import (
     translate_move, translate_condition, translate_perform_loop, translate_call,
     translate_arith_assign, translate_control, translate_evaluate, evaluate_case_label,
+    translate_leaf_stmt,
 )
 
 
@@ -104,10 +105,7 @@ class LeafJavaVisitor(AsgVisitor):
         两者 verb 集互斥、均与旧 rules 同函数同 ctx → 产物逐字符一致；俱兜不住（STRING/未固化/
         解析失败）→ // TODO-LEAF 占位。占位单调收敛（只减不增）。"""
         def _render():
-            lines, ok = translate_arith_assign(node.tokens, self.ctx)
-            if ok:
-                return lines
-            lines, ok = translate_control(node.tokens, self.ctx)
+            lines, ok = translate_leaf_stmt(node.tokens, self.ctx)
             return lines if ok else [f"// TODO-LEAF: {node.raw}"]
         return self._with_rebind(node, _render)
 

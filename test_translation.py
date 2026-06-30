@@ -1694,6 +1694,53 @@ class TestAsgLeafArithVisitor(unittest.TestCase):
         self.assertNotIn("    // TODO-LEAF: ADD 2 TO WSAA-COUNT", out)
 
 
+class TestUnifiedLeafEntry(unittest.TestCase):
+    """Step 31: rules and ASG visitor share translator.leaf.translate_leaf_stmt."""
+
+    def _ctx(self):
+        ctx = _leaf_ctx(field_type_map={"wsaaCount": {"type": "int"}})
+        ctx.system_programs = {"SYSERR": {"java_code": "throw new RuntimeException()"}}
+        return ctx
+
+    def test_translate_leaf_stmt_matches_rules_dispatch_for_supported_verbs(self):
+        from translator.leaf import translate_leaf_stmt
+        import translator.rules as rules
+
+        ctx = self._ctx()
+        cases = [
+            "MOVE 1 TO WSAA-COUNT",
+            "ADD 1 TO WSAA-COUNT",
+            "CALL 'SYSERR'",
+        ]
+        for line in cases:
+            toks = line.split()
+            self.assertEqual(translate_leaf_stmt(toks, ctx), rules._dispatch_leaf(toks, ctx))
+
+    def test_translate_leaf_stmt_handles_control_leaf_words(self):
+        from translator.leaf import translate_leaf_stmt
+
+        self.assertEqual(translate_leaf_stmt(["CONTINUE"], self._ctx()), ([";  // CONTINUE"], True))
+
+    def test_translate_leaf_stmt_falls_through_for_unmigrated_verbs(self):
+        from translator.leaf import translate_leaf_stmt
+
+        self.assertEqual(translate_leaf_stmt("STRING WSAA-A INTO WSAA-B".split(), self._ctx()),
+                         ([], False))
+
+    def test_rules_and_asg_leaf_share_supported_output(self):
+        from asg import Leaf, LeafJavaVisitor
+        from translator.segmenter import Stmt
+        import translator.rules as rules
+
+        ctx = self._ctx()
+        stmt = Stmt(kind="simple", tokens="ADD 1 TO WSAA-COUNT".split(), raw="ADD 1 TO WSAA-COUNT")
+        node = Leaf(tokens=list(stmt.tokens), raw=stmt.raw)
+
+        lines, matched = rules.translate_leaf(stmt, ctx)
+        self.assertTrue(matched)
+        self.assertEqual(LeafJavaVisitor(ctx).visit(node), lines)
+
+
 class TestDiffAsgVsLegacyArith(unittest.TestCase):
     """③ 整程序上旧/新两路 ARITH 的 (lines,matched) 逐字符一致（INITIALIZE/SET/ADD/SUBTRACT/COMPUTE，含嵌套于 IF）。"""
 
