@@ -74,12 +74,67 @@ class EvaluateStmt:
     lineno: int = 0
 
 
+@dataclass
+class BegnForeachStmt:
+    """BEGN+NEXTR 自跳循环吸收后的结构节点（步骤25）：相3 渲染为 List + for-each。"""
+    pfx: str = ""
+    name: str = ""
+    keys: list[tuple[str, str]] = field(default_factory=list)
+    filters: list = field(default_factory=list)
+    body: list = field(default_factory=list)
+    raw: str = ""
+    lineno: int = 0
+
+
+@dataclass
+class BegnSingleStmt:
+    """单次 BEGN 等值定位吸收后的结构节点（步骤26）：相3 渲染为 findBy...Begn + isEmpty 分支。"""
+    pfx: str = ""
+    name: str = ""
+    keys: list[tuple[str, str]] = field(default_factory=list)
+    then_body: list = field(default_factory=list)
+    raw: str = ""
+    lineno: int = 0
+
+
+@dataclass
+class IoReadSingleStmt:
+    """READR/READS 单条读吸收后的结构节点（步骤27）：finder + null 判断/try-catch。"""
+    pfx: str = ""
+    name: str = ""
+    func: str = ""
+    keys: list[tuple[str, str]] = field(default_factory=list)
+    mode: str = "plain"  # plain | ok | notok | error
+    then_body: list = field(default_factory=list)
+    else_body: list = field(default_factory=list)
+    try_tail: list = field(default_factory=list)
+    raw: str = ""
+    lineno: int = 0
+
+
 # ── 结构节点（Program → Section → Paragraph）──────────────────────────────────
+
+@dataclass
+class IoWriteSingleStmt:
+    """UPDAT/WRITR/DELET single write IO absorbed as save/delete structure."""
+    pfx: str = ""
+    name: str = ""
+    func: str = ""
+    is_new: bool = False
+    is_delete: bool = False
+    setters: list = field(default_factory=list)
+    mode: str = "plain"  # plain | error
+    then_body: list = field(default_factory=list)
+    try_tail: list = field(default_factory=list)
+    raw: str = ""
+    lineno: int = 0
+
 
 @dataclass
 class Paragraph:
     label: str | None = None          # None 表段首无标号块
     stmts: list = field(default_factory=list)     # list[Node]
+    body_lines: list[str] = field(default_factory=list)  # 原始 COBOL 行（供 PERFORM paragraph/THRU 登记 pending 方法）
     lineno: int = 0
 
 

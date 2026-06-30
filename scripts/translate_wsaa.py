@@ -52,7 +52,7 @@ def main() -> int:
     java = render_wsaa(roots, args.program)
     Path(args.outfile).write_text(java, encoding="utf-8")
 
-    print(f"✓ 已生成 {args.outfile}（{java.count(chr(10)) + 1} 行）")
+    print(f"OK generated {args.outfile} ({java.count(chr(10)) + 1} lines)")
     print("自检统计：")
     for k, v in _stats(roots).items():
         print(f"  {k:14s}: {v}")

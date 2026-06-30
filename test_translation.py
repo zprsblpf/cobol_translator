@@ -1868,5 +1868,703 @@ class TestDiffAsgVsLegacyControl(unittest.TestCase):
         self.assertEqual([x[1] for x in legacy], [x[1] for x in asg])
 
 
+class TestAsgSectionVisitorFlow(unittest.TestCase):
+    """步骤24：ASG SectionJavaVisitor 迁入 paragraph 装配与 flow dispatch。"""
+
+    def _ctx(self, proc_order=None, sections=None):
+        import translator.rules as r
+        sections = sections or []
+        return r.Ctx(field_type_map={},
+                     section_to_method=lambda s: "p_" + s.replace("-", "").lower(),
+                     known_sections=set(sections),
+                     section_order=list(sections),
+                     proc_order=list(proc_order or []))
+
+    def test_flat_paragraphs_without_goto(self):
+        from asg import Section, Paragraph, MoveStmt, SectionJavaVisitor
+        ctx = self._ctx()
+        sec = Section(name="S", paragraphs=[
+            Paragraph(label="PARA-A", stmts=[MoveStmt(tokens="MOVE 1 TO X".split(), raw="MOVE 1 TO X")]),
+            Paragraph(label="PARA-B", stmts=[MoveStmt(tokens="MOVE 2 TO Y".split(), raw="MOVE 2 TO Y")]),
+        ])
+        out = "\n".join(SectionJavaVisitor(ctx).render_section(sec))
+        self.assertIn("// paragraph PARA-A", out)
+        self.assertIn("// paragraph PARA-B", out)
+        self.assertNotIn("switch (__pc)", out)
+
+    def test_back_edge_goto_uses_state_machine(self):
+        from asg import Section, Paragraph, GotoStmt, MoveStmt, SectionJavaVisitor
+        from asg.registry import ProcRef
+        ctx = self._ctx()
+        sec = Section(name="S", paragraphs=[
+            Paragraph(label="PARA-A", stmts=[MoveStmt(tokens="MOVE 1 TO X".split(), raw="MOVE 1 TO X")]),
+            Paragraph(label="PARA-B", stmts=[GotoStmt(target=ProcRef("PARA-A"), tokens="GO TO PARA-A".split())]),
+        ])
+        out = "\n".join(SectionJavaVisitor(ctx).render_section(sec))
+        self.assertIn("switch (__pc)", out)
+        self.assertIn('__pc = "PARA-A"; continue FLOW;', out)
+
+    def test_force_sm_forward_goto(self):
+        from asg import Section, Paragraph, GotoStmt, MoveStmt, SectionJavaVisitor
+        from asg.registry import ProcRef
+        ctx = self._ctx()
+        sec = Section(name="S", paragraphs=[
+            Paragraph(label="PARA-A", stmts=[GotoStmt(target=ProcRef("PARA-C"), tokens="GO TO PARA-C".split())]),
+            Paragraph(label="PARA-B", stmts=[MoveStmt(tokens="MOVE 2 TO Y".split(), raw="MOVE 2 TO Y")]),
+            Paragraph(label="PARA-C", stmts=[MoveStmt(tokens="MOVE 3 TO Z".split(), raw="MOVE 3 TO Z")]),
+        ])
+        out = "\n".join(SectionJavaVisitor(ctx, force_sm=True).render_section(sec))
+        self.assertIn("switch (__pc)", out)
+        self.assertIn('__pc = "PARA-C"; continue FLOW;', out)
+
+
+class TestAsgSectionVisitorPerformTarget(unittest.TestCase):
+    """步骤24：PERFORM out-of-line 目标解析迁入 SectionJavaVisitor。"""
+
+    def _ctx(self, proc_order=None, sections=None):
+        import translator.rules as r
+        sections = sections or []
+        return r.Ctx(field_type_map={},
+                     section_to_method=lambda s: "p_" + s.replace("-", "").lower(),
+                     known_sections=set(sections),
+                     section_order=list(sections),
+                     proc_order=list(proc_order or []))
+
+    def test_perform_section(self):
+        from asg import PerformStmt, SectionJavaVisitor
+        from asg.registry import ProcRef
+        ctx = self._ctx(sections=["A-SEC"])
+        node = PerformStmt(target=ProcRef("A-SEC"), header=["A-SEC"])
+        self.assertEqual(SectionJavaVisitor(ctx).visit(node), ["this.p_asec();"])
+
+    def test_perform_single_paragraph_registers_pending(self):
+        from asg import PerformStmt, SectionJavaVisitor
+        from asg.registry import ProcRef
+        proc = [("PARA-X", "paragraph", "S", ["       MOVE 1 TO X."])]
+        ctx = self._ctx(proc_order=proc)
+        node = PerformStmt(target=ProcRef("PARA-X"), header=["PARA-X"])
+        out = "\n".join(SectionJavaVisitor(ctx).visit(node))
+        self.assertIn("this.p_parax();", out)
+        self.assertEqual(ctx.pending_range_methods["p_parax"], [("PARA-X", ["       MOVE 1 TO X."])])
+
+    def test_perform_paragraph_thru_registers_pending(self):
+        from asg import PerformStmt, SectionJavaVisitor
+        from asg.registry import ProcRef
+        proc = [("PARA-A", "paragraph", "S", ["       MOVE 1 TO X."]),
+                ("PARA-B", "paragraph", "S", ["       MOVE 2 TO Y."])]
+        ctx = self._ctx(proc_order=proc)
+        node = PerformStmt(target=ProcRef("PARA-A"), thru=ProcRef("PARA-B"),
+                           header=["PARA-A", "THRU", "PARA-B"])
+        out = "\n".join(SectionJavaVisitor(ctx).visit(node))
+        self.assertIn("this.p_paraaThruP_parab();", out)
+        self.assertEqual(ctx.pending_range_methods["p_paraaThruP_parab"],
+                         [("PARA-A", ["       MOVE 1 TO X."]),
+                          ("PARA-B", ["       MOVE 2 TO Y."])])
+
+
+class TestDiffAsgVsLegacySection(unittest.TestCase):
+    """步骤24：整程序 SECTION 骨架旧/新两路逐字符一致（不含结构吸收 pass）。"""
+
+    SRC = (
+        "       IDENTIFICATION DIVISION.\n"
+        "       PROGRAM-ID. TSECT.\n"
+        "       DATA DIVISION.\n"
+        "       WORKING-STORAGE SECTION.\n"
+        "       01 WS-X PIC 9(02) VALUE 0.\n"
+        "       PROCEDURE DIVISION.\n"
+        "       1000-MAIN SECTION.\n"
+        "       PARA-A.\n"
+        "           MOVE 1 TO WS-X.\n"
+        "       PARA-B.\n"
+        "           IF WS-X = 1\n"
+        "               GO TO PARA-A\n"
+        "           END-IF.\n"
+        "           EXIT.\n"
+    )
+
+    def test_legacy_equals_asg_section(self):
+        from translator.skeleton_gen.body_context import build_body_ctx
+        mod = TestDiffAsgVsLegacy()._harness()
+        prog = TestAsgMoveLift()._parse(self.SRC)
+        ctx1, _ = build_body_ctx(prog)
+        ctx2, _ = build_body_ctx(prog)
+        legacy = mod._legacy_sections(prog, ctx1)
+        asg = mod._asg_sections(prog, ctx2)
+        self.assertEqual(legacy, asg)
+
+
+class TestAsgBegnForeachRewrite(unittest.TestCase):
+    """步骤25：ASG 侧 BEGN+NEXTR 自跳循环 rewrite。"""
+
+    SRC = (
+        "       IDENTIFICATION DIVISION.\n"
+        "       PROGRAM-ID. TBEGN.\n"
+        "       DATA DIVISION.\n"
+        "       WORKING-STORAGE SECTION.\n"
+        "       01 WSAA-KEY PIC X(02).\n"
+        "       01 WSAA-OUT PIC X(02).\n"
+        "       01 ELPO-PARAMS.\n"
+        "          03 ELPO-FUNCTION PIC X(05).\n"
+        "       PROCEDURE DIVISION.\n"
+        "       1000-MAIN SECTION.\n"
+        "       SETUP-PARA.\n"
+        "           MOVE WSAA-KEY TO ELPO-CHDRNUM.\n"
+        "           MOVE BEGN TO ELPO-FUNCTION.\n"
+        "       LOOP-PARA.\n"
+        "           CALL 'ELPOIO' USING ELPO-PARAMS.\n"
+        "           IF ELPO-STATUZ NOT = O-K OR ELPO-CHDRNUM NOT = WSAA-KEY\n"
+        "               GO TO EXIT-PARA\n"
+        "           END-IF.\n"
+        "           MOVE ELPO-DATA TO WSAA-OUT.\n"
+        "           MOVE NEXTR TO ELPO-FUNCTION.\n"
+        "           GO TO LOOP-PARA.\n"
+        "       EXIT-PARA.\n"
+        "           EXIT.\n"
+    )
+
+    def _program_and_ctx(self):
+        from translator.skeleton_gen.body_context import build_body_ctx
+        prog = TestAsgMoveLift()._parse(self.SRC)
+        ctx, _ = build_body_ctx(prog)
+        return prog, ctx
+
+    def test_rewrite_replaces_loop_and_strips_setup(self):
+        from asg import build_asg, BegnForeachStmt
+        from asg.structure_rewrite import rewrite_begn_foreach
+        prog, ctx = self._program_and_ctx()
+        sec = build_asg(prog).sections[0]
+        rewritten = rewrite_begn_foreach(sec.paragraphs, ctx)
+        setup = rewritten[0]
+        loop = rewritten[1]
+        self.assertEqual(setup.stmts, [])
+        self.assertIsInstance(loop.stmts[0], BegnForeachStmt)
+        self.assertEqual(loop.stmts[0].pfx, "ELPO")
+        self.assertEqual(loop.stmts[0].keys, [("CHDRNUM", "WSAA-KEY")])
+
+    def test_non_adjacent_exit_not_rewritten(self):
+        from asg import build_asg, Paragraph, MoveStmt, BegnForeachStmt
+        from asg.structure_rewrite import rewrite_begn_foreach
+        prog, ctx = self._program_and_ctx()
+        sec = build_asg(prog).sections[0]
+        paras = list(sec.paragraphs)
+        paras.insert(2, Paragraph(label="MIDDLE-PARA",
+                                  stmts=[MoveStmt(tokens="MOVE 1 TO WSAA-OUT".split())]))
+        rewritten = rewrite_begn_foreach(paras, ctx)
+        self.assertFalse(any(isinstance(st, BegnForeachStmt)
+                             for para in rewritten for st in para.stmts))
+
+
+class TestAsgBegnForeachVisitor(unittest.TestCase):
+    """步骤25：BEGN foreach 经 SectionJavaVisitor 渲染，并支持 struct_rebind。"""
+
+    def test_legacy_equals_asg_section_begn_foreach(self):
+        from translator.skeleton_gen.body_context import build_body_ctx
+        mod = TestDiffAsgVsLegacy()._harness()
+        prog = TestAsgMoveLift()._parse(TestAsgBegnForeachRewrite.SRC)
+        ctx1, _ = build_body_ctx(prog)
+        ctx2, _ = build_body_ctx(prog)
+        legacy = mod._legacy_sections(prog, ctx1)
+        asg = mod._asg_sections(prog, ctx2)
+        self.assertEqual(legacy, asg)
+        rendered = "\n".join(asg[0][1])
+        self.assertIn("List<ElpoRecord> elpoList = elpoRepository.findByChdrnumBegn(wsaaKey);", rendered)
+        self.assertIn("for (ElpoRecord elpo : elpoList) {", rendered)
+        self.assertIn("wsaaOut = elpo.getData();", rendered)
+        self.assertNotIn("setFunction", rendered)
+
+
+class TestAsgBegnSingleRewrite(unittest.TestCase):
+    """步骤26：ASG 侧单次 BEGN rewrite。"""
+
+    SRC = (
+        "       IDENTIFICATION DIVISION.\n"
+        "       PROGRAM-ID. TBEG1.\n"
+        "       DATA DIVISION.\n"
+        "       WORKING-STORAGE SECTION.\n"
+        "       01 WSAA-KEY PIC X(02).\n"
+        "       01 WSAA-OUT PIC X(02).\n"
+        "       01 ELPO-PARAMS.\n"
+        "          03 ELPO-FUNCTION PIC X(05).\n"
+        "       PROCEDURE DIVISION.\n"
+        "       1000-MAIN SECTION.\n"
+        "       SINGLE-PARA.\n"
+        "           MOVE SPACES TO ELPO-PARAMS.\n"
+        "           MOVE WSAA-KEY TO ELPO-CHDRNUM.\n"
+        "           MOVE BEGN TO ELPO-FUNCTION.\n"
+        "           CALL 'ELPOIO' USING ELPO-PARAMS.\n"
+        "           IF ELPO-STATUZ NOT = O-K OR ELPO-CHDRNUM NOT = WSAA-KEY\n"
+        "               MOVE 1 TO WSAA-OUT\n"
+        "           END-IF.\n"
+        "           MOVE 2 TO WSAA-OUT.\n"
+    )
+
+    def _program_and_ctx(self):
+        from translator.skeleton_gen.body_context import build_body_ctx
+        prog = TestAsgMoveLift()._parse(self.SRC)
+        ctx, _ = build_body_ctx(prog)
+        return prog, ctx
+
+    def test_rewrite_inserts_begn_single_preserves_after(self):
+        from asg import build_asg, BegnSingleStmt, MoveStmt
+        from asg.structure_rewrite import rewrite_begn_single
+        prog, ctx = self._program_and_ctx()
+        sec = build_asg(prog).sections[0]
+        rewritten = rewrite_begn_single(sec.paragraphs, ctx)
+        stmts = rewritten[0].stmts
+        self.assertIsInstance(stmts[0], BegnSingleStmt)
+        self.assertEqual(stmts[0].keys, [("CHDRNUM", "WSAA-KEY")])
+        self.assertIsInstance(stmts[1], MoveStmt)
+        self.assertEqual(stmts[1].tokens[:2], ["MOVE", "2"])
+
+    def test_then_with_goto_not_rewritten(self):
+        from asg import build_asg, GotoStmt, BegnSingleStmt
+        from asg.registry import ProcRef
+        from asg.structure_rewrite import rewrite_begn_single
+        prog, ctx = self._program_and_ctx()
+        sec = build_asg(prog).sections[0]
+        if_node = sec.paragraphs[0].stmts[4]
+        if_node.then = [GotoStmt(target=ProcRef("EXIT-PARA"), tokens="GO TO EXIT-PARA".split())]
+        rewritten = rewrite_begn_single(sec.paragraphs, ctx)
+        self.assertFalse(any(isinstance(st, BegnSingleStmt)
+                             for para in rewritten for st in para.stmts))
+
+
+class TestAsgBegnSingleVisitor(unittest.TestCase):
+    """步骤26：单次 BEGN 经 SectionJavaVisitor 渲染，并与旧路逐字符一致。"""
+
+    def test_legacy_equals_asg_section_begn_single(self):
+        from translator.skeleton_gen.body_context import build_body_ctx
+        mod = TestDiffAsgVsLegacy()._harness()
+        prog = TestAsgMoveLift()._parse(TestAsgBegnSingleRewrite.SRC)
+        ctx1, _ = build_body_ctx(prog)
+        ctx2, _ = build_body_ctx(prog)
+        legacy = mod._legacy_sections(prog, ctx1)
+        asg = mod._asg_sections(prog, ctx2)
+        self.assertEqual(legacy, asg)
+        rendered = "\n".join(asg[0][1])
+        self.assertIn("List<ElpoRecord> elpoList = elpoRepository.findByChdrnumBegn(wsaaKey);", rendered)
+        self.assertIn("if (elpoList.isEmpty()) {", rendered)
+        self.assertIn("wsaaOut = 1;", rendered)
+        self.assertIn("wsaaOut = 2;", rendered)
+
+
+class TestAsgReadrSingleRewrite(unittest.TestCase):
+    """步骤27：ASG 侧 READR/READS 单条读 rewrite。"""
+
+    SRC_OK = (
+        "       IDENTIFICATION DIVISION.\n"
+        "       PROGRAM-ID. TREAD.\n"
+        "       DATA DIVISION.\n"
+        "       WORKING-STORAGE SECTION.\n"
+        "       01 WSAA-KEY PIC X(02).\n"
+        "       01 WSAA-OUT PIC X(02).\n"
+        "       01 ELPO-PARAMS.\n"
+        "          03 ELPO-FUNCTION PIC X(05).\n"
+        "       PROCEDURE DIVISION.\n"
+        "       1000-MAIN SECTION.\n"
+        "       READ-PARA.\n"
+        "           MOVE SPACES TO ELPO-PARAMS.\n"
+        "           MOVE WSAA-KEY TO ELPO-CHDRNUM.\n"
+        "           MOVE READR TO ELPO-FUNCTION.\n"
+        "           CALL 'ELPOIO' USING ELPO-PARAMS.\n"
+        "           IF ELPO-STATUZ = O-K\n"
+        "               MOVE ELPO-DATA TO WSAA-OUT\n"
+        "           END-IF.\n"
+    )
+
+    SRC_ERROR = (
+        "       IDENTIFICATION DIVISION.\n"
+        "       PROGRAM-ID. TRERR.\n"
+        "       DATA DIVISION.\n"
+        "       WORKING-STORAGE SECTION.\n"
+        "       01 WSAA-KEY PIC X(02).\n"
+        "       01 WSAA-OUT PIC X(02).\n"
+        "       01 ITDM-PARAMS.\n"
+        "          03 ITDM-FUNCTION PIC X(05).\n"
+        "       PROCEDURE DIVISION.\n"
+        "       1000-MAIN SECTION.\n"
+        "       READ-PARA.\n"
+        "           MOVE SPACES TO ITDM-PARAMS.\n"
+        "           MOVE WSAA-KEY TO ITDM-ITEMKEY.\n"
+        "           MOVE READR TO ITDM-FUNCTION.\n"
+        "           CALL 'ITDMIO' USING ITDM-PARAMS.\n"
+        "           IF ITDM-STATUZ NOT = O-K AND ITDM-STATUZ NOT = ENDP\n"
+        "               PERFORM 580-DB-ERROR\n"
+        "           END-IF.\n"
+        "           MOVE ITDM-VALUE TO WSAA-OUT.\n"
+        "       580-DB-ERROR SECTION.\n"
+        "           EXIT.\n"
+    )
+
+    def _program_and_ctx(self, src):
+        from translator.skeleton_gen.body_context import build_body_ctx
+        prog = TestAsgMoveLift()._parse(src)
+        ctx, _ = build_body_ctx(prog)
+        return prog, ctx
+
+    def test_rewrite_ok_mode(self):
+        from asg import build_asg, IoReadSingleStmt
+        from asg.structure_rewrite import rewrite_readr_single
+        prog, ctx = self._program_and_ctx(self.SRC_OK)
+        sec = build_asg(prog).sections[0]
+        rewritten = rewrite_readr_single(sec.paragraphs, ctx)
+        stmt = rewritten[0].stmts[0]
+        self.assertIsInstance(stmt, IoReadSingleStmt)
+        self.assertEqual(stmt.mode, "ok")
+        self.assertEqual(stmt.keys, [("CHDRNUM", "WSAA-KEY")])
+
+    def test_rewrite_error_mode_consumes_tail(self):
+        from asg import build_asg, IoReadSingleStmt
+        from asg.structure_rewrite import rewrite_readr_single
+        prog, ctx = self._program_and_ctx(self.SRC_ERROR)
+        sec = build_asg(prog).sections[0]
+        rewritten = rewrite_readr_single(sec.paragraphs, ctx)
+        stmt = rewritten[0].stmts[0]
+        self.assertIsInstance(stmt, IoReadSingleStmt)
+        self.assertEqual(stmt.mode, "error")
+        self.assertTrue(stmt.try_tail)
+        self.assertEqual(len(rewritten[0].stmts), 1)
+
+    def test_unknown_statuz_not_rewritten(self):
+        from asg import build_asg, IoReadSingleStmt
+        from asg.structure_rewrite import rewrite_readr_single
+        src = self.SRC_OK.replace("IF ELPO-STATUZ = O-K", "IF ELPO-STATUZ = WEIRD")
+        prog, ctx = self._program_and_ctx(src)
+        sec = build_asg(prog).sections[0]
+        rewritten = rewrite_readr_single(sec.paragraphs, ctx)
+        self.assertFalse(any(isinstance(st, IoReadSingleStmt)
+                             for para in rewritten for st in para.stmts))
+
+
+class TestAsgReadrSingleVisitor(unittest.TestCase):
+    """步骤27：READR 单条读经 SectionJavaVisitor 渲染，并与旧路逐字符一致。"""
+
+    def test_legacy_equals_asg_section_readr_ok(self):
+        from translator.skeleton_gen.body_context import build_body_ctx
+        mod = TestDiffAsgVsLegacy()._harness()
+        prog = TestAsgMoveLift()._parse(TestAsgReadrSingleRewrite.SRC_OK)
+        ctx1, _ = build_body_ctx(prog)
+        ctx2, _ = build_body_ctx(prog)
+        legacy = mod._legacy_sections(prog, ctx1)
+        asg = mod._asg_sections(prog, ctx2)
+        self.assertEqual(legacy, asg)
+        rendered = "\n".join(asg[0][1])
+        self.assertIn("ElpoRecord elpo = elpoRepository.findByChdrnumReadr(wsaaKey);", rendered)
+        self.assertIn("if (elpo != null) {", rendered)
+        self.assertIn("wsaaOut = elpo.getData();", rendered)
+
+    def test_legacy_equals_asg_section_readr_error(self):
+        from translator.skeleton_gen.body_context import build_body_ctx
+        mod = TestDiffAsgVsLegacy()._harness()
+        prog = TestAsgMoveLift()._parse(TestAsgReadrSingleRewrite.SRC_ERROR)
+        ctx1, _ = build_body_ctx(prog)
+        ctx2, _ = build_body_ctx(prog)
+        legacy = mod._legacy_sections(prog, ctx1)
+        asg = mod._asg_sections(prog, ctx2)
+        self.assertEqual(legacy, asg)
+        rendered = "\n".join(asg[0][1])
+        self.assertIn("try {", rendered)
+        self.assertIn("ItdmRecord itdm = itdmRepository.findByItemkeyReadr(wsaaKey);", rendered)
+        self.assertIn("} catch (Exception e) {", rendered)
+        self.assertIn("wsaaOut = itdm.getValue();", rendered)
+
+
+class TestAsgWriteSingleRewrite(unittest.TestCase):
+    """步骤28：ASG 侧 UPDAT/WRITR/DELET 单条写 IO rewrite。"""
+
+    SRC_WRITR = (
+        "       IDENTIFICATION DIVISION.\n"
+        "       PROGRAM-ID. TWRIT.\n"
+        "       DATA DIVISION.\n"
+        "       WORKING-STORAGE SECTION.\n"
+        "       01 WSAA-VAL PIC X(02).\n"
+        "       01 TMLCLST-PARAMS.\n"
+        "          03 TMLCLST-FUNCTION PIC X(05).\n"
+        "       PROCEDURE DIVISION.\n"
+        "       1000-MAIN SECTION.\n"
+        "       WRITE-PARA.\n"
+        "           MOVE SPACES TO TMLCLST-PARAMS.\n"
+        "           MOVE WSAA-VAL TO TMLCLST-FIELD.\n"
+        "           MOVE WRITR TO TMLCLST-FUNCTION.\n"
+        "           CALL 'TMLCLSTIO' USING TMLCLST-PARAMS.\n"
+    )
+
+    SRC_UPDAT_ERROR = (
+        "       IDENTIFICATION DIVISION.\n"
+        "       PROGRAM-ID. TUPDT.\n"
+        "       DATA DIVISION.\n"
+        "       WORKING-STORAGE SECTION.\n"
+        "       01 WSAA-NEW-VALUE PIC X(02).\n"
+        "       01 WSAA-OUT PIC X(02).\n"
+        "       01 TMLCLST-PARAMS.\n"
+        "          03 TMLCLST-FUNCTION PIC X(05).\n"
+        "       PROCEDURE DIVISION.\n"
+        "       1000-MAIN SECTION.\n"
+        "       UPDATE-PARA.\n"
+        "           MOVE WSAA-NEW-VALUE TO TMLCLST-FIELD.\n"
+        "           MOVE UPDAT TO TMLCLST-FUNCTION.\n"
+        "           CALL 'TMLCLSTIO' USING TMLCLST-PARAMS.\n"
+        "           IF TMLCLST-STATUZ NOT = O-K\n"
+        "               PERFORM 9999-FATAL-ERROR\n"
+        "           END-IF.\n"
+        "           MOVE TMLCLST-FIELD TO WSAA-OUT.\n"
+        "       9999-FATAL-ERROR SECTION.\n"
+        "           EXIT.\n"
+    )
+
+    SRC_DELET = (
+        "       IDENTIFICATION DIVISION.\n"
+        "       PROGRAM-ID. TDELT.\n"
+        "       DATA DIVISION.\n"
+        "       WORKING-STORAGE SECTION.\n"
+        "       01 TMLCLST-PARAMS.\n"
+        "          03 TMLCLST-FUNCTION PIC X(05).\n"
+        "       PROCEDURE DIVISION.\n"
+        "       1000-MAIN SECTION.\n"
+        "       DELETE-PARA.\n"
+        "           MOVE DELET TO TMLCLST-FUNCTION.\n"
+        "           CALL 'TMLCLSTIO' USING TMLCLST-PARAMS.\n"
+    )
+
+    @staticmethod
+    def _install_write_ops(ctx):
+        ctx.io_default_pattern = {
+            "class_suffix": "Repository",
+            "field_suffix": "Repository",
+            "param_struct_suffix": "-PARAMS",
+            "import_package": "com.example.repository",
+            "operations": {
+                "READR": "findByKeyReadr({key})",
+                "UPDAT": "save({entity})",
+                "WRITR": "save({entity})",
+                "DELET": "delete({entity})",
+            },
+        }
+        ctx.io_struct_prefixes.add("TMLCLST")
+        return ctx
+
+    def _program_and_ctx(self, src):
+        from translator.skeleton_gen.body_context import build_body_ctx
+        prog = TestAsgMoveLift()._parse(src)
+        ctx, _ = build_body_ctx(prog)
+        return prog, self._install_write_ops(ctx)
+
+    def test_rewrite_writr_new_plain(self):
+        from asg import build_asg, IoWriteSingleStmt
+        from asg.structure_rewrite import rewrite_write_single
+        prog, ctx = self._program_and_ctx(self.SRC_WRITR)
+        sec = build_asg(prog).sections[0]
+        rewritten = rewrite_write_single(sec.paragraphs, ctx)
+        stmt = rewritten[0].stmts[0]
+        self.assertIsInstance(stmt, IoWriteSingleStmt)
+        self.assertTrue(stmt.is_new)
+        self.assertFalse(stmt.is_delete)
+        self.assertEqual(stmt.mode, "plain")
+        self.assertEqual(len(stmt.setters), 1)
+
+    def test_rewrite_updat_error_consumes_tail(self):
+        from asg import build_asg, IoWriteSingleStmt
+        from asg.structure_rewrite import rewrite_write_single
+        prog, ctx = self._program_and_ctx(self.SRC_UPDAT_ERROR)
+        sec = build_asg(prog).sections[0]
+        rewritten = rewrite_write_single(sec.paragraphs, ctx)
+        stmt = rewritten[0].stmts[0]
+        self.assertIsInstance(stmt, IoWriteSingleStmt)
+        self.assertFalse(stmt.is_new)
+        self.assertEqual(stmt.mode, "error")
+        self.assertTrue(stmt.try_tail)
+        self.assertEqual(len(rewritten[0].stmts), 1)
+
+    def test_rewrite_delet_delete_mode(self):
+        from asg import build_asg, IoWriteSingleStmt
+        from asg.structure_rewrite import rewrite_write_single
+        prog, ctx = self._program_and_ctx(self.SRC_DELET)
+        sec = build_asg(prog).sections[0]
+        rewritten = rewrite_write_single(sec.paragraphs, ctx)
+        stmt = rewritten[0].stmts[0]
+        self.assertIsInstance(stmt, IoWriteSingleStmt)
+        self.assertTrue(stmt.is_delete)
+
+    def test_unknown_statuz_not_rewritten(self):
+        from asg import build_asg, IoWriteSingleStmt
+        from asg.structure_rewrite import rewrite_write_single
+        src = self.SRC_UPDAT_ERROR.replace("IF TMLCLST-STATUZ NOT = O-K", "IF TMLCLST-STATUZ = WEIRD")
+        prog, ctx = self._program_and_ctx(src)
+        sec = build_asg(prog).sections[0]
+        rewritten = rewrite_write_single(sec.paragraphs, ctx)
+        self.assertFalse(any(isinstance(st, IoWriteSingleStmt)
+                             for para in rewritten for st in para.stmts))
+
+
+class TestAsgWriteSingleVisitor(unittest.TestCase):
+    """步骤28：写 IO 经 SectionJavaVisitor 渲染，并与旧路线逐字符串一致。"""
+
+    def _sections(self, src):
+        from translator.skeleton_gen.body_context import build_body_ctx
+        mod = TestDiffAsgVsLegacy()._harness()
+        prog = TestAsgMoveLift()._parse(src)
+        ctx1, _ = build_body_ctx(prog)
+        ctx2, _ = build_body_ctx(prog)
+        TestAsgWriteSingleRewrite._install_write_ops(ctx1)
+        TestAsgWriteSingleRewrite._install_write_ops(ctx2)
+        return mod._legacy_sections(prog, ctx1), mod._asg_sections(prog, ctx2)
+
+    def test_legacy_equals_asg_section_writr_new(self):
+        legacy, asg = self._sections(TestAsgWriteSingleRewrite.SRC_WRITR)
+        self.assertEqual(legacy, asg)
+        rendered = "\n".join(asg[0][1])
+        self.assertIn("TmlclstRecord tmlclst = new TmlclstRecord();", rendered)
+        self.assertIn("tmlclst.setField(wsaaVal);", rendered)
+        self.assertIn("tmlclstRepository.save(tmlclst);", rendered)
+
+    def test_legacy_equals_asg_section_updat_error(self):
+        legacy, asg = self._sections(TestAsgWriteSingleRewrite.SRC_UPDAT_ERROR)
+        self.assertEqual(legacy, asg)
+        rendered = "\n".join(asg[0][1])
+        self.assertIn("try {", rendered)
+        self.assertIn("tmlclstRepository.save(tmlclst);", rendered)
+        self.assertIn("} catch (Exception e) {", rendered)
+        self.assertIn("this.fatalError9999();", rendered)
+        self.assertIn("wsaaOut = tmlclst.getField();", rendered)
+
+    def test_legacy_equals_asg_section_delet(self):
+        legacy, asg = self._sections(TestAsgWriteSingleRewrite.SRC_DELET)
+        self.assertEqual(legacy, asg)
+        rendered = "\n".join(asg[0][1])
+        self.assertIn("tmlclstRepository.delete(tmlclst);", rendered)
+        self.assertNotIn("deleteByKey", rendered)
+
+
+class TestMainlineSectionViaAsg(unittest.TestCase):
+    """步骤29：主线 translate_section_body / pending range 默认走 SectionJavaVisitor。"""
+
+    SRC_SIMPLE = (
+        "       IDENTIFICATION DIVISION.\n"
+        "       PROGRAM-ID. TMAIN.\n"
+        "       DATA DIVISION.\n"
+        "       WORKING-STORAGE SECTION.\n"
+        "       01 WSAA-OUT PIC X(02).\n"
+        "       PROCEDURE DIVISION.\n"
+        "       1000-MAIN SECTION.\n"
+        "       MAIN-PARA.\n"
+        "           MOVE 1 TO WSAA-OUT.\n"
+    )
+
+    def _program(self, src):
+        return TestAsgMoveLift()._parse(src)
+
+    def _known_methods(self, prog, ctx):
+        return {ctx.section_to_method(s.name.upper()) for s in prog.sections}
+
+    def _legacy_body(self, prog, ctx, ws_fields, section_index=0):
+        from translator.segmenter import split_paragraphs
+        from translator.skeleton_gen import body_context as bc
+        sec = prog.sections[section_index]
+        return bc._translate_paragraphs_body_legacy(
+            split_paragraphs(sec.lines), ctx, ws_fields, "", self._known_methods(prog, ctx)
+        )
+
+    def _mainline_body(self, prog, ctx, ws_fields, section_index=0):
+        from translator.skeleton_gen.body_context import translate_section_body
+        sec = prog.sections[section_index]
+        return translate_section_body(sec.lines, ctx, ws_fields, "", self._known_methods(prog, ctx))
+
+    def test_mainline_section_matches_legacy_for_plain_section(self):
+        from translator.skeleton_gen.body_context import build_body_ctx
+        prog = self._program(self.SRC_SIMPLE)
+        ctx1, ws1 = build_body_ctx(prog)
+        ctx2, ws2 = build_body_ctx(prog)
+        self.assertEqual(self._legacy_body(prog, ctx1, ws1), self._mainline_body(prog, ctx2, ws2))
+
+    def test_mainline_uses_asg_without_calling_legacy(self):
+        from translator.skeleton_gen import body_context as bc
+        prog = self._program(self.SRC_SIMPLE)
+        ctx, ws = bc.build_body_ctx(prog)
+        original = bc._translate_paragraphs_body_legacy
+
+        def _boom(*_args, **_kwargs):
+            raise AssertionError("legacy path should not be called")
+
+        bc._translate_paragraphs_body_legacy = _boom
+        try:
+            body = self._mainline_body(prog, ctx, ws)
+        finally:
+            bc._translate_paragraphs_body_legacy = original
+        self.assertIn("wsaa.wsaaOut = 1;", body)
+
+    def test_mainline_write_io_structure_absorption(self):
+        from translator.skeleton_gen.body_context import build_body_ctx
+        prog = self._program(TestAsgWriteSingleRewrite.SRC_WRITR)
+        ctx, ws = build_body_ctx(prog)
+        TestAsgWriteSingleRewrite._install_write_ops(ctx)
+        body = self._mainline_body(prog, ctx, ws)
+        self.assertIn("TmlclstRecord tmlclst = new TmlclstRecord();", body)
+        self.assertIn("tmlclst.setField(wsaa.wsaaVal);", body)
+        self.assertIn("tmlclstRepository.save(tmlclst);", body)
+
+    def test_asg_failure_falls_back_to_legacy(self):
+        from translator.segmenter import split_paragraphs
+        from translator.skeleton_gen import body_context as bc
+        prog = self._program(self.SRC_SIMPLE)
+        ctx1, ws1 = bc.build_body_ctx(prog)
+        ctx2, ws2 = bc.build_body_ctx(prog)
+        paras = split_paragraphs(prog.sections[0].lines)
+        expected = bc._translate_paragraphs_body_legacy(paras, ctx1, ws1, "", self._known_methods(prog, ctx1))
+        original = bc._translate_paragraphs_body_asg
+
+        def _boom(*_args, **_kwargs):
+            raise RuntimeError("forced ASG failure")
+
+        bc._translate_paragraphs_body_asg = _boom
+        try:
+            actual = bc.translate_paragraphs_body(paras, ctx2, ws2, "", self._known_methods(prog, ctx2))
+        finally:
+            bc._translate_paragraphs_body_asg = original
+        self.assertEqual(expected, actual)
+
+    def test_legacy_fallback_helper_is_explicit_reference_wrapper(self):
+        from translator.segmenter import split_paragraphs
+        from translator.skeleton_gen import body_context as bc
+        prog = self._program(self.SRC_SIMPLE)
+        ctx1, ws1 = bc.build_body_ctx(prog)
+        ctx2, ws2 = bc.build_body_ctx(prog)
+        paras = split_paragraphs(prog.sections[0].lines)
+        expected = bc._translate_paragraphs_body_legacy(paras, ctx1, ws1, "", self._known_methods(prog, ctx1))
+        actual = bc._translate_paragraphs_body_legacy_fallback(
+            paras, ctx2, ws2, "", self._known_methods(prog, ctx2)
+        )
+        self.assertEqual(expected, actual)
+
+
+class TestMainlinePendingRangeViaAsg(unittest.TestCase):
+    """步骤29：pending THRU 合成区间方法也经 ASG paragraph 入口渲染。"""
+
+    def _ctx(self, proc_order):
+        import translator.rules as r
+        return r.Ctx(field_type_map={}, section_to_method=lambda s: "p_" + s.replace("-", "").lower(),
+                     known_sections=set(), section_order=[], proc_order=list(proc_order))
+
+    def test_pending_range_force_sm_matches_legacy(self):
+        import translator.rules as r
+        from translator.skeleton_gen import body_context as bc
+        proc = [("PARA-A", "paragraph", "S", ["       GO TO PARA-C."]),
+                ("PARA-B", "paragraph", "S", ["       MOVE 9 TO WS-Y."]),
+                ("PARA-C", "paragraph", "S", ["       MOVE 3 TO WS-Z."])]
+        ctx_legacy = self._ctx(proc)
+        r._perform_range(["PARA-A", "THRU", "PARA-C"], ["PARA-A", "THRU", "PARA-C"], "PARA-A", ctx_legacy, 0)
+        expected = {
+            name: bc._translate_paragraphs_body_legacy(paras, ctx_legacy, [], "", set(), force_sm=True)
+            for name, paras in dict(ctx_legacy.pending_range_methods).items()
+        }
+
+        ctx_asg = self._ctx(proc)
+        r._perform_range(["PARA-A", "THRU", "PARA-C"], ["PARA-A", "THRU", "PARA-C"], "PARA-A", ctx_asg, 0)
+        actual = bc.render_pending_range_methods(ctx_asg, ws_field_names=[], call_args="", known_methods=set())
+        self.assertEqual(expected, actual)
+        body = "\n".join(actual.values())
+        self.assertIn("switch (__pc)", body)
+        self.assertIn('__pc = "PARA-C"; continue FLOW;', body)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

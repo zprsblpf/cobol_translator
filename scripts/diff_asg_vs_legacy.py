@@ -16,7 +16,7 @@
 对应设计：步骤18 §5（MOVE）、步骤19 §5（IF）、步骤20-绞杀项3③PERFORM循环子句迁visitor设计.md §5。
 
 用法：
-    python scripts/diff_asg_vs_legacy.py <program.cob> [--verb MOVE|IF|PERFORM|CALL|ARITH|CONTROL]
+    python scripts/diff_asg_vs_legacy.py <program.cob> [--verb MOVE|IF|PERFORM|CALL|ARITH|CONTROL|SECTION]
 退出码：全等 0；有差异 1（CI/回归可断言）。
 
 范围：
@@ -35,7 +35,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from parser.cobol_parser import parse                                   # noqa: E402
 from translator.segmenter import segment, split_paragraphs             # noqa: E402
-from translator.skeleton_gen.body_context import build_body_ctx        # noqa: E402
+from translator.skeleton_gen.body_context import build_body_ctx, reset_section  # noqa: E402
 from translator.leaf import (  # noqa: E402
     translate_move, translate_condition, translate_perform_loop, translate_call, translate_arith_assign,
     translate_control, translate_evaluate, evaluate_case_label,
@@ -44,6 +44,7 @@ from translator import rules                                          # noqa: E4
 from asg import build_asg                                              # noqa: E402
 from asg import nodes as asg_nodes                                     # noqa: E402
 from asg.visitor import AsgVisitor, LeafJavaVisitor                    # noqa: E402
+from asg.section_visitor import SectionJavaVisitor                     # noqa: E402
 
 
 def _walk_segmenter_stmts(st):
@@ -296,6 +297,37 @@ def _asg_control(program, ctx) -> list[tuple[str, object]]:
     return col.out
 
 
+def _legacy_sections(program, ctx) -> list[tuple[str, object]]:
+    """legacy reference：每个 SECTION 经 rules.build_section 渲染完整骨架行。
+
+    步骤30 后 rules.build_section 不再是主线入口，只保留为 fallback 与逐字符比对参照。
+    本闸诚实覆盖 SECTION 级渲染；样例若覆盖 BEGN/READR/写 IO 结构吸收，应确保 ASG 侧已有对应 pass。
+    """
+    out: list[tuple[str, object]] = []
+    for s in program.sections:
+        reset_section(ctx)
+        paras = [(lbl, segment(body)) for lbl, body in split_paragraphs(s.lines)]
+        lines = rules.build_section(paras, ctx, force_sm=False)
+        body = "\n".join(lines)
+        for lid, leaf in ctx.leaves:
+            fill_lines, matched = rules.translate_leaf(leaf, ctx)
+            fill = "\n".join(fill_lines) if matched else f"// TODO 叶子待译: {(leaf.raw or ' '.join(leaf.tokens)).strip()}"
+            body = body.replace(f"/*__LEAF_{lid}__*/", fill)
+        out.append((s.name, tuple(body.splitlines())))
+    return out
+
+
+def _asg_sections(program, ctx) -> list[tuple[str, object]]:
+    """新路：ASG SectionJavaVisitor 渲染每个 SECTION。"""
+    out: list[tuple[str, object]] = []
+    asg_program = build_asg(program)
+    visitor = SectionJavaVisitor(ctx)
+    for section in asg_program.sections:
+        reset_section(ctx)
+        out.append((section.name, tuple(visitor.render_section(section))))
+    return out
+
+
 _SAMPLERS = {
     "MOVE": (_legacy_moves, _asg_moves),
     "IF": (_legacy_ifs, _asg_ifs),
@@ -303,6 +335,7 @@ _SAMPLERS = {
     "CALL": (_legacy_calls, _asg_calls),
     "ARITH": (_legacy_arith, _asg_arith),
     "CONTROL": (_legacy_control, _asg_control),
+    "SECTION": (_legacy_sections, _asg_sections),
 }
 
 
