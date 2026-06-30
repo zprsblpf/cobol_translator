@@ -13,6 +13,90 @@ from translator.leaf import (
     translate_arith_assign, translate_control, translate_evaluate, evaluate_case_label,
     translate_leaf_stmt,
 )
+from translator.skel import (
+    render_perform_call,
+    render_flow_dispatch, dispatch_goto, dispatch_exit,   # 步骤24B GO TO dispatch 状态机
+    rewrite_io_paras, NodeAccess,                         # 步骤24C BEGN/READR/WRITE IO 形态吸收
+)
+
+
+def _ind(n: int) -> str:
+    return "    " * n
+
+
+# ── ASG 节点访问器（步骤24C 绞杀项4 骨架装配③）──────────────────────────────────
+# 把 skel.io_rewrite 匹配器读取的 5 个节点字段映射到 ASG 节点类型（设计24C §3.2）：
+# 旧路 STMT_ACCESS 属性直读，新路按类型派生 kind + then/els/cond/subject/inline_body。
+def _asg_kind(node) -> str:
+    if isinstance(node, nodes.IfStmt):
+        return "if"
+    if isinstance(node, nodes.EvaluateStmt):
+        return "evaluate"
+    if isinstance(node, nodes.PerformStmt):
+        return "perform"
+    if isinstance(node, nodes.Raw):
+        return "raw"
+    return "simple"          # Leaf / MoveStmt / CallStmt / GotoStmt
+
+
+def _asg_tokens(node) -> list:
+    if isinstance(node, nodes.IfStmt):
+        return node.cond          # if：条件 token（镜像 Stmt(kind=if).tokens）
+    if isinstance(node, nodes.EvaluateStmt):
+        return node.subject
+    if isinstance(node, nodes.PerformStmt):
+        return node.header
+    return getattr(node, "tokens", None) or []
+
+
+def _asg_children(node) -> list:
+    if isinstance(node, nodes.IfStmt):
+        return node.then
+    if isinstance(node, nodes.PerformStmt):
+        return node.inline_body
+    return []
+
+
+def _asg_else(node) -> list:
+    return node.els if isinstance(node, nodes.IfStmt) else []
+
+
+def _asg_whens(node) -> list:
+    return node.whens if isinstance(node, nodes.EvaluateStmt) else []
+
+
+ASG_ACCESS = NodeAccess(kind=_asg_kind, tokens=_asg_tokens, children=_asg_children,
+                        else_children=_asg_else, whens=_asg_whens)
+
+
+def _asg_collect_gotos(stmts: list) -> list[str]:
+    """递归收集 ASG 段体内所有 GO TO 目标（大写）——镜像 rules._collect_gotos 的 token 口径，
+    含嵌套 IF(then/els)/EVALUATE(whens)/PERFORM(inline_body) 体内的。"""
+    out: list[str] = []
+    for st in stmts:
+        if isinstance(st, nodes.GotoStmt):
+            for t in st.tokens:
+                if t.upper() not in ("GO", "TO"):
+                    out.append(t.upper())
+                    break
+        out += _asg_collect_gotos(getattr(st, "then", None) or [])
+        out += _asg_collect_gotos(getattr(st, "els", None) or [])
+        out += _asg_collect_gotos(getattr(st, "inline_body", None) or [])
+        for _cond, body in getattr(st, "whens", None) or []:
+            out += _asg_collect_gotos(body)
+    return out
+
+
+def _asg_ends_transfer(stmts: list) -> bool:
+    """末尾顶层语句是否为无条件跳转（GO/EXIT/GOBACK/STOP）——镜像 rules._ends_with_transfer。
+    GO 在 ASG 恒为 GotoStmt；EXIT/GOBACK/STOP 为 Leaf（builder 只升 GO）。"""
+    if not stmts:
+        return False
+    last = stmts[-1]
+    if isinstance(last, nodes.GotoStmt):
+        return True
+    toks = getattr(last, "tokens", None) or []
+    return bool(toks) and toks[0].upper() in {"EXIT", "GOBACK", "STOP"}
 
 
 class AsgVisitor:
@@ -46,28 +130,47 @@ class LeafJavaVisitor(AsgVisitor):
     """
 
     def __init__(self, ctx):
-        self.ctx = ctx                    # 满足 translator.leaf.LeafCtx 契约
+        self.ctx = ctx                    # 满足 translator.leaf.LeafCtx / skel.SkelCtx 契约
 
-    def _with_rebind(self, node, fn):
-        rebind = getattr(node, "struct_rebind", None)
-        if not rebind:
-            return fn()
-        saved = {k: self.ctx.struct_objects.get(k) for k in rebind}
-        self.ctx.struct_objects.update(rebind)
-        try:
-            return fn()
-        finally:
-            for k, v in saved.items():
-                if v is None:
-                    self.ctx.struct_objects.pop(k, None)
-                else:
-                    self.ctx.struct_objects[k] = v
+    def visit_Section(self, node) -> list[str]:
+        """复刻 rules.build_section 全链：IO 形态吸收（步骤24C）→ 段级 GO TO dispatch 装配（步骤24B）。
+
+        Section.paragraphs → [(label, stmts)]，先交路径中立 rewrite_io_paras 做 BEGN/READR/WRITE IO 形态
+        段级吸收（与旧 build_section 共调同一匹配/渲染，acc=ASG_ACCESS、render_body=_render_para_body、
+        make_raw=nodes.Raw → 吸收体 Java + struct_objects 副作用逐字符一致；命中段换 Raw 节点）；再交
+        render_flow_dispatch 做状态机壳 + 段内 GO TO/EXIT dispatch（步骤24B 已一致）。
+        indent 传 0，程序级缩进由 24D 外层施加（比对在 indent 0，沿 24A 范式）。"""
+        paras = [(p.label, p.stmts) for p in node.paragraphs]
+        paras = rewrite_io_paras(
+            paras, self.ctx, acc=ASG_ACCESS,
+            render_body=self._render_para_body,
+            make_raw=lambda lines: nodes.Raw(lines=lines),
+        )
+        return render_flow_dispatch(
+            paras, self.ctx, 0,
+            render_body=self._render_para_body,
+            collect_gotos=_asg_collect_gotos,
+            ends_transfer=_asg_ends_transfer,
+        )
+
+    def visit_Raw(self, node) -> list[str]:
+        """预渲染 IO 吸收体（步骤24C）：直接吐 .lines（缩进由 _render_para_body/render_flow_dispatch 统一施加，
+        镜像旧 _skeleton_one 的 kind=="raw" 整体下沉）。"""
+        return list(node.lines)
+
+    def _render_para_body(self, stmts, indent) -> list[str]:
+        """render_flow_dispatch 的段体渲染回调（= 旧 build_skeleton(stmts, ctx, indent)）：
+        visit 每条语句（产 indent-0 相对行）后整体下沉 indent 级；空行保持空（镜像旧 _skeleton_one raw 分支）。
+        关键：render_flow_dispatch 已先设 ctx.flow_label/flow_paragraphs，故体内 GO TO/EXIT 经 dispatch 命中。"""
+        out: list[str] = []
+        for st in stmts:
+            for ln in self.visit(st):
+                out.append((_ind(indent) + ln) if ln else ln)
+        return out
 
     def visit_MoveStmt(self, node) -> list[str]:
-        def _render():
-            lines, _ok = translate_move(node.tokens, self.ctx)
-            return lines
-        return self._with_rebind(node, _render)
+        lines, _ok = translate_move(node.tokens, self.ctx)
+        return lines
 
     def visit_IfStmt(self, node) -> list[str]:
         """复刻 rules._sk_if 的控制结构形状：if (cond) { … } [else { … }]，cond=None → 整 IF 交 LLM（占位）。
@@ -76,18 +179,16 @@ class LeafJavaVisitor(AsgVisitor):
         body 仅直译已迁动词（MOVE / 嵌套 IF），未迁动词落 visit_Leaf 占位——绞杀渐进的诚实呈现
         （block 级一致须待全动词迁完，§5-项4；本步比对只在条件边界，见设计 §4.2）。
         """
-        def _render():
-            cond = translate_condition(node.cond, self.ctx)
-            if cond is None:
-                return [f"// TODO-IF: {node.raw}"]
-            lines = [f"if ({cond}) {{"]
-            lines += self._body(node.then) or ["    // (空)"]
-            if node.els:
-                lines.append("} else {")
-                lines += self._body(node.els)
-            lines.append("}")
-            return lines
-        return self._with_rebind(node, _render)
+        cond = translate_condition(node.cond, self.ctx)
+        if cond is None:
+            return [f"// TODO-IF: {node.raw}"]
+        lines = [f"if ({cond}) {{"]
+        lines += self._body(node.then) or ["    // (空)"]
+        if node.els:
+            lines.append("} else {")
+            lines += self._body(node.els)
+        lines.append("}")
+        return lines
 
     def _body(self, stmts) -> list[str]:
         """递归 visit 子节点并扁平化为 Java 行（每行加一级缩进，等价 _sk_if 的 indent+1）。"""
@@ -103,11 +204,14 @@ class LeafJavaVisitor(AsgVisitor):
         依次试：① 算术/赋值（translate_arith_assign，步骤22）→ ② 控制流叶子词
         （translate_control，步骤23：落 Leaf 的 CONTINUE/STOP/EXIT/GOBACK/NEXT）。
         两者 verb 集互斥、均与旧 rules 同函数同 ctx → 产物逐字符一致；俱兜不住（STRING/未固化/
-        解析失败）→ // TODO-LEAF 占位。占位单调收敛（只减不增）。"""
-        def _render():
-            lines, ok = translate_leaf_stmt(node.tokens, self.ctx)
-            return lines if ok else [f"// TODO-LEAF: {node.raw}"]
-        return self._with_rebind(node, _render)
+        解析失败）→ // TODO-LEAF 占位。占位单调收敛（只减不增）。
+        dispatch 模式（步骤24B）：状态机内 EXIT → dispatch_exit 产 break FLOW（与旧 _sk_control EXIT 分支
+        同函数同 ctx → 逐字符一致），先于算术/控制叶子委托。"""
+        d = dispatch_exit(node.tokens, self.ctx, 0)
+        if d is not None:
+            return d
+        lines, ok = translate_leaf_stmt(node.tokens, self.ctx)
+        return lines if ok else [f"// TODO-LEAF: {node.raw}"]
 
     def visit_GotoStmt(self, node) -> list[str]:
         """复刻 rules._sk_control 的 GO 分支（步骤23 绞杀项3⑥，并入自退役的 GotoJavaVisitor）：
@@ -115,7 +219,12 @@ class LeafJavaVisitor(AsgVisitor):
         经公用 translate_control（与旧 _sk_control flow_label=None 分支同函数同 ctx → 逐字符一致）
         译 GO TO（…EXIT→return / known_section→proc_call+return / 未知段→TODO-GOTO+return / 无 target→return）。
         GotoStmt 恒为 GO、translate_control 全覆盖；无 token 的退化节点 → return;（步骤17 demo 语义）。
-        dispatch 模式（__pc/continue FLOW）依赖 flow_label 骨架态，留骨架装配刀（设计 §1 非目标）。"""
+        dispatch 模式（步骤24B 绞杀项4②）：状态机内目标命中段内标签 → dispatch_goto 产 __pc/continue FLOW
+        （与旧 _sk_control GO 分支同函数同 ctx → 逐字符一致），先于 flow_label-无关委托。"""
+        target = node.target.name if node.target else None
+        d = dispatch_goto(target, self.ctx, 0)
+        if d is not None:
+            return d
         lines, ok = translate_control(node.tokens, self.ctx)
         return lines if ok else ["return;"]
 
@@ -126,21 +235,19 @@ class LeafJavaVisitor(AsgVisitor):
         每 WHEN 的 case 标签经 evaluate_case_label（与 _sk_evaluate 同函数 → 壳逐字符一致）；
         WHEN 体递归直译已迁动词（未迁落 visit_Leaf 占位，同 IF body 渐进）。
         subject=None / 无 whens → // TODO-EVALUATE 占位（EVALUATE TRUE/复杂 subject 交 LLM）。"""
-        def _render():
-            subj = translate_evaluate(node.subject, self.ctx)
-            if subj is None or not node.whens:
-                return [f"// TODO-EVALUATE: {node.raw}"]
-            lines = [f"switch ({subj}) {{"]
-            for cond, body in node.whens:
-                lines.append(f"    {evaluate_case_label(cond, self.ctx)}: {{")
-                for c in body:
-                    for ln in self.visit(c):
-                        lines.append(f"        {ln}")
-                lines.append("        break;")
-                lines.append("    }")
-            lines.append("}")
-            return lines
-        return self._with_rebind(node, _render)
+        subj = translate_evaluate(node.subject, self.ctx)
+        if subj is None or not node.whens:
+            return [f"// TODO-EVALUATE: {node.raw}"]
+        lines = [f"switch ({subj}) {{"]
+        for cond, body in node.whens:
+            lines.append(f"    {evaluate_case_label(cond, self.ctx)}: {{")
+            for c in body:
+                for ln in self.visit(c):
+                    lines.append(f"        {ln}")
+            lines.append("        break;")
+            lines.append("    }")
+        lines.append("}")
+        return lines
 
     def visit_PerformStmt(self, node) -> list[str]:
         """复刻 rules._sk_perform 的循环壳（步骤20 绞杀项3③·只切①循环子句）：
@@ -148,23 +255,24 @@ class LeafJavaVisitor(AsgVisitor):
         经公用 translate_perform_loop 渲染 while/for/do-while/嵌套 for（与旧 _perform_loop 同函数同 ctx
         → 循环壳逐字符一致）；loop is None → 整条交 LLM（// TODO-PERFORM 占位，复刻 _sk_perform 兜底）。
         inline_body 递归直译已迁动词（MOVE/IF/嵌套 PERFORM），未迁落 visit_Leaf 占位；
-        out-of-line（仅 target、无 inline_body）落 // TODO-PERFORM-CALL 占位——区间/目标解析属②，留后续刀（设计 §1 非目标）。
-        比对只在循环壳边界（设计 §4.2），body/目标占位不比。
+        out-of-line（仅 target、无 inline_body）经公用 render_perform_call（步骤24A 绞杀项4 骨架装配①，
+        与旧 rules._perform_range 同函数同 ctx → 调用体行 + pending_range_methods 登记副作用逐字符/逐项一致）：
+        无 THRU→单段/合成单单元、SECTION 级 THRU→按段展开、paragraph 级 THRU→合成区间方法、兜不住→TODO 退化。
+        比对在循环壳（设计 §4.2）+ 调用体（步骤24A §5）两处边界。
         """
-        def _render():
-            loop = translate_perform_loop(node.header, self.ctx, 0)
-            if loop is None:
-                return [f"// TODO-PERFORM: {node.raw}"]
-            open_lines, close_lines = loop
-            if node.inline_body:
-                body = self._body(node.inline_body)
-            elif node.target:
-                thru = f" THRU {node.thru.name}" if node.thru else ""
-                body = [f"// TODO-PERFORM-CALL: {node.target.name}{thru}"]
-            else:
-                return [f"// TODO-PERFORM: {node.raw}"]
-            return (open_lines + body + close_lines) if open_lines else body
-        return self._with_rebind(node, _render)
+        loop = translate_perform_loop(node.header, self.ctx, 0)
+        if loop is None:
+            return [f"// TODO-PERFORM: {node.raw}"]
+        open_lines, close_lines = loop
+        if node.inline_body:
+            body = self._body(node.inline_body)
+        elif node.target:
+            # token-based 复用（设计 §3.3）：与旧路同源从 header 取 target/THRU 端点，不走已解析 ref。
+            hu = [h.upper() for h in node.header]
+            body = render_perform_call(node.header, hu, node.target.name, self.ctx, 0)
+        else:
+            return [f"// TODO-PERFORM: {node.raw}"]
+        return (open_lines + body + close_lines) if open_lines else body
 
     def visit_CallStmt(self, node) -> list[str]:
         """复刻 rules 散点 CALL 兜底（步骤21 绞杀项3④·只切① _t_call）：
@@ -174,7 +282,5 @@ class LeafJavaVisitor(AsgVisitor):
         ②setup+CALL+IF 结构吸收 / ③struct_rebind 属骨架装配层，留后续刀（设计 §1 非目标）；
         比对只在 translate_call 纯函数边界（设计 §4.2），不重放 struct_function 时序。
         """
-        def _render():
-            lines, matched = translate_call(node.tokens, self.ctx)
-            return lines if matched else [f"// TODO-CALL: {node.raw}"]
-        return self._with_rebind(node, _render)
+        lines, matched = translate_call(node.tokens, self.ctx)
+        return lines if matched else [f"// TODO-CALL: {node.raw}"]

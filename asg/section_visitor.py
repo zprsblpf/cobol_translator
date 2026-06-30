@@ -261,11 +261,20 @@ class SectionJavaVisitor(LeafJavaVisitor):
 
     def _render_rebound_body(self, stmts: list, rebind: dict, indent: int) -> list[str]:
         tag_rebind_nodes(stmts, rebind)
+        saved = {pfx: self.ctx.struct_objects.get(pfx) for pfx in rebind}
+        self.ctx.struct_objects.update(rebind)
         out: list[str] = []
-        for stmt in stmts:
-            for line in self.visit(stmt):
-                out.append(_ind(indent) + line)
-        return out
+        try:
+            for stmt in stmts:
+                for line in self.visit(stmt):
+                    out.append(_ind(indent) + line)
+            return out
+        finally:
+            for pfx, old in saved.items():
+                if old is None:
+                    self.ctx.struct_objects.pop(pfx, None)
+                else:
+                    self.ctx.struct_objects[pfx] = old
 
     def _perform_target(self, node: nodes.PerformStmt, indent: int) -> list[str]:
         target = node.target.name if node.target else ""
