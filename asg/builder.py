@@ -12,7 +12,7 @@ from config import grammar_loader
 from translator.segmenter import segment, split_paragraphs
 
 from asg import nodes
-from asg.registry import ProcRegistry, build as _build_reg
+from asg.registry import ProcRegistry, ProcUnit, build as _build_reg
 
 # PERFORM 头部修饰关键字（UNTIL/VARYING/THRU…）取自切分文法正本，不在本文件硬编码方言。
 _PERFORM_KW = grammar_loader.perform_keywords()
@@ -27,9 +27,34 @@ def build(program) -> nodes.Program:
         paras: list[nodes.Paragraph] = []
         for lbl, body in split_paragraphs(s.lines):
             stmts = [_lift(st, proc) for st in segment(body)]
-            paras.append(nodes.Paragraph(label=lbl, stmts=stmts))
+            paras.append(nodes.Paragraph(label=lbl, stmts=stmts, body_lines=list(body)))
         secs.append(nodes.Section(name=s.name.upper(), paragraphs=paras, lineno=s.line_start))
     return nodes.Program(program_id=program.program_id, sections=secs, registry=proc)
+
+
+def build_paragraphs(paras_raw: list[tuple[str | None, list[str]]], ctx) -> list[nodes.Paragraph]:
+    """Build ASG Paragraph nodes from pre-split raw paragraphs.
+
+    This is the mainline bridge for translator.skeleton_gen.body_context, where
+    pending THRU methods only have [(label, body_lines)] and no full CobolProgram.
+    """
+    proc = _proc_from_ctx(ctx)
+    paras: list[nodes.Paragraph] = []
+    for lbl, body in paras_raw:
+        stmts = [_lift(st, proc) for st in segment(body)]
+        paras.append(nodes.Paragraph(label=lbl, stmts=stmts, body_lines=list(body)))
+    return paras
+
+
+def _proc_from_ctx(ctx) -> ProcRegistry:
+    units: list[ProcUnit] = []
+    for i, item in enumerate(getattr(ctx, "proc_order", None) or []):
+        name, kind, section, _body = item
+        units.append(ProcUnit(name=name, kind=kind, section=section, order=i))
+    if not units:
+        for i, name in enumerate(getattr(ctx, "section_order", None) or sorted(getattr(ctx, "known_sections", set()))):
+            units.append(ProcUnit(name=name, kind="section", section=name, order=i))
+    return ProcRegistry(units)
 
 
 def _lift(st, proc: ProcRegistry):

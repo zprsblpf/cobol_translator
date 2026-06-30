@@ -147,10 +147,36 @@ _EXTRA_STATE_DEFAULTS = {
 }
 
 
+def cmd_no_llm_translate(cob_file: str, output_dir: str, max_sections: int = 0):
+    """Translate a COBOL program with deterministic rules only."""
+    from parser.cobol_parser import parse
+    from translator.skeleton_gen import render_skeleton
+    from config import spec_loader
+
+    prog = parse(cob_file)
+    if max_sections:
+        prog.sections = prog.sections[:max_sections]
+
+    java = render_skeleton(prog)
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_file = out_dir / f"{spec_loader.class_name(prog.program_id)}.java"
+    out_file.write_text(java, encoding="utf-8")
+
+    print("No-LLM translation completed")
+    print(f"  input       : {cob_file}")
+    print(f"  output      : {out_file}")
+    print(f"  program     : {prog.program_id}")
+    print(f"  sections    : {len(prog.sections)}")
+    print("  mode        : deterministic rules only")
+    return out_file
+
+
 def cmd_full_translate(cob_file: str, output_dir: str, max_sections: int = 0,
                        skeleton_only: bool = False):
     """全量翻译或限制数量翻译。"""
-    from graph.graph import get_graph
+    if skeleton_only:
+        return cmd_no_llm_translate(cob_file, output_dir, max_sections=max_sections)
 
     print(f"\n{'='*60}")
     print(f"  COBOL → Java 翻译器")
@@ -221,6 +247,7 @@ def cmd_full_translate(cob_file: str, output_dir: str, max_sections: int = 0,
         assemble_node(initial_state)
     else:
         # 全量走 LangGraph 图
+        from graph.graph import get_graph
         graph = get_graph()
         initial_state = {
             "cobol_file": cob_file,
@@ -257,6 +284,8 @@ def main():
     parser.add_argument("--sections", type=int, default=0, help="只翻译前N个SECTION（测试）")
     parser.add_argument("--skeleton-only", action="store_true",
                         help="仅生成控制流/调用骨架（叶子保留原 COBOL 占位，不调 LLM）")
+    parser.add_argument("--no-llm", action="store_true",
+                        help="整程序确定性翻译，不导入 LangGraph，不调用 vLLM")
     parser.add_argument("--output", default="./output", help="输出目录")
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="处理流程日志输出到 DEBUG 级别")
@@ -278,7 +307,7 @@ def main():
         cmd_translate_section(cob_file, args.section.upper(), args.output)
     else:
         cmd_full_translate(cob_file, args.output, max_sections=args.sections,
-                           skeleton_only=args.skeleton_only)
+                           skeleton_only=(args.skeleton_only or args.no_llm))
 
 
 if __name__ == "__main__":

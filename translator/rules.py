@@ -44,6 +44,7 @@ from translator.leaf.arith import _t_add, _t_subtract, _t_multiply, _t_divide, _
 # 下沉 translator.leaf.control，rules 委托（dispatch 分支保留在 _sk_control，骨架态不迁）；
 # 依赖单向 rules → leaf，无环。
 from translator.leaf.control import translate_control, translate_evaluate, evaluate_case_label
+from translator.leaf import translate_leaf_stmt
 
 
 @dataclass
@@ -312,26 +313,4 @@ def translate_leaf(stmt: Stmt, ctx: Ctx) -> tuple[list[str], bool]:
 
 
 def _dispatch_leaf(toks: list[str], ctx: Ctx) -> tuple[list[str], bool]:
-    verb = toks[0].upper()
-    try:
-        if verb == "MOVE":
-            return translate_move(toks, ctx)
-        if verb == "INITIALIZE":
-            return _t_initialize(toks, ctx)
-        if verb == "SET":
-            return _t_set(toks, ctx)
-        if verb == "ADD":
-            return _t_add(toks, ctx)
-        if verb == "SUBTRACT":
-            return _t_subtract(toks, ctx)
-        if verb == "MULTIPLY":
-            return _t_multiply(toks, ctx)
-        if verb == "DIVIDE":
-            return _t_divide(toks, ctx)
-        if verb == "COMPUTE":
-            return _t_compute(toks, ctx)
-        if verb == "CALL":
-            return _t_call(toks, ctx)
-    except (ValueError, IndexError):
-        return [], False
-    return [], False
+    return translate_leaf_stmt(toks, ctx)

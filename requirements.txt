@@ -1,0 +1,18 @@
+# Core workflow
+langgraph
+requests
+PyYAML
+python-dotenv
+
+# LLM integration
+langchain-openai
+
+# Optional RAG path used by graph.nodes._get_vs()
+langchain-community
+langchain-text-splitters
+langchain-chroma
+langchain-huggingface
+sentence-transformers
+
+# Optional MongoDB import path used by scripts/decompose.py --mongo-uri
+pymongo

@@ -30,9 +30,11 @@ def main() -> int:
 
     program = parse(args.infile)
     java = render_skeleton(program)
-    Path(args.outfile).write_text(java, encoding="utf-8")
+    out_path = Path(args.outfile)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(java, encoding="utf-8")
 
-    print(f"✓ 已生成 {args.outfile}（{java.count(chr(10)) + 1} 行）")
+    print(f"OK generated {args.outfile} ({java.count(chr(10)) + 1} lines)")
     print("自检统计：")
     print(f"  程序          : {program.program_id}")
     print(f"  SECTION 数    : {len(program.sections)}")
