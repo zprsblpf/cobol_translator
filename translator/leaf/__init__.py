@@ -12,7 +12,30 @@ from translator.leaf.cond import translate_condition
 from translator.leaf.control import translate_control, translate_evaluate, evaluate_case_label
 from translator.leaf.loop import translate_perform_loop
 from translator.leaf.move import translate_move
+from translator.leaf.string import translate_string
+
+
+def translate_leaf_stmt(tokens: list[str], ctx: LeafCtx) -> tuple[list[str], bool]:
+    """Shared leaf-statement dispatcher for rules and ASG visitors."""
+    if not tokens:
+        return [], False
+    verb = tokens[0].upper()
+    try:
+        if verb == "MOVE":
+            return translate_move(tokens, ctx)
+        lines, ok = translate_arith_assign(tokens, ctx)
+        if ok:
+            return lines, ok
+        if verb == "CALL":
+            return translate_call(tokens, ctx)
+        if verb == "STRING":
+            return translate_string(tokens, ctx)
+        return translate_control(tokens, ctx)
+    except (ValueError, IndexError):
+        return [], False
+
 
 __all__ = ["LeafCtx", "translate_move", "translate_condition", "translate_perform_loop",
-           "translate_call", "translate_assign", "translate_arith", "translate_arith_assign",
-           "translate_control", "translate_evaluate", "evaluate_case_label"]
+           "translate_call", "translate_string", "translate_assign", "translate_arith", "translate_arith_assign",
+           "translate_control", "translate_evaluate", "evaluate_case_label",
+           "translate_leaf_stmt"]

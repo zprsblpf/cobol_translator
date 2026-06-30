@@ -108,8 +108,8 @@ def _postprocess_body(body: str, ws_field_names: list[str], call_args: str,
     return body
 
 
-def translate_paragraphs_body(paras_raw: list, ctx: _rules.Ctx, ws_field_names: list[str],
-                              call_args: str, known_methods: set[str], force_sm: bool = False) -> str:
+def _translate_paragraphs_body_legacy(paras_raw: list, ctx: _rules.Ctx, ws_field_names: list[str],
+                                      call_args: str, known_methods: set[str], force_sm: bool = False) -> str:
     """已切好的 [(label, body_lines), …] → Java 方法体（确定性，无 LLM）。
     步骤14 §2.1：合成区间方法走此入口，**不经 split_paragraphs 的有损往返**，标签直传，
     让 build_section 重见区间内 paragraph 边界、按状态机精确路由区间内 GO TO。
@@ -132,6 +132,35 @@ def translate_paragraphs_body(paras_raw: list, ctx: _rules.Ctx, ws_field_names: 
     # 则 B1 自动把段内 this.aThruB(); 补成 this.aThruB(wsaa, using…);（无需 _perform_range 感知 call_args）。
     methods = set(known_methods) | set(ctx.pending_range_methods)
     return _postprocess_body(body, ws_field_names, call_args, methods)
+
+
+def _translate_paragraphs_body_legacy_fallback(paras_raw: list, ctx: _rules.Ctx, ws_field_names: list[str],
+                                               call_args: str, known_methods: set[str],
+                                               force_sm: bool = False) -> str:
+    """Legacy SECTION renderer retained only for ASG failure fallback and diff/reference tests."""
+    return _translate_paragraphs_body_legacy(paras_raw, ctx, ws_field_names, call_args, known_methods, force_sm)
+
+
+def _translate_paragraphs_body_asg(paras_raw: list, ctx: _rules.Ctx, ws_field_names: list[str],
+                                   call_args: str, known_methods: set[str], force_sm: bool = False) -> str:
+    from asg import SectionJavaVisitor, build_asg_paragraphs
+
+    reset_section(ctx)
+    paragraphs = build_asg_paragraphs(paras_raw, ctx)
+    body = "\n".join(SectionJavaVisitor(ctx, force_sm=force_sm).render_paragraphs(paragraphs))
+    methods = set(known_methods) | set(ctx.pending_range_methods)
+    return _postprocess_body(body, ws_field_names, call_args, methods)
+
+
+def translate_paragraphs_body(paras_raw: list, ctx: _rules.Ctx, ws_field_names: list[str],
+                              call_args: str, known_methods: set[str], force_sm: bool = False) -> str:
+    """Pre-split paragraphs -> Java body. Mainline now uses ASG SectionJavaVisitor, with legacy fallback."""
+    try:
+        return _translate_paragraphs_body_asg(paras_raw, ctx, ws_field_names, call_args, known_methods, force_sm)
+    except Exception:
+        return _translate_paragraphs_body_legacy_fallback(
+            paras_raw, ctx, ws_field_names, call_args, known_methods, force_sm
+        )
 
 
 def translate_section_body(body_lines: list[str], ctx: _rules.Ctx, ws_field_names: list[str],

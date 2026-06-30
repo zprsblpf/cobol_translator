@@ -35,7 +35,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from parser.cobol_parser import parse                                   # noqa: E402
 from translator.segmenter import segment, split_paragraphs             # noqa: E402
-from translator.skeleton_gen.body_context import build_body_ctx        # noqa: E402
+from translator.skeleton_gen.body_context import build_body_ctx, reset_section  # noqa: E402
 from translator.leaf import (  # noqa: E402
     translate_move, translate_condition, translate_perform_loop, translate_call, translate_arith_assign,
     translate_control, translate_evaluate, evaluate_case_label,
@@ -45,6 +45,7 @@ from translator.skel import render_perform_call                        # noqa: E
 from asg import build_asg                                              # noqa: E402
 from asg import nodes as asg_nodes                                     # noqa: E402
 from asg.visitor import AsgVisitor, LeafJavaVisitor                    # noqa: E402
+from asg.section_visitor import SectionJavaVisitor                     # noqa: E402
 
 
 def _walk_segmenter_stmts(st):
@@ -446,6 +447,33 @@ def _asg_ios(program, _ctx) -> list[tuple[str, object]]:
     return out
 
 
+def _legacy_sections(program, ctx) -> list[tuple[str, object]]:
+    """legacy reference: render each SECTION through rules.build_section."""
+    out: list[tuple[str, object]] = []
+    for section in program.sections:
+        reset_section(ctx)
+        paras = [(label, segment(body)) for label, body in split_paragraphs(section.lines)]
+        lines = rules.build_section(paras, ctx, force_sm=False)
+        body = "\n".join(lines)
+        for lid, leaf in ctx.leaves:
+            fill_lines, matched = rules.translate_leaf(leaf, ctx)
+            raw = (leaf.raw or " ".join(leaf.tokens)).strip()
+            fill = "\n".join(fill_lines) if matched else f"// TODO-LEAF: {raw}"
+            body = body.replace(f"/*__LEAF_{lid}__*/", fill)
+        out.append((section.name, tuple(body.splitlines())))
+    return out
+
+
+def _asg_sections(program, ctx) -> list[tuple[str, object]]:
+    """ASG route: render each SECTION through SectionJavaVisitor."""
+    out: list[tuple[str, object]] = []
+    visitor = SectionJavaVisitor(ctx)
+    for section in build_asg(program).sections:
+        reset_section(ctx)
+        out.append((section.name, tuple(visitor.render_section(section))))
+    return out
+
+
 _SAMPLERS = {
     "MOVE": (_legacy_moves, _asg_moves),
     "IF": (_legacy_ifs, _asg_ifs),
@@ -456,6 +484,7 @@ _SAMPLERS = {
     "CALL": (_legacy_calls, _asg_calls),
     "ARITH": (_legacy_arith, _asg_arith),
     "CONTROL": (_legacy_control, _asg_control),
+    "SECTION": (_legacy_sections, _asg_sections),
 }
 
 

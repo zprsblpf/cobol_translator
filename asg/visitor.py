@@ -11,6 +11,7 @@ from asg import nodes
 from translator.leaf import (
     translate_move, translate_condition, translate_perform_loop, translate_call,
     translate_arith_assign, translate_control, translate_evaluate, evaluate_case_label,
+    translate_leaf_stmt,
 )
 from translator.skel import (
     render_perform_call,
@@ -209,10 +210,7 @@ class LeafJavaVisitor(AsgVisitor):
         d = dispatch_exit(node.tokens, self.ctx, 0)
         if d is not None:
             return d
-        lines, ok = translate_arith_assign(node.tokens, self.ctx)
-        if ok:
-            return lines
-        lines, ok = translate_control(node.tokens, self.ctx)
+        lines, ok = translate_leaf_stmt(node.tokens, self.ctx)
         return lines if ok else [f"// TODO-LEAF: {node.raw}"]
 
     def visit_GotoStmt(self, node) -> list[str]:
