@@ -1277,12 +1277,12 @@ class TestAsgIfVisitor(unittest.TestCase):
         self.assertEqual(LeafJavaVisitor(self._ctx()).visit(node), ["// TODO-IF: IF WSAA-STATUS-OK"])
 
     def test_if_body_unmigrated_leaf_placeholder(self):
-        # 步骤32：STRING 已固化，改用仍未固化的 UNSTRING 验诚实占位
+        # 步骤37：UNSTRING 已固化，改用仍未固化的 DISPLAY 验诚实占位
         from asg import IfStmt, Leaf, LeafJavaVisitor
         node = IfStmt(cond=["WSAA-COUNT", "=", "1"],
-                      then=[Leaf(tokens=["UNSTRING", "WSAA-A", "DELIMITED", "BY", "SPACE", "INTO", "WSAA-B"],
-                                 raw="UNSTRING WSAA-A DELIMITED BY SPACE INTO WSAA-B")])
-        self.assertIn("    // TODO-LEAF: UNSTRING WSAA-A DELIMITED BY SPACE INTO WSAA-B",
+                      then=[Leaf(tokens=["DISPLAY", "WSAA-A"],
+                                 raw="DISPLAY WSAA-A")])
+        self.assertIn("    // UNSUPPORTED[LEAF.UNKNOWN.001] leaf: no deterministic leaf translator matched; raw=DISPLAY WSAA-A",
                       LeafJavaVisitor(self._ctx()).visit(node))
 
     def test_nested_if_renders_indented(self):
@@ -2219,12 +2219,27 @@ class TestLeafStringExtract(unittest.TestCase):
                          (['wsaaOut = wsaaA + String.valueOf(wsaaB).split(java.util.regex.Pattern.quote(" "), 2)[0] + String.valueOf(wsaaC).split(java.util.regex.Pattern.quote("/"), 2)[0];'],
                           True))
 
-    def test_unsupported_clauses_fall_through(self):
+    def test_complex_clauses_return_structured_unsupported(self):
         from translator.leaf import translate_string
 
         cases = [
-            "STRING WSAA-A DELIMITED BY SIZE INTO WSAA-OUT WITH POINTER WSAA-B",
-            "STRING WSAA-A DELIMITED BY SIZE INTO WSAA-OUT ON OVERFLOW MOVE 1 TO WSAA-C",
+            ("STRING WSAA-A DELIMITED BY SIZE INTO WSAA-OUT WITH POINTER WSAA-B",
+             "LEAF.STRING.POINTER.001"),
+            ("STRING WSAA-A DELIMITED BY SIZE INTO WSAA-OUT ON OVERFLOW MOVE 1 TO WSAA-C",
+             "LEAF.STRING.OVERFLOW.001"),
+            ("STRING WSAA-A DELIMITED BY SIZE INTO WSAA-OUT NOT ON OVERFLOW MOVE 1 TO WSAA-C",
+             "LEAF.STRING.OVERFLOW.001"),
+        ]
+        for line, rule_id in cases:
+            lines, ok = translate_string(line.split(), self._ctx())
+            self.assertTrue(ok)
+            self.assertIn(f"UNSUPPORTED[{rule_id}]", lines[0])
+            self.assertIn(line, lines[0])
+
+    def test_malformed_string_falls_through(self):
+        from translator.leaf import translate_string
+
+        cases = [
             "STRING WSAA-A INTO WSAA-OUT",
             "STRING WSAA-A DELIMITED BY SIZE",
         ]
@@ -2239,8 +2254,236 @@ class TestLeafStringExtract(unittest.TestCase):
                          ([], False))
 
 
+class TestLeafUnstringExtract(unittest.TestCase):
+    """步骤37：UNSTRING ... DELIMITED BY ... INTO ... 叶子翻译。"""
+
+    FTM = {
+        "wsaaA": {"type": "String"},
+        "wsaaB": {"type": "String"},
+        "wsaaC": {"type": "String"},
+        "wsaaDelim": {"type": "String"},
+    }
+
+    def _ctx(self):
+        return _leaf_ctx(field_type_map=self.FTM)
+
+    def test_delimited_by_space_extracts_single_target(self):
+        from translator.leaf import translate_unstring
+
+        toks = "UNSTRING WSAA-A DELIMITED BY SPACE INTO WSAA-B".split()
+
+        self.assertEqual(translate_unstring(toks, self._ctx()),
+                         (["{",
+                           '    String[] __unstringParts = String.valueOf(wsaaA).split(java.util.regex.Pattern.quote(" "), 2);',
+                           '    wsaaB = __unstringParts.length > 0 ? __unstringParts[0] : "";',
+                           "}"], True))
+
+    def test_literal_delimiter_extracts_multiple_targets(self):
+        from translator.leaf import translate_unstring
+
+        toks = ["UNSTRING", "WSAA-A", "DELIMITED", "BY", "'/'", "INTO", "WSAA-B", "WSAA-C"]
+
+        self.assertEqual(translate_unstring(toks, self._ctx()),
+                         (["{",
+                           '    String[] __unstringParts = String.valueOf(wsaaA).split(java.util.regex.Pattern.quote("/"), 2);',
+                           '    wsaaB = __unstringParts.length > 0 ? __unstringParts[0] : "";',
+                           '    wsaaC = __unstringParts.length > 1 ? __unstringParts[1] : "";',
+                           "}"], True))
+
+    def test_field_delimiter_uses_operand(self):
+        from translator.leaf import translate_unstring
+
+        toks = "UNSTRING WSAA-A DELIMITED BY WSAA-DELIM INTO WSAA-B".split()
+
+        self.assertEqual(translate_unstring(toks, self._ctx())[0][1],
+                         "    String[] __unstringParts = String.valueOf(wsaaA).split(java.util.regex.Pattern.quote(wsaaDelim), 2);")
+
+    def test_complex_clauses_return_structured_unsupported(self):
+        from translator.leaf import translate_unstring
+
+        cases = [
+            ("UNSTRING WSAA-A DELIMITED BY SPACE INTO WSAA-B WITH POINTER WSAA-C",
+             "LEAF.UNSTRING.POINTER.001"),
+            ("UNSTRING WSAA-A DELIMITED BY SPACE INTO WSAA-B TALLYING IN WSAA-C",
+             "LEAF.UNSTRING.COUNT.001"),
+            ("UNSTRING WSAA-A DELIMITED BY SPACE INTO WSAA-B ON OVERFLOW MOVE 1 TO WSAA-C",
+             "LEAF.UNSTRING.OVERFLOW.001"),
+            ("UNSTRING WSAA-A DELIMITED BY ALL SPACE INTO WSAA-B",
+             "LEAF.UNSTRING.DELIMITER.002"),
+        ]
+        for line, rule_id in cases:
+            lines, ok = translate_unstring(line.split(), self._ctx())
+            self.assertTrue(ok)
+            self.assertIn(f"UNSUPPORTED[{rule_id}]", lines[0])
+            self.assertIn(line, lines[0])
+
+    def test_malformed_unstring_falls_through(self):
+        from translator.leaf import translate_unstring
+
+        cases = [
+            "UNSTRING WSAA-A DELIMITED BY SPACE",
+            "UNSTRING WSAA-A INTO WSAA-B",
+            "UNSTRING WSAA-A DELIMITED BY SIZE INTO WSAA-B",
+        ]
+        for line in cases:
+            self.assertEqual(translate_unstring(line.split(), self._ctx()), ([], False))
+
+    def test_non_unstring_verb_falls_through(self):
+        from translator.leaf import translate_unstring
+
+        self.assertEqual(translate_unstring("STRING WSAA-A DELIMITED BY SIZE INTO WSAA-B".split(),
+                                            self._ctx()),
+                         ([], False))
+
+
+class TestLeafInspectExtract(unittest.TestCase):
+    """步骤38：INSPECT ... TALLYING / REPLACING 保守子集叶子翻译。"""
+
+    FTM = {
+        "wsaaText": {"type": "String"},
+        "wsaaCount": {"type": "int"},
+        "wsaaOut": {"type": "String"},
+    }
+
+    def _ctx(self):
+        return _leaf_ctx(field_type_map=self.FTM)
+
+    def test_tallying_characters_accumulates_length(self):
+        from translator.leaf import translate_inspect
+
+        toks = "INSPECT WSAA-TEXT TALLYING WSAA-COUNT FOR CHARACTERS".split()
+
+        self.assertEqual(translate_inspect(toks, self._ctx()),
+                         (["wsaaCount += String.valueOf(wsaaText).length();"], True))
+
+    def test_tallying_for_all_counts_non_overlapping_occurrences(self):
+        from translator.leaf import translate_inspect
+
+        toks = ["INSPECT", "WSAA-TEXT", "TALLYING", "WSAA-COUNT", "FOR", "ALL", "'A'"]
+
+        self.assertEqual(
+            translate_inspect(toks, self._ctx()),
+            ([
+                'wsaaCount += ("A".isEmpty() ? 0 : '
+                '(String.valueOf(wsaaText).length() - String.valueOf(wsaaText).replace("A", "").length()) / "A".length());'
+            ], True),
+        )
+
+    def test_replacing_all_literal_updates_source(self):
+        from translator.leaf import translate_inspect
+
+        toks = ["INSPECT", "WSAA-TEXT", "REPLACING", "ALL", "'A'", "BY", "'B'"]
+
+        self.assertEqual(translate_inspect(toks, self._ctx()),
+                         (['wsaaText = String.valueOf(wsaaText).replace("A", "B");'], True))
+
+    def test_replacing_space_uses_figurative_blank(self):
+        from translator.leaf import translate_inspect
+
+        toks = "INSPECT WSAA-TEXT REPLACING ALL SPACE BY SPACE".split()
+
+        self.assertEqual(translate_inspect(toks, self._ctx()),
+                         (['wsaaText = String.valueOf(wsaaText).replace(" ", " ");'], True))
+
+    def test_unsupported_inspect_shapes_fall_through(self):
+        from translator.leaf import translate_inspect
+
+        cases = [
+            "INSPECT WSAA-TEXT CONVERTING 'A' TO 'B'",
+            "INSPECT WSAA-TEXT TALLYING WSAA-COUNT FOR ALL 'A' BEFORE INITIAL 'B'",
+            "INSPECT WSAA-TEXT REPLACING ALL 'A' BY 'B' AFTER INITIAL 'C'",
+            "INSPECT WSAA-TEXT TALLYING WSAA-COUNT",
+        ]
+        for line in cases:
+            self.assertEqual(translate_inspect(line.split(), self._ctx()), ([], False))
+
+    def test_non_inspect_verb_falls_through(self):
+        from translator.leaf import translate_inspect
+
+        self.assertEqual(translate_inspect("STRING WSAA-TEXT DELIMITED BY SIZE INTO WSAA-OUT".split(),
+                                           self._ctx()),
+                         ([], False))
+
+
+class TestLeafSearchExtract(unittest.TestCase):
+    """步骤39：SEARCH 简单线性搜索叶子翻译。"""
+
+    FTM = {
+        "wsaaRows": {"type": "String", "is_array": True, "array_size": 10},
+        "wsaaRowCode": {"type": "String", "is_array": True, "array_size": 10},
+        "wsaaKey": {"type": "String"},
+        "wsaaI": {"type": "int"},
+    }
+
+    def _ctx(self):
+        return _leaf_ctx(field_type_map=self.FTM)
+
+    def test_basic_varying_when_loop(self):
+        from translator.leaf import translate_search
+
+        toks = "SEARCH WSAA-ROWS VARYING WSAA-I WHEN WSAA-ROW-CODE(WSAA-I) = WSAA-KEY".split()
+
+        self.assertEqual(translate_search(toks, self._ctx()),
+                         ([
+                             "for (wsaaI = 1; wsaaI <= wsaaRows.length; wsaaI++) {",
+                             "    if (wsaaKey.equals(wsaaRowCode(wsaaI))) {",
+                             "        break;",
+                             "    }",
+                             "}",
+                         ], True))
+
+    def test_complex_forms_emit_structured_unsupported(self):
+        from translator.leaf import translate_search
+
+        cases = [
+            "SEARCH ALL WSAA-ROWS VARYING WSAA-I WHEN WSAA-ROW-CODE(WSAA-I) = WSAA-KEY",
+            "SEARCH WSAA-ROWS AT END MOVE 1 TO WSAA-I WHEN WSAA-ROW-CODE(WSAA-I) = WSAA-KEY",
+            "SEARCH WSAA-ROWS WHEN WSAA-ROW-CODE(WSAA-I) = WSAA-KEY",
+            "SEARCH WSAA-ROWS VARYING WSAA-I WHEN WSAA-FLAG",
+        ]
+        for line in cases:
+            lines, ok = translate_search(line.split(), self._ctx())
+            self.assertTrue(ok)
+            self.assertEqual(len(lines), 1)
+            self.assertIn("UNSUPPORTED[LEAF.SEARCH.001]", lines[0])
+            self.assertIn(f"raw={line}", lines[0])
+
+    def test_non_search_verb_falls_through(self):
+        from translator.leaf import translate_search
+
+        self.assertEqual(translate_search("STRING WSAA-A DELIMITED BY SIZE INTO WSAA-OUT".split(),
+                                          self._ctx()),
+                         ([], False))
+
+    def test_translate_leaf_stmt_dispatches_search(self):
+        from translator.leaf import translate_leaf_stmt
+
+        toks = "SEARCH WSAA-ROWS VARYING WSAA-I WHEN WSAA-ROW-CODE(WSAA-I) = WSAA-KEY".split()
+
+        lines, ok = translate_leaf_stmt(toks, self._ctx())
+
+        self.assertTrue(ok)
+        self.assertEqual(lines[0], "for (wsaaI = 1; wsaaI <= wsaaRows.length; wsaaI++) {")
+
+    def test_asg_leaf_uses_search_output_and_specific_unsupported(self):
+        from asg import Leaf, LeafJavaVisitor
+
+        ctx = self._ctx()
+        raw = "SEARCH WSAA-ROWS VARYING WSAA-I WHEN WSAA-ROW-CODE(WSAA-I) = WSAA-KEY"
+        node = Leaf(tokens=raw.split(), raw=raw)
+
+        self.assertEqual(LeafJavaVisitor(ctx).visit(node)[0],
+                         "for (wsaaI = 1; wsaaI <= wsaaRows.length; wsaaI++) {")
+
+        bad = "SEARCH WSAA-ROWS WHEN WSAA-ROW-CODE(WSAA-I) = WSAA-KEY"
+        out = LeafJavaVisitor(ctx).visit(Leaf(tokens=bad.split(), raw=bad))
+
+        self.assertEqual(len(out), 1)
+        self.assertIn("UNSUPPORTED[LEAF.SEARCH.001]", out[0])
+
+
 class TestAsgLeafArithVisitor(unittest.TestCase):
-    """② visit_Leaf 经同一 translate_arith_assign → 与之逐字符一致；未固化→// TODO-LEAF；IF body 内直译可见。"""
+    """② visit_Leaf 经同一 translate_arith_assign → 与之逐字符一致；未固化→UNSUPPORTED；IF body 内直译可见。"""
 
     def _ctx(self):
         return _leaf_ctx(field_type_map={"wsaaCount": {"type": "int"}})
@@ -2256,10 +2499,10 @@ class TestAsgLeafArithVisitor(unittest.TestCase):
 
     def test_unmigrated_leaf_placeholder(self):
         from asg import Leaf, LeafJavaVisitor
-        node = Leaf(tokens="UNSTRING WSAA-A DELIMITED BY SPACE INTO WSAA-B".split(),
-                    raw="UNSTRING WSAA-A DELIMITED BY SPACE INTO WSAA-B")
+        node = Leaf(tokens="DISPLAY WSAA-A".split(),
+                    raw="DISPLAY WSAA-A")
         self.assertEqual(LeafJavaVisitor(self._ctx()).visit(node),
-                         ["// TODO-LEAF: UNSTRING WSAA-A DELIMITED BY SPACE INTO WSAA-B"])
+                         ["// UNSUPPORTED[LEAF.UNKNOWN.001] leaf: no deterministic leaf translator matched; raw=DISPLAY WSAA-A"])
 
     def test_arith_inside_if_body_direct(self):
         from asg import IfStmt, Leaf, LeafJavaVisitor
@@ -2279,6 +2522,7 @@ class TestUnifiedLeafEntry(unittest.TestCase):
             "wsaaA": {"type": "String"},
             "wsaaB": {"type": "String"},
             "wsaaOut": {"type": "String"},
+            "wsaaText": {"type": "String"},
         })
         ctx.system_programs = {"SYSERR": {"java_code": "throw new RuntimeException()"}}
         return ctx
@@ -2293,6 +2537,9 @@ class TestUnifiedLeafEntry(unittest.TestCase):
             "ADD 1 TO WSAA-COUNT",
             "CALL 'SYSERR'",
             "STRING WSAA-A DELIMITED BY SIZE WSAA-B DELIMITED BY SIZE INTO WSAA-OUT",
+            "UNSTRING WSAA-A DELIMITED BY SPACE INTO WSAA-B",
+            "INSPECT WSAA-TEXT TALLYING WSAA-COUNT FOR CHARACTERS",
+            "INSPECT WSAA-TEXT REPLACING ALL 'A' BY 'B'",
         ]
         for line in cases:
             toks = line.split()
@@ -2306,7 +2553,7 @@ class TestUnifiedLeafEntry(unittest.TestCase):
     def test_translate_leaf_stmt_falls_through_for_unmigrated_verbs(self):
         from translator.leaf import translate_leaf_stmt
 
-        self.assertEqual(translate_leaf_stmt("UNSTRING WSAA-A DELIMITED BY SPACE INTO WSAA-B".split(),
+        self.assertEqual(translate_leaf_stmt("DISPLAY WSAA-A".split(),
                                              self._ctx()),
                          ([], False))
 
@@ -2319,13 +2566,49 @@ class TestUnifiedLeafEntry(unittest.TestCase):
 
         self.assertEqual(LeafJavaVisitor(ctx).visit(node), ["wsaaOut = wsaaA + wsaaB;"])
 
+    def test_asg_leaf_uses_shared_inspect_output(self):
+        from asg import Leaf, LeafJavaVisitor
+
+        ctx = self._ctx()
+        raw = "INSPECT WSAA-TEXT REPLACING ALL 'A' BY 'B'"
+        node = Leaf(tokens=raw.split(), raw=raw)
+
+        self.assertEqual(LeafJavaVisitor(ctx).visit(node),
+                         ['wsaaText = String.valueOf(wsaaText).replace("A", "B");'])
+
+    def test_asg_leaf_uses_shared_unstring_output(self):
+        from asg import Leaf, LeafJavaVisitor
+
+        ctx = self._ctx()
+        raw = "UNSTRING WSAA-A DELIMITED BY SPACE INTO WSAA-B"
+        node = Leaf(tokens=raw.split(), raw=raw)
+
+        self.assertEqual(LeafJavaVisitor(ctx).visit(node),
+                         ["{",
+                          '    String[] __unstringParts = String.valueOf(wsaaA).split(java.util.regex.Pattern.quote(" "), 2);',
+                          '    wsaaB = __unstringParts.length > 0 ? __unstringParts[0] : "";',
+                          "}"])
+
     def test_asg_leaf_keeps_unsupported_string_placeholder(self):
         from asg import Leaf, LeafJavaVisitor
 
         raw = "STRING WSAA-A DELIMITED BY SIZE INTO WSAA-OUT WITH POINTER WSAA-B"
         node = Leaf(tokens=raw.split(), raw=raw)
 
-        self.assertEqual(LeafJavaVisitor(self._ctx()).visit(node), [f"// TODO-LEAF: {raw}"])
+        self.assertEqual(LeafJavaVisitor(self._ctx()).visit(node),
+                         [f"// UNSUPPORTED[LEAF.STRING.POINTER.001] leaf: WITH POINTER is not yet deterministic; raw={raw}"])
+
+    def test_asg_leaf_unknown_verb_uses_structured_unsupported_marker(self):
+        from asg import Leaf, LeafJavaVisitor
+
+        raw = "DISPLAY WSAA-A"
+        node = Leaf(tokens=raw.split(), raw=raw)
+
+        out = LeafJavaVisitor(self._ctx()).visit(node)
+
+        self.assertEqual(len(out), 1)
+        self.assertIn("UNSUPPORTED[LEAF.UNKNOWN.001]", out[0])
+        self.assertIn("raw=DISPLAY WSAA-A", out[0])
 
     def test_rules_and_asg_leaf_share_supported_output(self):
         from asg import Leaf, LeafJavaVisitor
@@ -3148,6 +3431,17 @@ class TestMainlineSectionViaAsg(unittest.TestCase):
         self.assertIn("TmlclstRecord tmlclst = new TmlclstRecord();", body)
         self.assertIn("tmlclst.setField(wsaa.wsaaVal);", body)
         self.assertIn("tmlclstRepository.save(tmlclst);", body)
+
+    def test_write_io_empty_catch_comment_is_clean(self):
+        from asg import IoWriteSingleStmt, SectionJavaVisitor
+        from translator.skeleton_gen.body_context import build_body_ctx
+        prog = self._program(TestAsgWriteSingleRewrite.SRC_UPDAT_ERROR)
+        ctx, _ws = build_body_ctx(prog)
+        TestAsgWriteSingleRewrite._install_write_ops(ctx)
+        node = IoWriteSingleStmt(pfx="TMLCLST", name="TMLCLSTIO", func="UPDAT", mode="error")
+        out = "\n".join(SectionJavaVisitor(ctx).visit(node))
+        self.assertIn("// (空)", out)
+        self.assertNotIn("// (绌?", out)
 
     def test_asg_failure_falls_back_to_legacy(self):
         from translator.segmenter import split_paragraphs

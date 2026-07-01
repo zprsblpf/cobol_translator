@@ -1,0 +1,17 @@
+rule_id: LEAF.UNSTRING.001
+verb: UNSTRING
+status: deterministic_leaf
+supported:
+  - pattern: "UNSTRING <source> DELIMITED BY <delimiter> INTO <target>..."
+    notes:
+      - "source, delimiter, and targets are single tokens"
+      - "delimiter supports SPACE and literal/field operands"
+      - "target assignment uses the shared leaf assignment helper"
+unsupported:
+  - "WITH POINTER"
+  - "TALLYING IN"
+  - "COUNT IN"
+  - "DELIMITER IN"
+  - "ON OVERFLOW"
+  - "NOT ON OVERFLOW"
+  - "multiple delimiters with OR"

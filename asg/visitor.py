@@ -13,6 +13,7 @@ from translator.leaf import (
     translate_arith_assign, translate_control, translate_evaluate, evaluate_case_label,
     translate_leaf_stmt,
 )
+from translator.unsupported import unsupported_comment
 from translator.skel import (
     render_perform_call,
     render_flow_dispatch, dispatch_goto, dispatch_exit,   # 步骤24B GO TO dispatch 状态机
@@ -204,14 +205,16 @@ class LeafJavaVisitor(AsgVisitor):
         依次试：① 算术/赋值（translate_arith_assign，步骤22）→ ② 控制流叶子词
         （translate_control，步骤23：落 Leaf 的 CONTINUE/STOP/EXIT/GOBACK/NEXT）。
         两者 verb 集互斥、均与旧 rules 同函数同 ctx → 产物逐字符一致；俱兜不住（STRING/未固化/
-        解析失败）→ // TODO-LEAF 占位。占位单调收敛（只减不增）。
+        解析失败）→ UNSUPPORTED[LEAF.UNKNOWN.001] 占位。占位单调收敛（只减不增）。
         dispatch 模式（步骤24B）：状态机内 EXIT → dispatch_exit 产 break FLOW（与旧 _sk_control EXIT 分支
         同函数同 ctx → 逐字符一致），先于算术/控制叶子委托。"""
         d = dispatch_exit(node.tokens, self.ctx, 0)
         if d is not None:
             return d
         lines, ok = translate_leaf_stmt(node.tokens, self.ctx)
-        return lines if ok else [f"// TODO-LEAF: {node.raw}"]
+        return lines if ok else [
+            unsupported_comment("LEAF.UNKNOWN.001", "leaf", node.raw, "no deterministic leaf translator matched")
+        ]
 
     def visit_GotoStmt(self, node) -> list[str]:
         """复刻 rules._sk_control 的 GO 分支（步骤23 绞杀项3⑥，并入自退役的 GotoJavaVisitor）：

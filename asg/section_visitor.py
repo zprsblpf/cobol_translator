@@ -255,7 +255,7 @@ class SectionJavaVisitor(LeafJavaVisitor):
         out = lines + ["try {", "    " + op_line]
         out.extend(self._render_rebound_body(node.try_tail, rebind, 1))
         out.append("} catch (Exception e) {")
-        out.extend(self._render_rebound_body(node.then_body, rebind, 1) or ["    // (绌?"])
+        out.extend(self._render_rebound_body(node.then_body, rebind, 1) or ["    // (空)"])
         out.append("}")
         return out
 
