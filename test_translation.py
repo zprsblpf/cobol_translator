@@ -864,6 +864,13 @@ class TestProcStartCommentImmune(unittest.TestCase):
         finally:
             os.unlink(path)
 
+    def _fixture_path(self, name: str) -> Path:
+        return Path(__file__).parent / "tests" / "fixtures" / name
+
+    def _parse_fixture(self, name: str):
+        from parser.cobol_parser import parse
+        return parse(str(self._fixture_path(name)))
+
     def test_comment_procedure_division_not_misdetected(self):
         # 第7列 '*' 的注释行含 "procedure division" 字样，真正 PROCEDURE DIVISION 在其后。
         src = (
@@ -886,9 +893,22 @@ class TestProcStartCommentImmune(unittest.TestCase):
         self.assertIn("1000-MAIN", names)
 
 
+    def test_fixture_comments_and_disabled_lines_do_not_create_sections(self):
+        prog = self._parse_fixture("preprocess_regression.cob")
+        names = {s.name.upper() for s in prog.sections}
+        self.assertIn("1000-MAIN", names)
+        self.assertNotIn("9000-DISABLED", names)
+        self.assertNotIn("9100-COMMENTED", names)
+        self.assertNotIn("WORKING-STORAGE", names)
+
+
 class TestDialectNormalize(unittest.TestCase):
     """步骤16：相1 方言归一（规则源自 config dialect_normalization，preprocess.dialect 应用）。
     本 shop 省 TO 的 GO 段名 → 标准 GO TO；GOBACK/已是 GO TO 不动；引号内文本不动。"""
+
+    def _fixture_lines(self, name: str) -> list[str]:
+        path = Path(__file__).parent / "tests" / "fixtures" / name
+        return path.read_text(encoding="utf-8").splitlines()
 
     def test_go_without_to_normalized(self):
         from preprocess import dialect
@@ -915,6 +935,17 @@ class TestDialectNormalize(unittest.TestCase):
 #   ④ 单点 visitor 自证：GotoJavaVisitor 输出 == rules._sk_control 对同一 GO 的 Java（逐字符）。
 # 旁路不接旧路径，旧用例/快照零 diff 由旧代码未动天然成立（此处只自证新通路）。
 # ══════════════════════════════════════════════════════════════════════════════
+    def test_fixture_clean_source_skips_comment_disabled_and_normalizes_go(self):
+        from preprocess.line_stream import build
+        clean = build(self._fixture_lines("preprocess_regression.cob"))
+        codes = [line.code.strip() for line in clean.clean_lines]
+        joined = "\n".join(codes)
+        self.assertNotIn("9000-DISABLED SECTION.", joined)
+        self.assertNotIn("9100-COMMENTED SECTION.", joined)
+        self.assertIn("GO TO 1090-EXIT", codes)
+        self.assertIn("-         'DEF' TO WSAA-TEXT.", codes)
+
+
 class TestAsgBuild(unittest.TestCase):
     """① 结构提升 + ② 引用解析：build_asg 在内联程序上跑通，GO TO 解析到真实单元。"""
 
