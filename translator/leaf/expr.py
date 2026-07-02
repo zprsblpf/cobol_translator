@@ -98,11 +98,29 @@ def _struct_cls(prefix: str, ctx: LeafCtx) -> str:
     return o[0].upper() + o[1:]
 
 
+def _qualified_operand(tok: str, ctx: LeafCtx) -> str | None:
+    """COBOL A OF/IN B: resolve only through an explicit qualified map."""
+    if not re.search(r"\s+(?:OF|IN)\s+", tok, re.IGNORECASE):
+        return None
+    from translator.naming import parse_qualified_field_reference, resolve_qualified_field_reference
+
+    parsed = parse_qualified_field_reference(tok)
+    if parsed is None:
+        return None
+    resolved = resolve_qualified_field_reference(tok, ctx)
+    if resolved:
+        return resolved
+    return f'"/* TODO unresolved qualified field: {tok.strip()} */"'
+
+
 def _operand(tok: str, ctx: LeafCtx) -> str:
     """把单个 COBOL 操作数转成 Java 表达式（裸字段名 / 字面量 / 下标访问 / 结构体读取）。"""
     u = tok.upper()
     if tok.startswith("'") or tok.startswith('"'):
         return '"' + tok[1:-1] + '"'
+    q = _qualified_operand(tok, ctx)
+    if q is not None:
+        return q
     if u in _FIGURATIVE_ZERO:
         return "0"
     if re.fullmatch(r"[+-]?\d+(\.\d+)?", tok):

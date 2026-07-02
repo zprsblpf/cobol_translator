@@ -20,6 +20,11 @@ from translator.leaf.context import LeafCtx
 from translator.leaf.expr import _operand
 
 
+def is_goto_depending(tokens: list[str]) -> bool:
+    toks = [t.upper() for t in tokens]
+    return bool(toks) and toks[0] == "GO" and "DEPENDING" in toks and "ON" in toks
+
+
 def translate_control(tokens: list[str], ctx: LeafCtx) -> tuple[list[str], bool]:
     """控制流叶子词译器（复刻 rules._sk_control 的 flow_label-无关分支）：
 
@@ -36,6 +41,11 @@ def translate_control(tokens: list[str], ctx: LeafCtx) -> tuple[list[str], bool]
     first = toks[0]
     try:
         if first == "GO":
+            if is_goto_depending(tokens):
+                return [
+                    f"// TODO-GOTO-DEPENDING: {' '.join(tokens)} requires indexed dispatch review",
+                    "return;",
+                ], True
             target = None
             for t in toks:
                 if t not in ("GO", "TO"):

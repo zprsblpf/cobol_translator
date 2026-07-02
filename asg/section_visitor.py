@@ -19,6 +19,7 @@ from asg.structure_rewrite import rewrite_structures, tag_rebind_nodes
 from translator.leaf import translate_perform_loop
 from translator.leaf.call import resolve_io_info
 from translator.leaf.cond import translate_condition
+from translator.leaf.control import is_goto_depending
 from translator.leaf.expr import _java, _operand, _pascal
 
 
@@ -339,6 +340,8 @@ class SectionJavaVisitor(LeafJavaVisitor):
         return f"this.{self.ctx.section_to_method(target)}();"
 
     def _goto_target(self, node) -> str | None:
+        if is_goto_depending(getattr(node, "tokens", None) or []):
+            return None
         if isinstance(node, nodes.GotoStmt) and node.target:
             return node.target.name
         toks = getattr(node, "tokens", None) or []

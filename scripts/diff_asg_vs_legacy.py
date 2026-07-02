@@ -586,7 +586,7 @@ VERB_MATRIX = (
     {
         "verb": "CONTROL",
         "family": "asg",
-        "scope": "control leaf and EVALUATE shell parity",
+        "scope": "control leaf and EVALUATE shell parity; GO TO DEPENDING ON explicit fallback parity",
         "status": "migrated",
     },
     {

@@ -12,6 +12,48 @@ from config.yaml_cache import load as _load_yaml   # 唯一 YAML 加载入口（
 from translator import rules as _rules
 
 
+_QUALIFIER_SEP = re.compile(r"\s+(?:OF|IN)\s+", re.IGNORECASE)
+
+
+def parse_qualified_field_reference(text: str) -> tuple[str, tuple[str, ...]] | None:
+    """Parse COBOL qualified field refs: ``A OF B`` / ``A IN B``.
+
+    Returns upper-case COBOL names so callers can do deterministic lookups.
+    A plain token is not a qualified reference and returns ``None``.
+    """
+    parts = [p.strip().upper() for p in _QUALIFIER_SEP.split(text.strip()) if p.strip()]
+    if len(parts) < 2:
+        return None
+    if not all(re.fullmatch(r"[A-Z0-9-]+", p) for p in parts):
+        return None
+    return parts[0], tuple(parts[1:])
+
+
+def resolve_qualified_field_reference(text: str, ctx) -> str | None:
+    """Resolve a qualified COBOL field through ``ctx.qualified_field_map``.
+
+    The map key is ``(field_name, (qualifier, ...))`` in upper-case COBOL
+    spelling, and the value is the Java field name. Suffix qualifier matching
+    lets a shorter ``A OF B`` resolve when the registry stores ``A OF B OF C``.
+    Ambiguous or unknown references return ``None`` instead of guessing.
+    """
+    parsed = parse_qualified_field_reference(text)
+    if parsed is None:
+        return None
+    field, qualifiers = parsed
+    qmap = getattr(ctx, "qualified_field_map", {}) or {}
+    direct = qmap.get((field, qualifiers))
+    if direct:
+        return direct
+    matches = [
+        java_name for (candidate, candidate_qualifiers), java_name in qmap.items()
+        if candidate == field and tuple(candidate_qualifiers[-len(qualifiers):]) == qualifiers
+    ]
+    if len(set(matches)) == 1:
+        return matches[0]
+    return None
+
+
 def build_struct_registry(state: dict) -> dict:
     """
     按命名范式（config/naming_conventions.yaml）从 COPY 引用派生结构体注册表。

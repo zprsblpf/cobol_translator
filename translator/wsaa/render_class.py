@@ -27,21 +27,24 @@ def _index_and_groups(roots: list[WsNode]):
     name_index: dict[str, WsNode] = {}
     view_groups: set[str] = set()
     arrayed: set[str] = set()
+    array_dims: dict[str, list[int]] = {}
 
-    def walk(n: WsNode, in_array: bool):
+    def walk(n: WsNode, dims: list[int]):
         if not n.is_filler:
             name_index.setdefault(n.name.upper(), n)
-            if in_array:
+            node_dims = dims + ([n.occurs] if n.occurs else [])
+            if node_dims:
                 arrayed.add(n.name.upper())
-        if not in_array and not n.occurs and _view.can_group_view(n):
+                array_dims[n.name.upper()] = node_dims
+        if not dims and not n.occurs and _view.can_group_view(n):
             view_groups.add(java_name(n.name))
-        child_in_array = in_array or bool(n.occurs)
+        child_dims = dims + ([n.occurs] if n.occurs else [])
         for c in n.children:
-            walk(c, child_in_array)
+            walk(c, child_dims)
 
     for r in roots:
-        walk(r, False)
-    return name_index, view_groups, arrayed
+        walk(r, [])
+    return name_index, view_groups, arrayed, array_dims
 
 
 class _Acc:
@@ -64,6 +67,7 @@ def _disambiguate(jn: str, parent_jn: str, seen: set[str]) -> str:
 
 
 def _handle(node: WsNode, dims: list[int], acc: _Acc, idx: dict, vg: set, arr: set,
+            arr_dims: dict[str, list[int]],
             parent_jn: str = ""):
     if node.conditions:
         indexed = bool(dims) or bool(node.occurs)
@@ -73,7 +77,7 @@ def _handle(node: WsNode, dims: list[int], acc: _Acc, idx: dict, vg: set, arr: s
         if node.redefines.upper() not in idx:
             acc.fields.extend(_view.render_primary(node))
         else:
-            acc.views.extend(_view.render_redefines(node, idx, vg, arr))
+            acc.views.extend(_view.render_redefines(node, idx, vg, arr, arr_dims))
         return
     if node.is_group:
         if node.children:
@@ -83,7 +87,7 @@ def _handle(node: WsNode, dims: list[int], acc: _Acc, idx: dict, vg: set, arr: s
         newdims = dims + ([node.occurs] if node.occurs else [])
         child_parent = parent_jn if node.is_filler else java_name(node.name)
         for c in node.children:
-            _handle(c, newdims, acc, idx, vg, arr, child_parent)
+            _handle(c, newdims, acc, idx, vg, arr, arr_dims, child_parent)
         return
     # 叶子
     mydims = dims + ([node.occurs] if node.occurs else [])
@@ -104,7 +108,7 @@ def _handle(node: WsNode, dims: list[int], acc: _Acc, idx: dict, vg: set, arr: s
         acc.fields.append(f"    // TODO 畸形层级: {node.name} 同时带 PIC 与子项，下列子项尽力平铺")
         child_parent = parent_jn if node.is_filler else java_name(node.name)
         for c in node.children:
-            _handle(c, mydims, acc, idx, vg, arr, child_parent)
+            _handle(c, mydims, acc, idx, vg, arr, arr_dims, child_parent)
 
 
 def render_wsaa(roots: list[WsNode], program: str) -> str:
@@ -112,11 +116,11 @@ def render_wsaa(roots: list[WsNode], program: str) -> str:
     base = spec_loader.class_name(program)  # ZPOLDWNM → Zpoldwnm（经规范访问层）
     class_name = f"{base}Wsaa"             # 协作规范：{PROGRAM}WSAA
     package = program.lower()
-    idx, vg, arr = _index_and_groups(roots)
+    idx, vg, arr, arr_dims = _index_and_groups(roots)
 
     acc = _Acc()
     for r in roots:
-        _handle(r, [], acc, idx, vg, arr)
+        _handle(r, [], acc, idx, vg, arr, arr_dims)
 
     out: list[str] = [
         f"package {package};", "",

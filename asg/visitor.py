@@ -13,6 +13,7 @@ from translator.leaf import (
     translate_arith_assign, translate_control, translate_evaluate, evaluate_case_label,
     translate_leaf_stmt,
 )
+from translator.leaf.control import is_goto_depending
 from translator.skel import (
     render_perform_call,
     render_flow_dispatch, dispatch_goto, dispatch_exit,   # 步骤24B GO TO dispatch 状态机
@@ -75,10 +76,11 @@ def _asg_collect_gotos(stmts: list) -> list[str]:
     out: list[str] = []
     for st in stmts:
         if isinstance(st, nodes.GotoStmt):
-            for t in st.tokens:
-                if t.upper() not in ("GO", "TO"):
-                    out.append(t.upper())
-                    break
+            if not is_goto_depending(st.tokens):
+                for t in st.tokens:
+                    if t.upper() not in ("GO", "TO"):
+                        out.append(t.upper())
+                        break
         out += _asg_collect_gotos(getattr(st, "then", None) or [])
         out += _asg_collect_gotos(getattr(st, "els", None) or [])
         out += _asg_collect_gotos(getattr(st, "inline_body", None) or [])
@@ -222,6 +224,8 @@ class LeafJavaVisitor(AsgVisitor):
         dispatch 模式（步骤24B 绞杀项4②）：状态机内目标命中段内标签 → dispatch_goto 产 __pc/continue FLOW
         （与旧 _sk_control GO 分支同函数同 ctx → 逐字符一致），先于 flow_label-无关委托。"""
         target = node.target.name if node.target else None
+        if is_goto_depending(node.tokens):
+            target = None
         d = dispatch_goto(target, self.ctx, 0)
         if d is not None:
             return d

@@ -19,6 +19,7 @@ from translator.wsaa.render_field import java_name, render_field
 from translator.wsaa.storage import storage_accessor, scale_of, num_to_digits, num_from_digits
 
 _NUMERIC = ("int", "long", "BigDecimal")
+_INDEX_NAMES = ("i", "j", "k", "m", "n")
 
 PAD_HELPER = [
     "    /** 定宽右填充空格（视图切片用）：截断或补足到 n 字符。 */",
@@ -70,22 +71,25 @@ def render_group_view(node: WsNode) -> list[str]:
     return lines
 
 
-def _todo_plain(node: WsNode, msg: str) -> list[str]:
+def _todo_plain(node: WsNode, msg: str, array_dims: dict[str, list[int]] | None = None) -> list[str]:
     """退化：普通字段（非真正别名）+ TODO 标注（数组上下文 / 不支持目标）。"""
     out = [f"    // TODO {msg}"]
     if node.is_group and node.children:
         for ch in node.children:
             if ch.is_filler:
                 continue
+            dims = (array_dims or {}).get(ch.name.upper())
             if ch.is_group:
                 for g in ch.children:
                     if not g.is_filler:
-                        out += render_field(g, [ch.occurs, g.occurs] if g.occurs else
-                                            ([ch.occurs] if ch.occurs else []))
+                        gdims = (array_dims or {}).get(g.name.upper())
+                        out += render_field(g, gdims if gdims is not None else
+                                            ([ch.occurs, g.occurs] if g.occurs else
+                                             ([ch.occurs] if ch.occurs else [])))
             else:
-                out += render_field(ch, [ch.occurs] if ch.occurs else [])
+                out += render_field(ch, dims if dims is not None else ([ch.occurs] if ch.occurs else []))
     else:
-        out += render_field(node, [])
+        out += render_field(node, (array_dims or {}).get(node.name.upper(), []))
     return out
 
 
@@ -106,6 +110,135 @@ def _setter(p: str, vtype: str, read: str, W: int, rebuilt: str, wf) -> list[str
     return ([f"    public void set{p}({vtype} v) {{",
              f"        String _s = _pad({read}, {W});",
              f"        String _n = {rebuilt};"] + wf("_n") + ["    }"])
+
+
+def _index_names(count: int) -> list[str]:
+    if count <= len(_INDEX_NAMES):
+        return list(_INDEX_NAMES[:count])
+    return [f"i{n + 1}" for n in range(count)]
+
+
+def _index_params(names: list[str]) -> str:
+    return ", ".join(f"int {n}" for n in names)
+
+
+def _indexed_name(name: str, names: list[str]) -> str:
+    return name + "".join(f"[{n} - 1]" for n in names)
+
+
+def _array_storage_accessor(tnode: WsNode, dims: list[int], index_names: list[str]):
+    """Array-context backing accessor for one OCCURS ancestor element."""
+    if not dims:
+        return None
+
+    def idx(cobol_name: str) -> str:
+        return _indexed_name(java_name(cobol_name), index_names)
+
+    if tnode.is_group:
+        terms, writes, off = [], [], 0
+        for ch in tnode.children:
+            w = ch.byte_len
+            if w <= 0 or ch.occurs or ch.is_group or ch.is_edited or "COMP" in (ch.comp or "").upper():
+                return None
+            if ch.is_filler:
+                terms.append(f'_pad("", {w})')
+            elif ch.java_type == "String":
+                cn = idx(ch.name)
+                terms.append(f"_pad({cn}, {w})")
+                writes.append((off, w, cn, "String", 0))
+            elif ch.java_type in _NUMERIC:
+                cn, sc = idx(ch.name), scale_of(ch.pic)
+                terms.append(num_to_digits(cn, ch.java_type, w, sc))
+                writes.append((off, w, cn, ch.java_type, sc))
+            else:
+                return None
+            off += w
+
+        def write_fn(v: str, _writes=writes) -> list[str]:
+            out = []
+            for o, w, cn, jt, sc in _writes:
+                seg = f"{v}.substring({o}, {o + w})"
+                rhs = seg if jt == "String" else num_from_digits(seg, jt, sc)
+                out.append(f"        {cn} = {rhs};")
+            return out
+
+        return " + ".join(terms), write_fn, off
+
+    if tnode.occurs or tnode.is_edited or "COMP" in (tnode.comp or "").upper() or tnode.byte_len <= 0:
+        return None
+    name, w = idx(tnode.name), tnode.byte_len
+    if tnode.java_type == "String":
+        return name, (lambda v: [f"        {name} = {v};"]), w
+    if tnode.java_type in _NUMERIC:
+        sc, jt = scale_of(tnode.pic), tnode.java_type
+        read = num_to_digits(name, jt, w, sc)
+        return read, (lambda v: [f"        {name} = {num_from_digits(v, jt, sc)};"]), w
+    return None
+
+
+def _indexed_slice_view(ch: WsNode, off: int, w: int, read: str, wf, W: int,
+                        names: list[str]) -> list[str]:
+    p = _pascal(java_name(ch.name))
+    params = _index_params(names)
+    seg = f"_pad({read}, {W}).substring({off}, {off + w})"
+    if ch.java_type in _NUMERIC:
+        sc = scale_of(ch.pic)
+        getter = f"    public {ch.java_type} get{p}({params}) {{ return {num_from_digits(seg, ch.java_type, sc)}; }}"
+        vexpr, vtype = num_to_digits("v", ch.java_type, w, sc), ch.java_type
+    else:
+        getter = f"    public String get{p}({params}) {{ return {seg}; }}"
+        vexpr, vtype = f"_pad(v, {w})", "String"
+    rebuilt = f"_s.substring(0, {off}) + {vexpr} + _s.substring({off + w})"
+    setter_params = f"{params}, {vtype} v" if params else f"{vtype} v"
+    return ([getter, f"    public void set{p}({setter_params}) {{",
+             f"        String _s = _pad({read}, {W});",
+             f"        String _n = {rebuilt};"] + wf("_n") + ["    }"])
+
+
+def _indexed_array_view(ch: WsNode, off: int, w: int, read: str, wf, W: int,
+                        names: list[str]) -> list[str]:
+    if ch.java_type != "String":
+        return [f"    // TODO REDEFINES 子项 {ch.name} 为数值数组，需人工核对"]
+    local = _index_names(len(names) + 1)[-1]
+    all_names = names + [local]
+    p = _pascal(java_name(ch.name))
+    params = _index_params(all_names)
+    base = f"{off} + ({local} - 1) * {w}"
+    getter = (f"    public String get{p}({params}) {{ "
+              f"return _pad({read}, {W}).substring({base}, {base} + {w}); }}")
+    rebuilt = f"_s.substring(0, {base}) + _pad(v, {w}) + _s.substring({base} + {w})"
+    return ([getter, f"    public void set{p}({params}, String v) {{",
+             f"        String _s = _pad({read}, {W});",
+             f"        String _n = {rebuilt};"] + wf("_n") + ["    }"])
+
+
+def _array_redefines_view(node: WsNode, tnode: WsNode, target_dims: list[int],
+                          alias_dims: list[int]) -> list[str] | None:
+    if target_dims != alias_dims:
+        return None
+    names = _index_names(len(target_dims))
+    acc = _array_storage_accessor(tnode, target_dims, names)
+    if acc is None:
+        return None
+    read, wf, W = acc
+    out = [f"    // ── REDEFINES {node.name} → indexed view over {node.redefines}（OCCURS 元素内双向同步）──"]
+    if not node.is_group:
+        return out + _indexed_slice_view(node, 0, node.byte_len, read, wf, W, names)
+    off = 0
+    for ch in node.children:
+        w = ch.byte_len
+        if ch.is_filler:
+            off += w
+        elif ch.is_group:
+            out.append(f"    // TODO REDEFINES 子项 {ch.name} 为嵌套组，需人工核对")
+            off += w * (ch.occurs or 1)
+        elif ch.occurs:
+            out += _indexed_array_view(ch, off, w, read, wf, W, names)
+            off += w * ch.occurs
+        else:
+            out += _indexed_slice_view(ch, off, w, read, wf, W, names)
+            off += w
+    return out
 
 
 def _slice_view(ch: WsNode, off: int, w: int, read: str, wf, W: int) -> list[str]:
@@ -153,14 +286,19 @@ def _scalar_view(node: WsNode, read: str, wf, W: int) -> list[str]:
 
 
 def render_redefines(node: WsNode, name_index: dict, view_groups: set[str],
-                     arrayed: set[str]) -> list[str]:
+                     arrayed: set[str], array_dims: dict[str, list[int]] | None = None) -> list[str]:
     """REDEFINES 节点 → 视图方法（或退化 TODO）。目标缺失由调用方走 render_primary。"""
     tnode = name_index.get(node.redefines.upper())
     if tnode is None:
         return render_primary(node)
     if node.redefines.upper() in arrayed or node.name.upper() in arrayed:
+        target_dims = (array_dims or {}).get(node.redefines.upper(), [])
+        alias_dims = (array_dims or {}).get(node.name.upper(), [])
+        view = _array_redefines_view(node, tnode, target_dims, alias_dims)
+        if view is not None:
+            return view
         return _todo_plain(node, f"REDEFINES {node.redefines}: 处于 OCCURS 数组上下文，"
-                                 f"定宽视图不适用，需人工核对")
+                                 f"定宽视图不适用，需人工核对", array_dims)
     acc = storage_accessor(tnode)
     if acc is None:
         return _todo_plain(node, f"REDEFINES {node.redefines}: 目标含 OCCURS/编辑型/COMP-3 "

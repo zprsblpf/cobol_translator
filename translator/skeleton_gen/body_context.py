@@ -152,12 +152,28 @@ def _translate_paragraphs_body_asg(paras_raw: list, ctx: _rules.Ctx, ws_field_na
     return _postprocess_body(body, ws_field_names, call_args, methods)
 
 
+def _record_asg_fallback(ctx: _rules.Ctx, exc: Exception, paras_raw: list, force_sm: bool) -> None:
+    labels = [lbl for lbl, _body in paras_raw if lbl is not None]
+    ctx.asg_fallback_events.append({
+        "exception_type": type(exc).__name__,
+        "message": str(exc),
+        "paragraph_labels": labels,
+        "force_sm": force_sm,
+    })
+
+
+def asg_fallback_summary(ctx: _rules.Ctx) -> dict:
+    events = list(getattr(ctx, "asg_fallback_events", []))
+    return {"count": len(events), "events": events}
+
+
 def translate_paragraphs_body(paras_raw: list, ctx: _rules.Ctx, ws_field_names: list[str],
                               call_args: str, known_methods: set[str], force_sm: bool = False) -> str:
     """Pre-split paragraphs -> Java body. Mainline now uses ASG SectionJavaVisitor, with legacy fallback."""
     try:
         return _translate_paragraphs_body_asg(paras_raw, ctx, ws_field_names, call_args, known_methods, force_sm)
-    except Exception:
+    except Exception as exc:
+        _record_asg_fallback(ctx, exc, paras_raw, force_sm)
         return _translate_paragraphs_body_legacy_fallback(
             paras_raw, ctx, ws_field_names, call_args, known_methods, force_sm
         )

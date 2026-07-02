@@ -95,6 +95,9 @@ def _lift_perform(st, proc: ProcRegistry):
 
 
 def _goto_target(toks) -> str | None:
+    upper = [t.upper() for t in toks]
+    if "DEPENDING" in upper and "ON" in upper:
+        return None
     for t in toks:
         if t.upper() not in ("GO", "TO"):
             return t

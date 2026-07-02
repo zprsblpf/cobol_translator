@@ -104,7 +104,7 @@ def _range_method(model, using, name, body) -> list[str]:
     return out
 
 
-def render_skeleton(program) -> str:
+def render_skeleton_with_context(program) -> tuple[str, object]:
     """CobolProgram → 主类骨架 Java 源码字符串（含确定性翻译的 SECTION 方法体，步骤07）。"""
     model = build_model(program)
     res = resolve(model.copies)
@@ -128,4 +128,9 @@ def render_skeleton(program) -> str:
     for name, body in rendered.items():
         lines += _range_method(model, using, name, body)
     lines += ["}", ""]
-    return "\n".join(lines)
+    return "\n".join(lines), ctx
+
+
+def render_skeleton(program) -> str:
+    java, _ctx = render_skeleton_with_context(program)
+    return java

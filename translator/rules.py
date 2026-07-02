@@ -59,6 +59,7 @@ class Ctx:
     # 步骤13 §2.3 缺口2：程序级合成区间方法登记表，{合成方法名: 区间内各单元体按 proc_order 序拼接的 COBOL 行}。
     # **程序级、reset_section 不清**：_perform_range 命中 paragraph 区间时登记，render_skeleton 收尾 drain 落地为类级方法。
     pending_range_methods: dict = dc_field(default_factory=dict)
+    asg_fallback_events: list = dc_field(default_factory=list)
     leaves: list = dc_field(default_factory=list)   # [(id, Stmt)]
     _counter: list = dc_field(default_factory=lambda: [0])
     flow_label: str | None = None      # 状态机循环标签（dispatch 模式下为 "FLOW"，否则 None）

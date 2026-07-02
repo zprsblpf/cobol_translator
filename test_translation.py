@@ -3460,6 +3460,29 @@ class TestMainlineSectionViaAsg(unittest.TestCase):
         finally:
             bc._translate_paragraphs_body_asg = original
         self.assertEqual(expected, actual)
+        self.assertEqual(
+            bc.asg_fallback_summary(ctx2),
+            {
+                "count": 1,
+                "events": [
+                    {
+                        "exception_type": "RuntimeError",
+                        "message": "forced ASG failure",
+                        "paragraph_labels": ["MAIN-PARA"],
+                        "force_sm": False,
+                    }
+                ],
+            },
+        )
+
+    def test_asg_verification_suite_counts_mainline_fallback_coverage(self):
+        from scripts import check
+
+        suite_args = [" ".join(cmd) for cmd in check.SUITES["asg"]]
+        self.assertTrue(
+            any("test_translation.TestMainlineSectionViaAsg" in cmd for cmd in suite_args),
+            "scripts/check.py --suite asg must include mainline ASG fallback coverage",
+        )
 
     def test_legacy_fallback_helper_is_explicit_reference_wrapper(self):
         from translator.segmenter import split_paragraphs
