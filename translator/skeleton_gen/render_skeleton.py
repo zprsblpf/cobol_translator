@@ -73,8 +73,7 @@ def _entry(model, using) -> list[str]:
            f"        {model.wsaa_class} wsaa = new {model.wsaa_class}();"]
     if model.sections:
         first = model.sections[0]
-        out.append(f"        // TODO 入口控制流待译：COBOL 主体从首个 SECTION 开始 "
-                   f"→ {first.method}({_args(using)});")
+        out.append(f"        this.{first.method}({_args(using)});")
     else:
         out.append("        // TODO 入口控制流待译")
     out.append("    }")

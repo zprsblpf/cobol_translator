@@ -1,0 +1,32 @@
+id: LEAF.SEARCH.001
+verb: SEARCH
+status: implemented
+title: "SEARCH basic linear scan"
+description: |
+  Conservative deterministic translation for a simple COBOL SEARCH over a
+  known array. The first implemented subset requires an explicit VARYING index
+  and a single WHEN condition that can be translated by translate_condition.
+supported_when:
+  - "SEARCH <array> VARYING <index> WHEN <condition>"
+  - "The searched identifier is a known array in field_type_map"
+  - "The WHEN condition is supported by translator.leaf.cond.translate_condition"
+unsupported_when:
+  - "SEARCH ALL / binary search"
+  - "AT END / NOT AT END branches"
+  - "Missing VARYING index"
+  - "Multiple WHEN clauses or inline WHEN action bodies"
+  - "Unknown array metadata or unsupported condition syntax"
+examples:
+  - cobol: "SEARCH WSAA-ROWS VARYING WSAA-I WHEN WSAA-ROW-CODE(WSAA-I) = WSAA-KEY"
+    java: |
+      for (wsaaI = 1; wsaaI <= wsaaRows.length; wsaaI++) {
+          if (wsaaKey.equals(wsaaRowCode(wsaaI))) {
+              break;
+          }
+      }
+tests:
+  - "test_translation.TestLeafSearchExtract.test_basic_varying_when_loop"
+  - "test_translation.TestLeafSearchExtract.test_complex_forms_emit_structured_unsupported"
+implementation:
+  module: "translator/leaf/search.py"
+  dispatcher: "translator/leaf/__init__.py::translate_leaf_stmt"
