@@ -18,6 +18,8 @@ from translator.leaf.expr import (
     _struct_cls, _struct_obj, _struct_prefix,
 )
 
+_STRUCT_INIT_FALLBACK_FIELDS = {"FUNCTION", "FORMAT", "STATUZ"}
+
 
 def _t_initialize(toks: list[str], ctx: LeafCtx) -> tuple[list[str], bool]:
     """INITIALIZE dst1 [dst2 ...] → 重置为默认值。
@@ -35,6 +37,14 @@ def _t_initialize(toks: list[str], ctx: LeafCtx) -> tuple[list[str], bool]:
         sp = _struct_prefix(dst, ctx)
         if sp and sp[1] == "PARAMS":
             lines.append(f"{_struct_obj(sp[0], ctx)} = new {_struct_cls(sp[0], ctx)}();")
+        elif sp and sp[1] not in _STRUCT_INIT_FALLBACK_FIELDS:
+            if _is_bigdecimal(dst, ctx):
+                val = "BigDecimal.ZERO"
+            elif _is_numeric_field(dst, ctx):
+                val = "0"
+            else:
+                val = '""'
+            lines.append(_assign(dst, val, ctx))
         elif _is_field(dst, ctx):
             if _is_bigdecimal(dst, ctx):
                 val = "BigDecimal.ZERO"

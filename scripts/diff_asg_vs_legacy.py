@@ -243,6 +243,45 @@ def _asg_arith(program, ctx) -> list[tuple[str, object]]:
     return col.out
 
 
+def _fallback_line(raw: str) -> list[str]:
+    return [f"// TODO-LEAF: {raw}"]
+
+
+def _legacy_fallbacks(program, ctx) -> list[tuple[str, list[str]]]:
+    """旧路：采集未固化 simple leaf 的 TODO 回填文本，锁住 fallback 文案。"""
+    out: list[tuple[str, list[str]]] = []
+    for s in program.sections:
+        for _lbl, body in split_paragraphs(s.lines):
+            for st in segment(body):
+                for sub in _walk_segmenter_stmts(st):
+                    toks = getattr(sub, "tokens", None) or []
+                    if sub.kind == "simple" and toks:
+                        _lines, matched = rules.translate_leaf(sub, ctx)
+                        if not matched:
+                            raw = (sub.raw or " ".join(toks)).strip()
+                            out.append((raw, _fallback_line(raw)))
+    return out
+
+
+class _FallbackCollector(AsgVisitor):
+    """新路：采集 LeafJavaVisitor 对未固化 Leaf 的 TODO 输出。"""
+
+    def __init__(self, ctx):
+        self._leaf = LeafJavaVisitor(ctx)
+        self.out: list[tuple[str, list[str]]] = []
+
+    def visit_Leaf(self, node):
+        lines = self._leaf.visit(node)
+        if len(lines) == 1 and lines[0].startswith("// TODO-LEAF: "):
+            self.out.append((node.raw, lines))
+
+
+def _asg_fallbacks(program, ctx) -> list[tuple[str, list[str]]]:
+    col = _FallbackCollector(ctx)
+    col.visit(build_asg(program))
+    return col.out
+
+
 # 控制流动词（步骤23 绞杀项3⑥）：EVALUATE + 控制叶子词。比对单位＝可迁的「壳」：
 #   · 控制词 → translate_control 的 (lines)；· EVALUATE → (subject 串, case 标签元组)。
 # honest 边界（设计 §4.2）：仅 flow_label=None；dispatch 模式留骨架刀，喂 flow_label=None ctx 规避伪差异。
@@ -483,9 +522,80 @@ _SAMPLERS = {
     "IO": (_legacy_ios, _asg_ios),
     "CALL": (_legacy_calls, _asg_calls),
     "ARITH": (_legacy_arith, _asg_arith),
+    "FALLBACK": (_legacy_fallbacks, _asg_fallbacks),
     "CONTROL": (_legacy_control, _asg_control),
     "SECTION": (_legacy_sections, _asg_sections),
 }
+
+
+VERB_MATRIX = (
+    {
+        "verb": "MOVE",
+        "family": "leaf",
+        "scope": "MOVE statements via shared translate_move output",
+        "status": "migrated",
+    },
+    {
+        "verb": "IF",
+        "family": "asg",
+        "scope": "IF condition shell parity",
+        "status": "migrated",
+    },
+    {
+        "verb": "PERFORM",
+        "family": "asg",
+        "scope": "PERFORM loop shell parity",
+        "status": "migrated",
+    },
+    {
+        "verb": "PERFORMCALL",
+        "family": "skel",
+        "scope": "out-of-line PERFORM call and pending range side effects",
+        "status": "migrated",
+    },
+    {
+        "verb": "FLOW",
+        "family": "skel",
+        "scope": "section flow dispatch and cleanup side effects",
+        "status": "migrated",
+    },
+    {
+        "verb": "IO",
+        "family": "skel",
+        "scope": "BEGN, READR, WRITR, UPDAT, and DELET structure absorption",
+        "status": "migrated",
+    },
+    {
+        "verb": "CALL",
+        "family": "leaf",
+        "scope": "CALL leaf output and matched flag parity",
+        "status": "migrated",
+    },
+    {
+        "verb": "ARITH",
+        "family": "leaf",
+        "scope": "arithmetic and assignment leaf output parity",
+        "status": "migrated",
+    },
+    {
+        "verb": "FALLBACK",
+        "family": "leaf",
+        "scope": "unsupported simple leaf TODO fallback text",
+        "status": "documented-fallback",
+    },
+    {
+        "verb": "CONTROL",
+        "family": "asg",
+        "scope": "control leaf and EVALUATE shell parity",
+        "status": "migrated",
+    },
+    {
+        "verb": "SECTION",
+        "family": "asg",
+        "scope": "whole-section legacy versus SectionJavaVisitor rendering",
+        "status": "migrated",
+    },
+)
 
 
 def main() -> int:

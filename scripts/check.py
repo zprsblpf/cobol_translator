@@ -17,9 +17,9 @@ ROOT = Path(__file__).resolve().parent.parent
 SUITES = ("quick", "leaf", "asg", "deterministic", "all")
 
 
-def run(args: list[str]) -> int:
-    print("$ " + " ".join(args), flush=True)
-    return subprocess.call(args, cwd=ROOT)
+def _py(*args: str) -> list[str]:
+    """Build a Python command using the current interpreter."""
+    return [sys.executable, *args]
 
 
 def py_compile_command() -> list[str]:

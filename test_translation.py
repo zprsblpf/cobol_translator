@@ -1209,6 +1209,92 @@ class TestDiffAsgVsLegacy(unittest.TestCase):
         self.assertEqual([x[1] for x in legacy], [x[1] for x in asg])
 
 
+class TestDiffAsgVsLegacyLeafFallback(unittest.TestCase):
+    """任务03：未固化 leaf fallback 在 legacy 与 ASG 路径下保持同一 TODO 输出。"""
+
+    SRC = (
+        "       IDENTIFICATION DIVISION.\n"
+        "       PROGRAM-ID. TFALL.\n"
+        "       DATA DIVISION.\n"
+        "       WORKING-STORAGE SECTION.\n"
+        "       01 WSAA-A        PIC X(10).\n"
+        "       01 WSAA-B        PIC X(10).\n"
+        "       PROCEDURE DIVISION.\n"
+        "       1000-MAIN SECTION.\n"
+        "           DISPLAY WSAA-A.\n"
+    )
+
+    def _harness(self):
+        import importlib.util, pathlib
+        p = pathlib.Path(__file__).parent / "scripts" / "diff_asg_vs_legacy.py"
+        spec = importlib.util.spec_from_file_location("diff_asg_vs_legacy", p)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_legacy_equals_asg_leaf_fallback(self):
+        from translator.skeleton_gen.body_context import build_body_ctx
+
+        mod = self._harness()
+        prog = TestAsgMoveLift()._parse(self.SRC)
+        ctx, _ = build_body_ctx(prog)
+
+        self.assertIn("FALLBACK", mod._SAMPLERS)
+        legacy_fn, asg_fn = mod._SAMPLERS["FALLBACK"]
+        legacy = legacy_fn(prog, ctx)
+        asg = asg_fn(prog, ctx)
+
+        self.assertEqual(legacy, asg)
+        self.assertEqual(
+            legacy,
+            [("DISPLAY WSAA-A", ["// TODO-LEAF: DISPLAY WSAA-A"])],
+        )
+
+
+class TestDiffAsgVsLegacyVerbMatrix(unittest.TestCase):
+    """步骤37：diff 工具暴露稳定动词族矩阵，便于并行 worker 精确选闸。"""
+
+    def _harness(self):
+        import importlib.util, pathlib
+        p = pathlib.Path(__file__).parent / "scripts" / "diff_asg_vs_legacy.py"
+        spec = importlib.util.spec_from_file_location("diff_asg_vs_legacy", p)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_matrix_lists_stable_sampler_order(self):
+        mod = self._harness()
+
+        self.assertEqual(
+            [row["verb"] for row in mod.VERB_MATRIX],
+            [
+                "MOVE",
+                "IF",
+                "PERFORM",
+                "PERFORMCALL",
+                "FLOW",
+                "IO",
+                "CALL",
+                "ARITH",
+                "FALLBACK",
+                "CONTROL",
+                "SECTION",
+            ],
+        )
+
+    def test_matrix_rows_are_explicit_and_backed_by_samplers(self):
+        mod = self._harness()
+
+        for row in mod.VERB_MATRIX:
+            self.assertEqual(set(row), {"verb", "family", "scope", "status"})
+            self.assertIn(row["verb"], mod._SAMPLERS)
+            for key in ("verb", "family", "scope", "status"):
+                self.assertIsInstance(row[key], str)
+                self.assertTrue(row[key])
+
+        self.assertEqual({row["verb"] for row in mod.VERB_MATRIX}, set(mod._SAMPLERS))
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # 步骤19 绞杀项3② IF 迁 visitor（抽公用 translate_condition + visit_IfStmt + 比对闸扩 IF）
 #   ① translate_condition 抽出后输出正确（数值/NOT/SPACES/BigDecimal/AND-OR/复杂→None）
@@ -2146,6 +2232,27 @@ class TestLeafArithExtract(unittest.TestCase):
         self.assertEqual(translate_arith_assign("INITIALIZE ELPO-PARAMS".split(), ctx),
                          (["elpoParams = new ElpoParams();"], True))
 
+    def test_initialize_struct_field_defaults_to_blank(self):
+        from translator.leaf import translate_arith_assign
+        ctx = self._ctx(prefixes={"WSAA"})
+        self.assertEqual(translate_arith_assign("INITIALIZE WSAA-DATA".split(), ctx),
+                         (['wsaaParams.setData("");'], True))
+
+    def test_initialize_multiple_scalar_fields(self):
+        from translator.leaf import translate_arith_assign
+        self.assertEqual(
+            translate_arith_assign("INITIALIZE WSAA-COUNT WSAA-AMT WSAA-FLAG".split(), self._ctx()),
+            (["wsaaCount = 0;", "wsaaAmt = BigDecimal.ZERO;", 'wsaaFlag = "";'], True),
+        )
+
+    def test_initialize_struct_replacing_falls_through(self):
+        from translator.leaf import translate_arith_assign
+        ctx = self._ctx(prefixes={"WSAA"})
+        self.assertEqual(
+            translate_arith_assign("INITIALIZE WSAA-DATA REPLACING ALPHANUMERIC BY SPACES".split(), ctx),
+            ([], False),
+        )
+
     def test_set_to_number(self):
         from translator.leaf import translate_arith_assign
         self.assertEqual(translate_arith_assign("SET WSAA-COUNT TO 5".split(), self._ctx()),
@@ -2486,7 +2593,11 @@ class TestAsgLeafArithVisitor(unittest.TestCase):
     """② visit_Leaf 经同一 translate_arith_assign → 与之逐字符一致；未固化→UNSUPPORTED；IF body 内直译可见。"""
 
     def _ctx(self):
-        return _leaf_ctx(field_type_map={"wsaaCount": {"type": "int"}})
+        return _leaf_ctx(field_type_map={
+            "wsaaCount": {"type": "int"},
+            "wsaaA": {"type": "String"},
+            "wsaaB": {"type": "String"},
+        })
 
     def test_leaf_arith_matches_translate(self):
         from asg import Leaf, LeafJavaVisitor
@@ -2497,7 +2608,7 @@ class TestAsgLeafArithVisitor(unittest.TestCase):
         self.assertEqual(LeafJavaVisitor(ctx).visit(node), translate_arith_assign(toks, ctx)[0])
         self.assertEqual(LeafJavaVisitor(ctx).visit(node), ["wsaaCount += 1;"])
 
-    def test_unmigrated_leaf_placeholder(self):
+    def test_unstring_leaf_uses_shared_output(self):
         from asg import Leaf, LeafJavaVisitor
         node = Leaf(tokens="DISPLAY WSAA-A".split(),
                     raw="DISPLAY WSAA-A")
@@ -2609,6 +2720,18 @@ class TestUnifiedLeafEntry(unittest.TestCase):
         self.assertEqual(len(out), 1)
         self.assertIn("UNSUPPORTED[LEAF.UNKNOWN.001]", out[0])
         self.assertIn("raw=DISPLAY WSAA-A", out[0])
+
+    def test_asg_leaf_keeps_complex_string_placeholders(self):
+        from asg import Leaf, LeafJavaVisitor
+
+        cases = [
+            "STRING WSAA-A DELIMITED BY SIZE INTO WSAA-OUT NOT ON OVERFLOW MOVE 1 TO WSAA-B",
+            "STRING WSAA-A DELIMITED BY SIZE INTO WSAA-OUT ON OVERFLOW MOVE 1 TO WSAA-B NOT ON OVERFLOW MOVE 2 TO WSAA-B",
+            "STRING WSAA-A DELIMITED BY SIZE INTO WSAA-OUT WSAA-B",
+        ]
+        for raw in cases:
+            node = Leaf(tokens=raw.split(), raw=raw)
+            self.assertEqual(LeafJavaVisitor(self._ctx()).visit(node), [f"// TODO-LEAF: {raw}"])
 
     def test_rules_and_asg_leaf_share_supported_output(self):
         from asg import Leaf, LeafJavaVisitor
