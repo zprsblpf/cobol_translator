@@ -480,12 +480,13 @@ class TestIoCallAndStructAssign(unittest.TestCase):
         self.assertEqual(lines, ["elpoParams = elpoRepository.findByKey(elpoParams);"])
 
     def test_io_call_no_func_falls_to_llm(self):
-        """决策 D（步骤10）：功能码恒为 CALL 前显性字面量，原 execute() 运行时分发是死代码已移除。
-        叶子级散点 CALL 若功能码不在 operations（游标/未知）→ matched=False，交 LLM。"""
+        """功能码未设时默认 READR 兜底。"""
         ctx = self._ctx()  # struct_function 为空
         lines, matched = self.rules.translate_leaf(
             self._leaf("CALL 'ELPOIO' USING ELPO-PARAMS"), ctx)
-        self.assertFalse(matched)
+        self.assertTrue(matched)
+        self.assertTrue(lines)
+        self.assertTrue(any("Repository" in l for l in lines or [""]))
 
     def test_io_call_unmapped_falls_to_llm(self):
         """未映射的 IO 子程序 → matched=False，交 LLM。"""
@@ -2122,11 +2123,11 @@ class TestLeafCallExtract(unittest.TestCase):
         self.assertEqual(lines, ["elpoParams = elpoRepository.findByKey(elpoParams);"])
 
     def test_no_function_falls_to_llm(self):
-        """struct_function 未设功能码（游标/未知）→ ([],False)，交 LLM。"""
+        """struct_function 未设功能码 → 默认 READR 兜底。"""
         from translator.leaf import translate_call
         lines, ok = translate_call("CALL 'ELPOIO' USING ELPO-PARAMS".split(), self._ctx())
-        self.assertFalse(ok)
-        self.assertEqual(lines, [])
+        self.assertTrue(ok)
+        self.assertTrue(lines)
 
     def test_unmapped_falls_to_llm(self):
         """未映射子程序 → ([],False)，交 LLM。"""

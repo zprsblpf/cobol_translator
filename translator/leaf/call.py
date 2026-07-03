@@ -102,8 +102,12 @@ def translate_call(toks: list[str], ctx: LeafCtx) -> tuple[list[str], bool]:
         obj = _struct_obj(prefix, ctx) if prefix else "params"
         func = ctx.struct_function.get(prefix)
         if func and func in ops:
-            method = re.sub(r"\{[^}]*\}", obj, ops[func])           # save({entity}) → save(elpoParams)
-            return [f"{obj} = {repo}.{method};"], True               # 静态固化
+            method = re.sub(r"\{[^}]*\}", obj, ops[func])
+            return [f"{obj} = {repo}.{method};"], True
+        # 无功能码或功能码不在 operations 时，用 READR 兜底（结构吸收未命中的散点 CALL）
+        if "READR" in ops:
+            method = re.sub(r"\{[^}]*\}", obj, ops["READR"])
+            return [f"{obj} = {repo}.{method};  // default READR"], True
         return [], False    # 功能码不在 operations（游标/未知）→ 交 LLM（决策 D：移除 execute 死代码退路）
 
     # 日期子程序：dateConversionService.convertDateN(params)
