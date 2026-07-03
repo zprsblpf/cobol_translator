@@ -67,10 +67,18 @@ def build_body_ctx(program) -> tuple[_rules.Ctx, list[str]]:
     }
     reg = build_struct_registry(state)
     io = _load_io_maps()
+    # 88 条件名映射（从 parser 构建）
+    from parser.cobol_parser import build_88_condition_map
+    eighty_eights = build_88_condition_map(program.working_storage)
+
+    proc_order = _build_proc_order(program)
+    known_paragraphs = {u[0] for u in proc_order if u[1] == "paragraph"}
+
     ctx = _rules.Ctx(
         field_type_map=field_type_map,
         section_to_method=_section_to_method,
         known_sections={s.name.upper() for s in program.sections},
+        known_paragraphs=known_paragraphs,
         section_order=[s.name.upper() for s in program.sections],
         proc_order=_build_proc_order(program),   # 步骤13 §2.1：paragraph 级 THRU 区间解析的数据基座
         io_struct_prefixes=reg["prefixes"], struct_objects=reg["objects"],
@@ -78,6 +86,7 @@ def build_body_ctx(program) -> tuple[_rules.Ctx, list[str]]:
         struct_setter=reg["setter"], struct_default_suffix=reg["default_suffix"],
         io_programs=io["io_programs"], date_programs=io["date_programs"],
         system_programs=io["system_programs"], io_default_pattern=io["io_default_pattern"],
+        eighty_eights=eighty_eights,
     )
     return ctx, ws_field_names
 
@@ -147,9 +156,43 @@ def _translate_paragraphs_body_asg(paras_raw: list, ctx: _rules.Ctx, ws_field_na
 
     reset_section(ctx)
     paragraphs = build_asg_paragraphs(paras_raw, ctx)
+
+    # 自动检测：段内有 GO TO 指向段内 paragraph（非 SECTION）→ 启用状态机
+    if not force_sm:
+        labels = {p.label.upper() for p in paragraphs if p.label}
+        for p in paragraphs:
+            for stmt in p.stmts:
+                target = _goto_target_from_stmt(stmt, ctx)
+                if target and target in labels:
+                    force_sm = True
+                    break
+            if force_sm:
+                break
+
     body = "\n".join(SectionJavaVisitor(ctx, force_sm=force_sm).render_paragraphs(paragraphs))
     methods = set(known_methods) | set(ctx.pending_range_methods)
     return _postprocess_body(body, ws_field_names, call_args, methods)
+
+
+def _goto_target_from_stmt(stmt, ctx) -> str | None:
+    """从 ASG 语句节点提取 GO TO 目标（仅段内 paragraph，非已知 SECTION）。"""
+    from asg import nodes as asg_nodes
+    target = None
+    if isinstance(stmt, asg_nodes.GotoStmt):
+        if stmt.target:
+            target = stmt.target.name
+        else:
+            for tok in stmt.tokens:
+                if tok.upper() not in ("GO", "TO"):
+                    target = tok.upper()
+                    break
+    elif hasattr(stmt, 'tokens') and stmt.tokens:
+        toks = [t.upper() for t in stmt.tokens]
+        if toks[:1] == ["GO"] and "TO" in toks:
+            target = next((t for t in toks[1:] if t != "TO"), None)
+    if target and target not in ctx.known_sections:
+        return target
+    return None
 
 
 def _record_asg_fallback(ctx: _rules.Ctx, exc: Exception, paras_raw: list, force_sm: bool) -> None:

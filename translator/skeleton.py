@@ -257,7 +257,10 @@ public class {class_name} {{
 
 
 def _section_to_method(section_name: str) -> str:
-    """1000-INIT → init1000 / 8040A-ACMV-INF → acmvInf8040a / 0000-STARTUP → startup0000"""
+    """1000-INIT → init1000 / 8040A-ACMV-INF → acmvInf8040a / 0000-STARTUP → startup0000
+    __ENTRY → entry（PROCEDURE DIVISION 入口控制流）"""
+    if section_name.upper() == "__ENTRY":
+        return "entry"
     parts = section_name.lower().replace("-", "_").split("_")
     # 数字标号段：纯数字或"数字+字母后缀"（如 8040a、2090b），统一作为方法名后缀，
     # 避免出现以数字开头的非法 Java 标识符（如 8040A-... 旧实现会得到 8040aAcmvInf）。

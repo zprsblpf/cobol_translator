@@ -16,13 +16,13 @@ io_default_pattern:
   import_package: "com.example.repository"
   # 查询方法名以功能码结尾（驼峰）：READR→...Readr（单条），BEGN→...Begn（返回 List）。
   # 只放「单条操作」功能码 → 单方法替换（obj = repo.method(obj);）。
-  # ⚠️ 顺序读 BEGN/BEGNH/NEXTR 不在此列：它们是「按索引键定位 + NEXTR 顺序遍历」，
-  #    正确形态是 List<X> rows = repo.findBy<等值键>Begn(...); for(...) { ...结果集过滤... }，
-  #    方法名取决于循环处的等值键/过滤条件，是循环级改写，无法用固定单方法表达
-  #    （详见 knowledge/io_call_patterns.md「BEGN 定位读语义」）。
+  # BEGN：在 structure_rewrite 未吸收的单次 BEGN 调用中作为 READR 等价物兜底。
+  #   BEGN+NEXTR 循环仍由 structure_rewrite 吸收为 for(Rec r : list)。
+  #   其他顺序读功能码不在本表（正确形态由 rewrite 吸收），以防 LLM 误生。
   operations:           # COBOL 单条操作功能码 → Repository 方法（{key}/{entity} 由引擎替换为参数对象）
     READR: "findByKeyReadr({key})"
     READS: "findByKeyReads({key})"
+    BEGN:  "findByKeyBegn({key})"      # 单次定位（非循环内），等价于 READR
     UPDAT: "save({entity})"
     WRITE: "save({entity})"
     WRITR: "save({entity})"
@@ -53,6 +53,21 @@ date_programs:
     field_name: "dateConversionService"
     method: "convertDate3({params})"
 
+  DATCON2:
+    java_class: "DateConversionService"
+    field_name: "dateConversionService"
+    method: "convertDate2({params})"
+
+  DATCON3:
+    java_class: "DateConversionService"
+    field_name: "dateConversionService"
+    method: "convertDate3({params})"
+
+  DATCON4:
+    java_class: "DateConversionService"
+    field_name: "dateConversionService"
+    method: "convertDate4({params})"
+
   DATCON6:
     java_class: "DateConversionService"
     field_name: "dateConversionService"
@@ -67,3 +82,73 @@ system_programs:
     java_class: "ZpoldwntmService"
     field_name: "zpoldwntmService"
     method: "process({params})"
+
+  ZPOLPRDNM:
+    java_class: "ZpolprdnmService"
+    field_name: "zpolprdnmService"
+    method: "process({params})"
+
+  ACMVLDGCP:
+    java_class: "AcmvldgcpService"
+    field_name: "acmvldgcpService"
+    method: "process({params})"
+
+  BCNVR:
+    java_class: "BcnvrService"
+    field_name: "bcnvrService"
+    method: "convert({params})"
+
+  CAL234:
+    java_class: "Cal234Service"
+    field_name: "cal234Service"
+    method: "calculate({params})"
+
+  CALAPE:
+    java_class: "CalapeService"
+    field_name: "calapeService"
+    method: "calculate({params})"
+
+  CALCSV:
+    java_class: "CalcsvService"
+    field_name: "calcsvService"
+    method: "calculate({params})"
+
+  CALRDVAL:
+    java_class: "CalrdvalService"
+    field_name: "calrdvalService"
+    method: "calculate({params})"
+
+  CALRUVAL:
+    java_class: "CalruvalService"
+    field_name: "calruvalService"
+    method: "calculate({params})"
+
+  CHKTL:
+    java_class: "ChktlService"
+    field_name: "chktlService"
+    method: "check({params})"
+
+  GETBRN:
+    java_class: "GetbrnService"
+    field_name: "getbrnService"
+    method: "get({params})"
+
+  HEXACNV:
+    java_class: "HexacnvService"
+    field_name: "hexacnvService"
+    method: "convert({params})"
+
+  NAMADRS:
+    java_class: "NamadrsService"
+    field_name: "namadrsService"
+    method: "getNameAddress({params})"
+
+  TCPOINT:
+    java_class: "TcpointService"
+    field_name: "tcpointService"
+    method: "calculate({params})"
+
+  ZBPREM:
+    java_class: "ZbpremService"
+    field_name: "zbpremService"
+    method: "getPremium({params})"

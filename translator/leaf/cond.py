@@ -19,7 +19,10 @@ from translator.leaf.expr import (
 
 
 def translate_condition(tokens: list[str], ctx: LeafCtx) -> str | None:
-    """翻译 IF / UNTIL / WHEN 条件为 Java 布尔表达式；失败返回 None。"""
+    """翻译 IF / UNTIL / WHEN 条件为 Java 布尔表达式；失败返回 None。
+
+    支持 COBOL 隐式操作数简写：`IF A = 'X' OR 'Y'` → `IF A = 'X' OR A = 'Y'`。
+    """
     if not tokens:
         return None
     # 按 AND/OR 切分（保留连接符）
@@ -35,15 +38,53 @@ def translate_condition(tokens: list[str], ctx: LeafCtx) -> str | None:
     parts.append(cur)
 
     out: list[str] = []
+    last_left: str | None = None    # 上一个比较的左操作数（支持隐式复用）
+    last_op: str | None = None      # 上一个比较的操作符
+
     for seg in parts:
         if len(seg) == 1 and seg[0] in ("AND", "OR"):
             out.append("&&" if seg[0] == "AND" else "||")
             continue
+        # 去除首尾括号（括号包裹的 OR 列表：(... OR ... )）
+        while seg and seg[0] == "(":
+            seg = seg[1:]
+        while seg and seg[-1] == ")":
+            seg = seg[:-1]
+        if not seg:
+            continue
+        # 尝试完整解析
         expr = _try_comparison(seg, ctx)
-        if expr is None:
-            return None
-        out.append(expr)
+        if expr is not None:
+            out.append(expr)
+            # 记录左操作数和操作符供后续隐式复用
+            _left, _op = _extract_comparison_info(seg)
+            if _left:
+                last_left = _left
+                last_op = _op
+            continue
+        # 完整解析失败 → 尝试隐式操作数（COBOL 简写：A = 'X' OR 'Y'）
+        if last_left is not None and last_op is not None and len(seg) >= 1:
+            # 在 seg 前补上左操作数和操作符重试
+            augmented = [last_left, last_op] + seg
+            expr = _try_comparison(augmented, ctx)
+            if expr is not None:
+                out.append(expr)
+                continue
+        return None
     return " ".join(out)
+
+
+def _extract_comparison_info(seg: list[str]) -> tuple[str | None, str | None]:
+    """从比较分段中提取左操作数和操作符（用于隐式复用）。"""
+    for i, t in enumerate(seg):
+        u = t.upper()
+        if u == "NOT":
+            continue
+        if u in ("=", ">", "<", ">=", "<=", "EQUAL", "GREATER", "LESS"):
+            left_tokens = [x for x in seg[:i] if x.upper() != "NOT"]
+            if left_tokens:
+                return left_tokens[0], u
+    return None, None
 
 
 def _try_comparison(seg: list[str], ctx: LeafCtx) -> str | None:
@@ -74,6 +115,24 @@ def _try_comparison(seg: list[str], ctx: LeafCtx) -> str | None:
             op, op_idx = "<=", i
             break
     if op_idx < 0:
+        # 尝试 88 条件名展开
+        eighty_eights = getattr(ctx, 'eighty_eights', None) or {}
+        cond_name = None
+        negated = False
+        if len(seg) == 1:
+            cond_name = seg[0].upper()
+        elif len(seg) == 2 and seg[0].upper() == "NOT":
+            cond_name = seg[1].upper()
+            negated = True
+        if cond_name and cond_name in eighty_eights:
+            info = eighty_eights[cond_name]
+            holder = info["holder"]
+            vals = info["values"]
+            if vals:
+                ljava = _operand(holder, ctx)
+                rjava = _operand(vals[0], ctx)
+                base = f"{rjava}.equals({ljava})"
+                return f"!{base}" if negated else base
         return None  # 88 条件名 / 复杂条件 → 交 LLM
     left = [t for t in seg[:op_idx] if t.upper() != "NOT"]
     right = seg[op_idx + 1:]

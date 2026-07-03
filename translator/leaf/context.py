@@ -29,4 +29,7 @@ class LeafCtx(Protocol):
     system_programs: dict         # 系统子程序映射（SYSERR 等），名 → info
     # ── 控制流叶子词翻译读取的过程结构信息（步骤23 绞杀项3⑥；稳定结构，非骨架瞬态）──
     known_sections: set           # 所有 SECTION 名（大写）——GO TO known_section → proc_call 判定
+    known_paragraphs: set         # 所有 paragraph 名（大写）——GO TO known_para → 方法调用
     section_to_method: object     # callable: 段/paragraph 名 → java 方法名（GO TO → this.<m>();）
+    # ── 88 条件名映射（{条件名大写: {holder: 字段名, values: [值列表]}}）──
+    eighty_eights: dict           # 条件名→字段映射，用于 IF IS-6PWB 展开为 IF VAL28-PRD = '6PWB'

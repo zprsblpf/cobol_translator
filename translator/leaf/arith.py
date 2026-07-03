@@ -139,7 +139,7 @@ def _t_divide(toks: list[str], ctx: LeafCtx) -> tuple[list[str], bool]:
 
 
 def _t_compute(toks: list[str], ctx: LeafCtx) -> tuple[list[str], bool]:
-    # COMPUTE dst [ROUNDED] = expr  （仅固化整型；BigDecimal 表达式交 LLM）
+    # COMPUTE dst [ROUNDED] = expr
     u = [t.upper() for t in toks]
     if "=" not in u:
         return [], False
@@ -148,8 +148,6 @@ def _t_compute(toks: list[str], ctx: LeafCtx) -> tuple[list[str], bool]:
     if len(dst_toks) != 1:
         return [], False
     dst = dst_toks[0]
-    if _is_bigdecimal(dst, ctx):
-        return [], False  # BigDecimal 中缀转链式不可靠 → LLM
     expr_toks = toks[eq + 1:]
     parts = []
     for t in expr_toks:
@@ -157,7 +155,11 @@ def _t_compute(toks: list[str], ctx: LeafCtx) -> tuple[list[str], bool]:
             parts.append(t)
         else:
             parts.append(_operand(t, ctx))
-    return [f"{_lvalue(dst, ctx)} = {' '.join(parts)};"], True
+    # BigDecimal 字段用 doubleValue 计算后重建（简单模式，不处理精度）
+    result = ' '.join(parts)
+    if _is_bigdecimal(dst, ctx):
+        result = f"java.math.BigDecimal.valueOf({result})"
+    return [f"{_lvalue(dst, ctx)} = {result};"], True
 
 
 _ARITH = {"ADD": _t_add, "SUBTRACT": _t_subtract, "MULTIPLY": _t_multiply,

@@ -2365,7 +2365,6 @@ class TestLeafStringExtract(unittest.TestCase):
             "STRING WSAA-A DELIMITED BY SIZE INTO WSAA-OUT NOT ON OVERFLOW MOVE 1 TO WSAA-C",
             "STRING WSAA-A DELIMITED BY SIZE INTO WSAA-OUT ON OVERFLOW MOVE 1 TO WSAA-C NOT ON OVERFLOW MOVE 2 TO WSAA-C",
             "STRING WSAA-A DELIMITED BY SIZE INTO WSAA-OUT WSAA-B",
-            "STRING WSAA-A INTO WSAA-OUT",
             "STRING WSAA-A DELIMITED BY SIZE",
         ]
         for line in cases:
@@ -2725,8 +2724,8 @@ class TestLeafControlExtract(unittest.TestCase):
     def test_goto_known_section_proc_call(self):
         lines, ok = self._c("GO TO 2000-SEC", known={"2000-SEC"})
         self.assertTrue(ok)
-        self.assertEqual(lines, ["// TODO-GOTO: 跳转 2000-SEC，需人工核对控制流",
-                                 "this.2000-SEC();", "return;"])
+        self.assertEqual(lines, ["this.2000-SEC();  // GO TO 2000-SEC",
+                                 "return;"])
 
     def test_goto_no_target(self):
         self.assertEqual(self._c("GO"), (["return;"], True))

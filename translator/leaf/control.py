@@ -54,10 +54,21 @@ def translate_control(tokens: list[str], ctx: LeafCtx) -> tuple[list[str], bool]
             if target and target.endswith("EXIT"):
                 return [f"return;  // GO TO {target}"], True
             if target:
-                line = f"// TODO-GOTO: 跳转 {target}，需人工核对控制流"
                 if target in ctx.known_sections:
-                    return [line, f"this.{ctx.section_to_method(target)}();", "return;"], True
-                return [line, "return;"], True
+                    # 已知 SECTION → 方法调用 + return
+                    return [f"this.{ctx.section_to_method(target)}();  // GO TO {target}",
+                            "return;"], True
+                # 检查是否为已知 paragraph（在 proc_order 中注册过）
+                known_paras = getattr(ctx, 'known_paragraphs', None) or set()
+                if target in known_paras:
+                    mname = getattr(ctx, 'section_to_method', None)
+                    if mname:
+                        return [f"this.{mname(target)}();  // GO TO {target}",
+                                "return;"], True
+                    return [f"return;  // GO TO {target} (paragraph)"], True
+                # 未知目标 → 标 TODO 人工核对
+                return [f"// TODO-GOTO: 跳转 {target}，需人工核对控制流",
+                        "return;"], True
             return ["return;"], True
         if first in ("GOBACK", "STOP"):
             return ["return;"], True

@@ -50,7 +50,7 @@ class TestDeterministicReportOutput(unittest.TestCase):
 
             alpha = report["files"][0]
             self.assertEqual(alpha["program_id"], "ALPHA")
-            self.assertEqual(alpha["todo_count"], 2)
+            self.assertEqual(alpha["todo_count"], 1)  # 入口控制流已实现，不再有 TODO
             self.assertGreaterEqual(alpha["risk_count"], 1)
             self.assertEqual(alpha["asg_fallback_summary"], {"count": 0, "events": []})
 

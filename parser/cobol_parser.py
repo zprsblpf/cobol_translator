@@ -160,6 +160,30 @@ def _parse_variables(lines: list[str]) -> list[Variable]:
     return variables
 
 
+def build_88_condition_map(variables: list[Variable]) -> dict[str, dict]:
+    """从变量列表构建 88 条件名 → {holder, values} 映射。
+
+    88 条件的 holder 是它前面的最近非 88 变量。
+    如：03 WSAA-VAL28-PRD → 88 IS-6PWB VALUES '6PWB'
+        → {"IS-6PWB": {"holder": "WSAA-VAL28-PRD", "values": ["6PWB"]}}
+    """
+    cond_map: dict[str, dict] = {}
+    current_holder: str | None = None
+    for var in variables:
+        if var.level == 88:
+            import re
+            vm = re.findall(r"VALUES?\s+['\"]?([^'\"\s]+)['\"]?", var.raw_line, re.IGNORECASE)
+            values = vm if vm else []
+            if var.name and current_holder:
+                cond_map[var.name.upper()] = {
+                    "holder": current_holder,
+                    "values": values,
+                }
+        else:
+            current_holder = var.name
+    return cond_map
+
+
 # ── SECTION 解析 ──────────────────────────────────────────────────────────────
 
 _SECTION_RE = re.compile(
@@ -178,7 +202,11 @@ def _parse_sections(
     raw_lines: list[str],
     proc_start: int,
 ) -> list[CobolSection]:
-    """从 PROCEDURE DIVISION 开始，解析所有 SECTION。"""
+    """从 PROCEDURE DIVISION 开始，解析所有 SECTION。
+
+    如果 PROCEDURE DIVISION 和第一个 SECTION 之间存在代码（自由段落），
+    捕获为 __ENTRY 段——这些是主入口控制流。
+    """
     sections: list[CobolSection] = []
     current_name = ""
     current_lines: list[str] = []
@@ -199,6 +227,59 @@ def _parse_sections(
             go_tos=go_tos,
             line_start=current_start,
             line_end=end_line,
+        ))
+
+    first_sec_line = None
+    for i, raw in enumerate(raw_lines[proc_start:], proc_start + 1):
+        clean = _strip_cobol_line(raw)
+        if not clean.strip():
+            continue
+        if _SECTION_RE.match(clean):
+            first_sec_line = i
+            break
+
+    # 检查 PROCEDURE DIVISION 和第一个 SECTION 之间是否有有效代码
+    # （跳过 PROCEDURE DIVISION 头本身，只算真实语句）
+    has_entry_code = False
+    if first_sec_line and first_sec_line > proc_start + 1:
+        # 跳过 PROCEDURE DIVISION 头：proc_start 那行就是
+        first_data_line = proc_start + 1
+        # 跳过后续空行和注释，找第一条有效代码
+        for j in range(first_data_line, first_sec_line - 1):
+            if j < len(raw_lines):
+                c = _strip_cobol_line(raw_lines[j])
+                if c.strip():
+                    # 确认不是 PROCEDURE DIVISION/USING 的延续
+                    upper = c.strip().upper()
+                    if upper.startswith("PROCEDURE DIVISION") or upper.startswith("USING"):
+                        continue
+                    if upper.startswith("!!!!!!"):
+                        continue
+                    has_entry_code = True
+                    break
+
+    if has_entry_code:
+        # 把 PROCEDURE DIVISION 入口代码作为 __ENTRY 段
+        entry_lines: list[str] = []
+        for j in range(proc_start, first_sec_line - 1):
+            if j < len(raw_lines):
+                c = _strip_cobol_line(raw_lines[j])
+                if c.strip():
+                    upper = c.strip().upper()
+                    if upper.startswith("PROCEDURE DIVISION") or upper.startswith("USING"):
+                        continue
+                    if upper.startswith("!!!!!!"):
+                        continue
+                    entry_lines.append(c)
+        entry_code = "\n".join(entry_lines)
+        sections.append(CobolSection(
+            name="__ENTRY",
+            lines=entry_lines,
+            performs=list({m.group(1).upper() for m in _PERFORM_RE.finditer(entry_code)}),
+            calls=list({m.group(1).upper() for m in _CALL_RE.finditer(entry_code)}),
+            go_tos=list({m.group(1).upper() for m in _GOTO_RE.finditer(entry_code)}),
+            line_start=proc_start,
+            line_end=first_sec_line - 1,
         ))
 
     for i, raw in enumerate(raw_lines[proc_start:], proc_start + 1):
@@ -285,7 +366,7 @@ def parse(cob_file: str | Path) -> CobolProgram:
         if using_m:
             linkage_using = [t.strip() for t in using_m.group(1).split() if t.strip()]
 
-    # 6. 解析所有 SECTION
+    # 6. 解析所有 SECTION（含 __ENTRY 入口段，位于 PROCEDURE DIVISION 与首个 SECTION 之间）
     sections = _parse_sections(raw_lines, proc_start) if proc_start >= 0 else []
 
     # 7. 收集 COPY 引用
@@ -296,6 +377,9 @@ def parse(cob_file: str | Path) -> CobolProgram:
         m = re.search(r"\bCOPY\s+(\S+)", line)
         if m:
             copy_refs.append(m.group(1).rstrip("."))
+
+    # 8. 构建 88 条件名映射（从 WS variables）
+    eighty_eights = build_88_condition_map(working_storage)
 
     return CobolProgram(
         program_id=program_id,

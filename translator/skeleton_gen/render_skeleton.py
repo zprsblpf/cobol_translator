@@ -64,7 +64,8 @@ def _services_and_ctor(model, res) -> list[str]:
 
 
 def _entry(model, using) -> list[str]:
-    """主入口 execute：USING→入参，方法内 new WS 容器（§8）。"""
+    """主入口 execute：USING→入参，方法内 new WS 容器（§8）。
+    如果有 __ENTRY 段（PROCEDURE DIVISION 入口控制流），调用其方法。"""
     params = ", ".join(f"{t} {f}" for t, f in using)
     out = ["", "    /**",
            f"     * 主入口：对应 PROCEDURE DIVISION USING {' '.join(model.using)}。",
@@ -73,8 +74,10 @@ def _entry(model, using) -> list[str]:
            f"        {model.wsaa_class} wsaa = new {model.wsaa_class}();"]
     if model.sections:
         first = model.sections[0]
-        out.append(f"        // TODO 入口控制流待译：COBOL 主体从首个 SECTION 开始 "
-                   f"→ {first.method}({_args(using)});")
+        if first.cobol_name == "__ENTRY":
+            out.append(f"        this.{first.method}({_args(using)});  // 入口控制流")
+        else:
+            out.append(f"        this.{first.method}({_args(using)});  // 首个 SECTION")
     else:
         out.append("        // TODO 入口控制流待译")
     out.append("    }")
@@ -85,9 +88,10 @@ def _section_method(model, using, s, ctx, ws_field_names, known_methods) -> list
     """单个 SECTION → 方法签名（带 wsaa）+ 确定性翻译方法体（步骤07，接 rules 引擎，无 LLM）。"""
     out = ["", f"    void {s.method}({_sig(model.wsaa_class, using)}) {{",
            f"        // COBOL SECTION: {s.cobol_name} (行 {s.line_start}-{s.line_end})"]
-    if s.go_tos:
-        out.append("        // TODO-GOTO: 含 GO TO 语句，控制流需人工核对")
     body = translate_section_body(s.body_lines, ctx, ws_field_names, _args(using), known_methods)
+    # 只有 body 中还有 TODO-GOTO 才标记段级 GO TO 警告（已处理的 GO TO 不标）
+    if s.go_tos and "TODO-GOTO" in body:
+        out.append("        // TODO-GOTO: 含未处理的 GO TO 语句，控制流需人工核对")
     # 方法体缩进到方法内层（8 空格基准）
     out += [("        " + ln if ln.strip() else "") for ln in body.split("\n")]
     out.append("    }")

@@ -52,7 +52,8 @@ class Ctx:
     field_type_map: dict
     section_to_method: object          # callable: SEC名 -> java 方法名
     known_sections: set                # 所有 SECTION 名（大写）
-    section_order: list = dc_field(default_factory=list)  # 全程序 SECTION 名顺序（大写）——PERFORM…THRU 区间判定用（步骤12 §2）
+    section_order: list = dc_field(default_factory=list)
+    known_paragraphs: set = dc_field(default_factory=set)  # 所有 paragraph 名（大写）  # 全程序 SECTION 名顺序（大写）——PERFORM…THRU 区间判定用（步骤12 §2）
     # 步骤13 §2.1 缺口1：全程序「过程单元顺序表」，四元 (name_upper, kind, section_upper, body_lines)，
     # kind∈{section,paragraph}，按源码物理顺序罗列所有 SECTION 头与其下 paragraph；paragraph 级 THRU 区间解析用。
     proc_order: list = dc_field(default_factory=list)
@@ -77,6 +78,8 @@ class Ctx:
     system_programs: dict = dc_field(default_factory=dict)  # 系统子程序（SYSERR 等），名→info
     io_default_pattern: dict = dc_field(default_factory=dict)  # *IO 查表派生范式（io_mappings.yaml）
     struct_function: dict = dc_field(default_factory=dict)  # 运行时跟踪：前缀→最近功能码（如 ELPO→READR）
+    # ── 88 条件名映射（{条件名大写: {holder: 字段名, values: [值列表]}}）──
+    eighty_eights: dict = dc_field(default_factory=dict)
 
     def new_leaf(self, stmt: Stmt) -> str:
         i = self._counter[0]
