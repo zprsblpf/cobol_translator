@@ -1,3 +1,9 @@
+"""
+T16 确定性报告输出测试。
+
+验证 scripts/deterministic_report.py 的多输入确定性 JSON 报告格式，
+包括版本号、文件列表、TODO/风险/ASG fallback 计数等字段的稳定性。
+"""
 import json
 import tempfile
 import unittest

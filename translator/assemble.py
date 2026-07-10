@@ -113,8 +113,28 @@ def assemble_outputs(state: dict) -> dict:
             f.write(f"- {fn}: {n} 行\n")
         f.write("\n## 翻译统计\n")
         f.write(f"- 总 SECTION 数: {len(sections_meta)}\n")
-        f.write(f"- 已填充方法: {total_replaced}\n")
+        f.write(f"- 已填充方法: {total_replaced}/{len(sections_meta)}\n")
         f.write(f"- 调用链最大深度: {cg.get('max_depth', 0)}\n")
+        f.write(f"- 调用环数: {len(cg.get('cycles', []))}\n")
+        f.write(f"- 入口段: {cg.get('entry_section', '?')}\n")
+        f.write(f"- 入口序列: {', '.join(cg.get('entry_sequence', []))[:100]}\n")
+
+        # 风险清单（从 java_validator 获取）
+        try:
+            from validator.java_validator import scan_risks
+            # 拼接所有模块的 Java 源码
+            all_java = ""
+            for mod in state.get("modules", []):
+                mod_skel = state.get("module_skeletons", {}).get(mod["class_name"], "")
+                filled, _cnt = _fill_stubs(mod_skel, mod["sections"], translated, meta_by_name)
+                all_java += filled
+            java_risks = scan_risks(all_java)
+            if java_risks:
+                f.write("\n## Java 产物风险扫描\n\n")
+                for risk in java_risks:
+                    f.write(f"- {risk}\n")
+        except (ImportError, Exception):
+            pass  # scan_risks 不可用时不阻塞
 
     if size_warnings:
         for w in size_warnings:

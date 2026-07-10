@@ -1,3 +1,8 @@
+"""
+T13-T14 WS 字段视图测试（合格字段引用 + REDEFINES 数组视图）。
+
+覆盖 COBOL 的 OF/IN 限定名解析和 REDEFINES 在 OCCURS 内的切片访问器生成。
+"""
 import unittest
 from types import SimpleNamespace
 

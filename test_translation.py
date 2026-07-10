@@ -1025,6 +1025,222 @@ class TestAsgBuild(unittest.TestCase):
         from asg import build_asg
         return build_asg
 
+    # ── 语句族提升覆盖 ─────────────────────────────────────────────────
+
+    def _lift_types(self, src: str) -> dict[str, int]:
+        """解析源码 → 构建 ASG → 统计各节点类型出现次数。"""
+        from asg import build_asg
+        from asg import nodes as asg_nodes
+        prog = self._parse(src)
+        asg = build_asg(prog)
+        counts: dict[str, int] = {}
+        for sec in asg.sections:
+            for para in sec.paragraphs:
+                for stmt in para.stmts:
+                    tn = type(stmt).__name__
+                    counts[tn] = counts.get(tn, 0) + 1
+                    # 收集嵌套子节点
+                    for attr in ("then", "els", "inline_body"):
+                        for c in getattr(stmt, attr, None) or []:
+                            tn2 = type(c).__name__
+                            counts[tn2] = counts.get(tn2, 0) + 1
+                    if hasattr(stmt, "whens"):
+                        for _cond, body in stmt.whens:
+                            for c in body:
+                                tn2 = type(c).__name__
+                                counts[tn2] = counts.get(tn2, 0) + 1
+        return counts
+
+    def test_lift_move(self):
+        """MOVE → MoveStmt。"""
+        src = (
+            "       IDENTIFICATION DIVISION.\n"
+            "       PROGRAM-ID. TMOVE.\n"
+            "       DATA DIVISION.\n"
+            "       WORKING-STORAGE SECTION.\n"
+            "       01 WSAA-X PIC X(04).\n"
+            "       01 WSAA-Y PIC X(04).\n"
+            "       PROCEDURE DIVISION.\n"
+            "       1000-MAIN SECTION.\n"
+            "           MOVE WSAA-X TO WSAA-Y.\n"
+        )
+        counts = self._lift_types(src)
+        self.assertGreater(counts.get("MoveStmt", 0), 0, "MOVE → 应提升为 MoveStmt")
+        self.assertEqual(counts.get("MoveStmt", 0), 1)
+
+    def test_lift_if(self):
+        """IF → IfStmt。"""
+        src = (
+            "       IDENTIFICATION DIVISION.\n"
+            "       PROGRAM-ID. TIF.\n"
+            "       DATA DIVISION.\n"
+            "       WORKING-STORAGE SECTION.\n"
+            "       01 WSAA-X PIC X(04).\n"
+            "       PROCEDURE DIVISION.\n"
+            "       1000-MAIN SECTION.\n"
+            "           IF WSAA-X = 'A'\n"
+            "               MOVE 'B' TO WSAA-X\n"
+            "           END-IF.\n"
+        )
+        counts = self._lift_types(src)
+        self.assertGreater(counts.get("IfStmt", 0), 0, "IF → 应提升为 IfStmt")
+        self.assertEqual(counts.get("IfStmt", 0), 1)
+
+    def test_lift_if_else(self):
+        """IF/ELSE → IfStmt 含 els 分支。"""
+        from asg import build_asg, IfStmt
+        src = (
+            "       IDENTIFICATION DIVISION.\n"
+            "       PROGRAM-ID. TIFE.\n"
+            "       DATA DIVISION.\n"
+            "       WORKING-STORAGE SECTION.\n"
+            "       01 WSAA-X PIC X(04).\n"
+            "       PROCEDURE DIVISION.\n"
+            "       1000-MAIN SECTION.\n"
+            "           IF WSAA-X = 'A'\n"
+            "               MOVE 'B' TO WSAA-X\n"
+            "           ELSE\n"
+            "               MOVE 'C' TO WSAA-X\n"
+            "           END-IF.\n"
+        )
+        prog = self._parse(src)
+        asg = self._import_build()(prog)
+        for sec in asg.sections:
+            for para in sec.paragraphs:
+                for stmt in para.stmts:
+                    if isinstance(stmt, IfStmt):
+                        self.assertTrue(stmt.els, "IF/ELSE → els 分支非空")
+                        return
+        self.fail("未找到 IfStmt")
+
+    def test_lift_evaluate(self):
+        """EVALUATE → EvaluateStmt。"""
+        src = (
+            "       IDENTIFICATION DIVISION.\n"
+            "       PROGRAM-ID. TEVAL.\n"
+            "       DATA DIVISION.\n"
+            "       WORKING-STORAGE SECTION.\n"
+            "       01 WSAA-X PIC X(04).\n"
+            "       PROCEDURE DIVISION.\n"
+            "       1000-MAIN SECTION.\n"
+            "           EVALUATE WSAA-X\n"
+            "               WHEN 'A'\n"
+            "                   MOVE 'B' TO WSAA-X\n"
+            "           END-EVALUATE.\n"
+        )
+        counts = self._lift_types(src)
+        self.assertGreater(counts.get("EvaluateStmt", 0), 0, "EVALUATE → 应提升为 EvaluateStmt")
+
+    def test_lift_perform_out_of_line(self):
+        """PERFORM section → PerformStmt（out-of-line）。"""
+        src = (
+            "       IDENTIFICATION DIVISION.\n"
+            "       PROGRAM-ID. TPERF.\n"
+            "       DATA DIVISION.\n"
+            "       WORKING-STORAGE SECTION.\n"
+            "       01 WSAA-X PIC X(04).\n"
+            "       PROCEDURE DIVISION.\n"
+            "       1000-MAIN SECTION.\n"
+            "           PERFORM 2000-DONE.\n"
+            "       2000-DONE SECTION.\n"
+            "           MOVE 'A' TO WSAA-X.\n"
+        )
+        counts = self._lift_types(src)
+        self.assertGreater(counts.get("PerformStmt", 0), 0, "PERFORM → 应提升为 PerformStmt")
+
+    def test_lift_perform_loop(self):
+        """PERFORM inline loop → PerformStmt 含 inline_body。"""
+        from asg import build_asg, PerformStmt
+        src = (
+            "       IDENTIFICATION DIVISION.\n"
+            "       PROGRAM-ID. TLOOP.\n"
+            "       DATA DIVISION.\n"
+            "       WORKING-STORAGE SECTION.\n"
+            "       01 WSAA-I PIC 9(02).\n"
+            "       01 WSAA-X PIC X(04).\n"
+            "       PROCEDURE DIVISION.\n"
+            "       1000-MAIN SECTION.\n"
+            "           PERFORM VARYING WSAA-I FROM 1 BY 1 UNTIL WSAA-I > 10\n"
+            "               MOVE 'A' TO WSAA-X\n"
+            "           END-PERFORM.\n"
+        )
+        prog = self._parse(src)
+        asg = self._import_build()(prog)
+        for sec in asg.sections:
+            for para in sec.paragraphs:
+                for stmt in para.stmts:
+                    if isinstance(stmt, PerformStmt):
+                        self.assertTrue(stmt.inline_body, "PERFORM 循环 → inline_body 非空")
+                        return
+        self.fail("未找到 PerformStmt")
+
+    def test_lift_call(self):
+        """CALL → CallStmt。"""
+        src = (
+            "       IDENTIFICATION DIVISION.\n"
+            "       PROGRAM-ID. TCALL.\n"
+            "       DATA DIVISION.\n"
+            "       WORKING-STORAGE SECTION.\n"
+            "       01 WSAA-PARAMS.\n"
+            "          03 WSAA-FUNC PIC X(05).\n"
+            "       PROCEDURE DIVISION.\n"
+            "       1000-MAIN SECTION.\n"
+            "           CALL 'SYSERR' USING WSAA-PARAMS.\n"
+        )
+        counts = self._lift_types(src)
+        self.assertGreater(counts.get("CallStmt", 0), 0, "CALL → 应提升为 CallStmt")
+
+    def test_lift_goto(self):
+        """GO TO → GotoStmt。"""
+        src = (
+            "       IDENTIFICATION DIVISION.\n"
+            "       PROGRAM-ID. TGOTO.\n"
+            "       DATA DIVISION.\n"
+            "       WORKING-STORAGE SECTION.\n"
+            "       01 WSAA-X PIC X(04).\n"
+            "       PROCEDURE DIVISION.\n"
+            "       1000-MAIN SECTION.\n"
+            "           GO TO 1000-EXIT.\n"
+            "       1000-EXIT.\n"
+            "           EXIT.\n"
+        )
+        counts = self._lift_types(src)
+        self.assertGreater(counts.get("GotoStmt", 0), 0, "GO TO → 应提升为 GotoStmt")
+
+    def test_lift_arithmetic_as_leaf(self):
+        """ADD/COMPUTE → Leaf（未单独提升，属于已记录的 fallback）。"""
+        src = (
+            "       IDENTIFICATION DIVISION.\n"
+            "       PROGRAM-ID. TARITH.\n"
+            "       DATA DIVISION.\n"
+            "       WORKING-STORAGE SECTION.\n"
+            "       01 WSAA-X PIC 9(04).\n"
+            "       01 WSAA-Y PIC 9(04).\n"
+            "       PROCEDURE DIVISION.\n"
+            "       1000-MAIN SECTION.\n"
+            "           ADD 1 TO WSAA-X.\n"
+            "           COMPUTE WSAA-Y = WSAA-X + 1.\n"
+        )
+        counts = self._lift_types(src)
+        self.assertGreater(counts.get("Leaf", 0), 0, "算术语句 → 应提升为 Leaf（fallback）")
+        # 不应误提升为其他类型
+        self.assertEqual(counts.get("MoveStmt", 0), 0)
+
+    def test_lift_exit_as_leaf(self):
+        """EXIT → Leaf（未单独提升，通过 translate_control 翻译）。"""
+        src = (
+            "       IDENTIFICATION DIVISION.\n"
+            "       PROGRAM-ID. TEXIT.\n"
+            "       DATA DIVISION.\n"
+            "       WORKING-STORAGE SECTION.\n"
+            "       01 WSAA-X PIC X(04).\n"
+            "       PROCEDURE DIVISION.\n"
+            "       1000-MAIN SECTION.\n"
+            "           EXIT.\n"
+        )
+        counts = self._lift_types(src)
+        self.assertGreaterEqual(counts.get("Leaf", 0), 1, "EXIT → 应提升为 Leaf（控制流）")
+
 
 class TestAsgRegistryThru(unittest.TestCase):
     """③ PERFORM THRU 区间：resolve_thru 在合成单元上取 [A..B] 闭区间，不丢中间、保守退化。"""
@@ -2992,6 +3208,66 @@ class TestAsgBegnForeachRewrite(unittest.TestCase):
         "           EXIT.\n"
     )
 
+    SRC_MULTIKEY = (
+        "       IDENTIFICATION DIVISION.\n"
+        "       PROGRAM-ID. TBEGN2.\n"
+        "       DATA DIVISION.\n"
+        "       WORKING-STORAGE SECTION.\n"
+        "       01 WSAA-KEY1 PIC X(02).\n"
+        "       01 WSAA-KEY2 PIC X(03).\n"
+        "       01 WSAA-OUT PIC X(02).\n"
+        "       01 ELPO-PARAMS.\n"
+        "          03 ELPO-FUNCTION PIC X(05).\n"
+        "       PROCEDURE DIVISION.\n"
+        "       1000-MAIN SECTION.\n"
+        "       SETUP-PARA.\n"
+        "           MOVE WSAA-KEY1 TO ELPO-CHDRNUM.\n"
+        "           MOVE WSAA-KEY2 TO ELPO-CHDRCOY.\n"
+        "           MOVE BEGN TO ELPO-FUNCTION.\n"
+        "       LOOP-PARA.\n"
+        "           CALL 'ELPOIO' USING ELPO-PARAMS.\n"
+        "           IF ELPO-STATUZ NOT = O-K\n"
+        "               OR ELPO-CHDRNUM NOT = WSAA-KEY1\n"
+        "               OR ELPO-CHDRCOY NOT = WSAA-KEY2\n"
+        "               GO TO EXIT-PARA\n"
+        "           END-IF.\n"
+        "           MOVE ELPO-DATA TO WSAA-OUT.\n"
+        "           MOVE NEXTR TO ELPO-FUNCTION.\n"
+        "           GO TO LOOP-PARA.\n"
+        "       EXIT-PARA.\n"
+        "           EXIT.\n"
+    )
+
+    SRC_NESTED_IF = (
+        "       IDENTIFICATION DIVISION.\n"
+        "       PROGRAM-ID. TBEGN3.\n"
+        "       DATA DIVISION.\n"
+        "       WORKING-STORAGE SECTION.\n"
+        "       01 WSAA-KEY PIC X(02).\n"
+        "       01 WSAA-OUT PIC X(02).\n"
+        "       01 WSAA-FLAG PIC X(01).\n"
+        "       01 ELPO-PARAMS.\n"
+        "          03 ELPO-FUNCTION PIC X(05).\n"
+        "       PROCEDURE DIVISION.\n"
+        "       1000-MAIN SECTION.\n"
+        "       SETUP-PARA.\n"
+        "           MOVE WSAA-KEY TO ELPO-CHDRNUM.\n"
+        "           MOVE BEGN TO ELPO-FUNCTION.\n"
+        "       LOOP-PARA.\n"
+        "           CALL 'ELPOIO' USING ELPO-PARAMS.\n"
+        "           IF ELPO-STATUZ NOT = O-K OR ELPO-CHDRNUM NOT = WSAA-KEY\n"
+        "               GO TO EXIT-PARA\n"
+        "           END-IF.\n"
+        "           MOVE ELPO-DATA TO WSAA-OUT.\n"
+        "           IF WSAA-FLAG = 'Y'\n"
+        "               MOVE 'OK' TO WSAA-OUT\n"
+        "           END-IF.\n"
+        "           MOVE NEXTR TO ELPO-FUNCTION.\n"
+        "           GO TO LOOP-PARA.\n"
+        "       EXIT-PARA.\n"
+        "           EXIT.\n"
+    )
+
     def _program_and_ctx(self):
         from translator.skeleton_gen.body_context import build_body_ctx
         prog = TestAsgMoveLift()._parse(self.SRC)
@@ -3023,6 +3299,41 @@ class TestAsgBegnForeachRewrite(unittest.TestCase):
         self.assertFalse(any(isinstance(st, BegnForeachStmt)
                              for para in rewritten for st in para.stmts))
 
+    def test_multikey_begn_foreach(self):
+        """BEGN + 多键（CHDRNUM + CHDRCOY）→ 两个 key 都被提取。"""
+        from asg import build_asg, BegnForeachStmt
+        from asg.structure_rewrite import rewrite_begn_foreach
+        from translator.skeleton_gen.body_context import build_body_ctx
+        prog = TestAsgMoveLift()._parse(self.SRC_MULTIKEY)
+        ctx, _ = build_body_ctx(prog)
+        sec = build_asg(prog).sections[0]
+        rewritten = rewrite_begn_foreach(sec.paragraphs, ctx)
+        loop = rewritten[1]
+        self.assertIsInstance(loop.stmts[0], BegnForeachStmt)
+        bf = loop.stmts[0]
+        keys = bf.keys
+        self.assertEqual(2, len(keys), "多键 BEGN 应提取 2 个 key")
+        key_names = {k[0].upper() for k in keys}
+        self.assertIn("CHDRNUM", key_names)
+        self.assertIn("CHDRCOY", key_names)
+
+    def test_begn_foreach_with_nested_if(self):
+        """BEGN for-each 体内含 IF 条件分支 → 正确保留在 body 中。"""
+        from asg import build_asg, BegnForeachStmt, IfStmt
+        from asg.structure_rewrite import rewrite_begn_foreach
+        from translator.skeleton_gen.body_context import build_body_ctx
+        prog = TestAsgMoveLift()._parse(self.SRC_NESTED_IF)
+        ctx, _ = build_body_ctx(prog)
+        sec = build_asg(prog).sections[0]
+        rewritten = rewrite_begn_foreach(sec.paragraphs, ctx)
+        loop = rewritten[1]
+        self.assertIsInstance(loop.stmts[0], BegnForeachStmt)
+        bf = loop.stmts[0]
+        self.assertGreater(len(bf.body), 1, "body 应有多个语句")
+        self.assertTrue(any(isinstance(st, IfStmt) for st in bf.body),
+                        "body 应包含嵌套 IF")
+        self.assertEqual("ELPO", bf.pfx)
+
 
 class TestAsgBegnForeachVisitor(unittest.TestCase):
     """步骤25：BEGN foreach 经 SectionJavaVisitor 渲染，并支持 struct_rebind。"""
@@ -3041,6 +3352,34 @@ class TestAsgBegnForeachVisitor(unittest.TestCase):
         self.assertIn("for (ElpoRecord elpo : elpoList) {", rendered)
         self.assertIn("wsaaOut = elpo.getData();", rendered)
         self.assertNotIn("setFunction", rendered)
+
+    def test_multikey_begn_foreach_visitor(self):
+        """多键 BEGN for-each 经 SectionJavaVisitor → 产物含 And<Key2>Begn 方法调用。"""
+        from translator.skeleton_gen.body_context import build_body_ctx
+        mod = TestDiffAsgVsLegacy()._harness()
+        prog = TestAsgMoveLift()._parse(TestAsgBegnForeachRewrite.SRC_MULTIKEY)
+        ctx1, _ = build_body_ctx(prog)
+        ctx2, _ = build_body_ctx(prog)
+        legacy = mod._legacy_sections(prog, ctx1)
+        asg = mod._asg_sections(prog, ctx2)
+        self.assertEqual(legacy, asg)
+        rendered = "\n".join(asg[0][1])
+        self.assertIn("findByChdrnumAndChdrcoyBegn", rendered,
+                      "多键应生成 ...And...Begn 方法名")
+
+    def test_begn_nested_if_visitor(self):
+        """BEGN for-each + 嵌套 IF 经 visitor → IF 条件保留在循环体内。"""
+        from translator.skeleton_gen.body_context import build_body_ctx
+        mod = TestDiffAsgVsLegacy()._harness()
+        prog = TestAsgMoveLift()._parse(TestAsgBegnForeachRewrite.SRC_NESTED_IF)
+        ctx1, _ = build_body_ctx(prog)
+        ctx2, _ = build_body_ctx(prog)
+        legacy = mod._legacy_sections(prog, ctx1)
+        asg = mod._asg_sections(prog, ctx2)
+        self.assertEqual(legacy, asg)
+        rendered = "\n".join(asg[0][1])
+        self.assertIn("for (ElpoRecord elpo : elpoList)", rendered)
+        self.assertIn("if (", rendered, "循环体内的 IF 应保留")
 
 
 class TestAsgBegnSingleRewrite(unittest.TestCase):
@@ -3205,6 +3544,114 @@ class TestAsgReadrSingleRewrite(unittest.TestCase):
         self.assertFalse(any(isinstance(st, IoReadSingleStmt)
                              for para in rewritten for st in para.stmts))
 
+    # ── 4.2 新增形态 ─────────────────────────────────────────────────
+
+    def test_multikey_readr_ok_mode(self):
+        """READR + 多键（CHDRNUM + CHDRCOY）+ IF STATUZ=O-K → 两个 key 被提取。"""
+        from asg import build_asg, IoReadSingleStmt
+        from asg.structure_rewrite import rewrite_readr_single
+        src = (
+            "       IDENTIFICATION DIVISION.\n"
+            "       PROGRAM-ID. TRDMK.\n"
+            "       DATA DIVISION.\n"
+            "       WORKING-STORAGE SECTION.\n"
+            "       01 WSAA-KEY1 PIC X(02).\n"
+            "       01 WSAA-KEY2 PIC X(03).\n"
+            "       01 WSAA-OUT PIC X(02).\n"
+            "       01 ELPO-PARAMS.\n"
+            "          03 ELPO-FUNCTION PIC X(05).\n"
+            "       PROCEDURE DIVISION.\n"
+            "       1000-MAIN SECTION.\n"
+            "       READ-PARA.\n"
+            "           MOVE SPACES TO ELPO-PARAMS.\n"
+            "           MOVE WSAA-KEY1 TO ELPO-CHDRNUM.\n"
+            "           MOVE WSAA-KEY2 TO ELPO-CHDRCOY.\n"
+            "           MOVE READR TO ELPO-FUNCTION.\n"
+            "           CALL 'ELPOIO' USING ELPO-PARAMS.\n"
+            "           IF ELPO-STATUZ = O-K\n"
+            "               MOVE ELPO-DATA TO WSAA-OUT\n"
+            "           END-IF.\n"
+        )
+        prog, ctx = self._program_and_ctx(src)
+        sec = build_asg(prog).sections[0]
+        rewritten = rewrite_readr_single(sec.paragraphs, ctx)
+        stmt = rewritten[0].stmts[0]
+        self.assertIsInstance(stmt, IoReadSingleStmt)
+        self.assertEqual(stmt.mode, "ok")
+        self.assertEqual(len(stmt.keys), 2, "多键 READR → 2 个 key")
+        key_names = {k[0].upper() for k in stmt.keys}
+        self.assertIn("CHDRNUM", key_names)
+        self.assertIn("CHDRCOY", key_names)
+
+    def test_readr_notfound_with_else(self):
+        """READR + IF STATUZ=O-K ELSE MOVE 'N/A' → else_body 提取。"""
+        from asg import build_asg, IoReadSingleStmt
+        from asg.structure_rewrite import rewrite_readr_single
+        src = (
+            "       IDENTIFICATION DIVISION.\n"
+            "       PROGRAM-ID. TRNFP.\n"
+            "       DATA DIVISION.\n"
+            "       WORKING-STORAGE SECTION.\n"
+            "       01 WSAA-KEY PIC X(02).\n"
+            "       01 WSAA-OUT PIC X(02).\n"
+            "       01 ELPO-PARAMS.\n"
+            "          03 ELPO-FUNCTION PIC X(05).\n"
+            "       PROCEDURE DIVISION.\n"
+            "       1000-MAIN SECTION.\n"
+            "       READ-PARA.\n"
+            "           MOVE SPACES TO ELPO-PARAMS.\n"
+            "           MOVE WSAA-KEY TO ELPO-CHDRNUM.\n"
+            "           MOVE READR TO ELPO-FUNCTION.\n"
+            "           CALL 'ELPOIO' USING ELPO-PARAMS.\n"
+            "           IF ELPO-STATUZ = O-K\n"
+            "               MOVE ELPO-DATA TO WSAA-OUT\n"
+            "           ELSE\n"
+            "               MOVE 'N/A' TO WSAA-OUT\n"
+            "           END-IF.\n"
+        )
+        prog, ctx = self._program_and_ctx(src)
+        sec = build_asg(prog).sections[0]
+        rewritten = rewrite_readr_single(sec.paragraphs, ctx)
+        stmt = rewritten[0].stmts[0]
+        self.assertIsInstance(stmt, IoReadSingleStmt)
+        self.assertTrue(stmt.else_body, "not-found → else_body 应非空")
+        self.assertEqual(stmt.mode, "ok")
+
+    def test_readr_with_nested_if_in_then(self):
+        """READR + IF 体内嵌套 IF → 嵌套 IF 保留在 then_body 中。"""
+        from asg import build_asg, IoReadSingleStmt
+        from asg.structure_rewrite import rewrite_readr_single
+        src = (
+            "       IDENTIFICATION DIVISION.\n"
+            "       PROGRAM-ID. TRNIF.\n"
+            "       DATA DIVISION.\n"
+            "       WORKING-STORAGE SECTION.\n"
+            "       01 WSAA-KEY PIC X(02).\n"
+            "       01 WSAA-OUT PIC X(02).\n"
+            "       01 WSAA-FLAG PIC X(01).\n"
+            "       01 ELPO-PARAMS.\n"
+            "          03 ELPO-FUNCTION PIC X(05).\n"
+            "       PROCEDURE DIVISION.\n"
+            "       1000-MAIN SECTION.\n"
+            "       READ-PARA.\n"
+            "           MOVE SPACES TO ELPO-PARAMS.\n"
+            "           MOVE WSAA-KEY TO ELPO-CHDRNUM.\n"
+            "           MOVE READR TO ELPO-FUNCTION.\n"
+            "           CALL 'ELPOIO' USING ELPO-PARAMS.\n"
+            "           IF ELPO-STATUZ = O-K\n"
+            "               MOVE ELPO-DATA TO WSAA-OUT\n"
+            "               IF WSAA-FLAG = 'Y'\n"
+            "                   MOVE 'OK' TO WSAA-OUT\n"
+            "               END-IF\n"
+            "           END-IF.\n"
+        )
+        prog, ctx = self._program_and_ctx(src)
+        sec = build_asg(prog).sections[0]
+        rewritten = rewrite_readr_single(sec.paragraphs, ctx)
+        stmt = rewritten[0].stmts[0]
+        self.assertIsInstance(stmt, IoReadSingleStmt)
+        self.assertGreater(len(stmt.then_body), 1, "then_body 应有多个语句")
+
 
 class TestAsgReadrSingleVisitor(unittest.TestCase):
     """步骤27：READR 单条读经 SectionJavaVisitor 渲染，并与旧路逐字符一致。"""
@@ -3364,6 +3811,96 @@ class TestAsgWriteSingleRewrite(unittest.TestCase):
         rewritten = rewrite_write_single(sec.paragraphs, ctx)
         self.assertFalse(any(isinstance(st, IoWriteSingleStmt)
                              for para in rewritten for st in para.stmts))
+
+    # ── 4.3 新增形态 ─────────────────────────────────────────────────
+
+    def test_updat_plain_no_error(self):
+        """UPDAT 无 IF STATUZ → 更新（非 new，非 delete），mode=plain。"""
+        from asg import build_asg, IoWriteSingleStmt
+        from asg.structure_rewrite import rewrite_write_single
+        src = (
+            "       IDENTIFICATION DIVISION.\n"
+            "       PROGRAM-ID. TUPPN.\n"
+            "       DATA DIVISION.\n"
+            "       WORKING-STORAGE SECTION.\n"
+            "       01 WSAA-VAL PIC X(02).\n"
+            "       01 TMLCLST-PARAMS.\n"
+            "          03 TMLCLST-FUNCTION PIC X(05).\n"
+            "       PROCEDURE DIVISION.\n"
+            "       1000-MAIN SECTION.\n"
+            "       UPDATE-PARA.\n"
+            "           MOVE WSAA-VAL TO TMLCLST-FIELD.\n"
+            "           MOVE UPDAT TO TMLCLST-FUNCTION.\n"
+            "           CALL 'TMLCLSTIO' USING TMLCLST-PARAMS.\n"
+        )
+        prog, ctx = self._program_and_ctx(src)
+        sec = build_asg(prog).sections[0]
+        rewritten = rewrite_write_single(sec.paragraphs, ctx)
+        stmt = rewritten[0].stmts[0]
+        self.assertIsInstance(stmt, IoWriteSingleStmt)
+        self.assertFalse(stmt.is_new, "UPDAT → 不是 new")
+        self.assertFalse(stmt.is_delete, "UPDAT → 不是 delete")
+        self.assertEqual(stmt.mode, "plain")
+        self.assertEqual(stmt.func.upper(), "UPDAT")
+
+    def test_writr_with_then_body(self):
+        """WRITR 后接后续处理语句 → 后续语句保留在 stmts 列表中（在 stmt 之后）。"""
+        from asg import build_asg, IoWriteSingleStmt
+        from asg.structure_rewrite import rewrite_write_single
+        src = (
+            "       IDENTIFICATION DIVISION.\n"
+            "       PROGRAM-ID. TWRTH.\n"
+            "       DATA DIVISION.\n"
+            "       WORKING-STORAGE SECTION.\n"
+            "       01 WSAA-VAL PIC X(02).\n"
+            "       01 WSAA-OUT PIC X(02).\n"
+            "       01 TMLCLST-PARAMS.\n"
+            "          03 TMLCLST-FUNCTION PIC X(05).\n"
+            "       PROCEDURE DIVISION.\n"
+            "       1000-MAIN SECTION.\n"
+            "       WRITE-PARA.\n"
+            "           MOVE SPACES TO TMLCLST-PARAMS.\n"
+            "           MOVE WSAA-VAL TO TMLCLST-FIELD.\n"
+            "           MOVE WRITR TO TMLCLST-FUNCTION.\n"
+            "           CALL 'TMLCLSTIO' USING TMLCLST-PARAMS.\n"
+            "           MOVE 'DONE' TO WSAA-OUT.\n"
+        )
+        prog, ctx = self._program_and_ctx(src)
+        sec = build_asg(prog).sections[0]
+        rewritten = rewrite_write_single(sec.paragraphs, ctx)
+        stmt = rewritten[0].stmts[0]
+        self.assertIsInstance(stmt, IoWriteSingleStmt)
+        self.assertTrue(stmt.is_new, "WRITR → new")
+        self.assertEqual(stmt.func.upper(), "WRITR")
+        # 后续语句在 IoWriteSingleStmt 之后，不在 then_body 内
+        self.assertGreater(len(rewritten[0].stmts), 1, "WRITR 后语句 → stmts 有后续元素")
+
+    def test_delet_with_then_body(self):
+        """DELET 后接后续语句 → 后续语句保留在 stmts 列表中。"""
+        from asg import build_asg, IoWriteSingleStmt
+        from asg.structure_rewrite import rewrite_write_single
+        src = (
+            "       IDENTIFICATION DIVISION.\n"
+            "       PROGRAM-ID. TDLTH.\n"
+            "       DATA DIVISION.\n"
+            "       WORKING-STORAGE SECTION.\n"
+            "       01 WSAA-OUT PIC X(02).\n"
+            "       01 TMLCLST-PARAMS.\n"
+            "          03 TMLCLST-FUNCTION PIC X(05).\n"
+            "       PROCEDURE DIVISION.\n"
+            "       1000-MAIN SECTION.\n"
+            "       DELETE-PARA.\n"
+            "           MOVE DELET TO TMLCLST-FUNCTION.\n"
+            "           CALL 'TMLCLSTIO' USING TMLCLST-PARAMS.\n"
+            "           MOVE 'DELETED' TO WSAA-OUT.\n"
+        )
+        prog, ctx = self._program_and_ctx(src)
+        sec = build_asg(prog).sections[0]
+        rewritten = rewrite_write_single(sec.paragraphs, ctx)
+        stmt = rewritten[0].stmts[0]
+        self.assertIsInstance(stmt, IoWriteSingleStmt)
+        self.assertTrue(stmt.is_delete, "DELET → is_delete")
+        self.assertGreater(len(rewritten[0].stmts), 1, "DELET 后语句 → stmts 有后续元素")
 
 
 class TestAsgWriteSingleVisitor(unittest.TestCase):
@@ -3557,6 +4094,268 @@ class TestMainlinePendingRangeViaAsg(unittest.TestCase):
         body = "\n".join(actual.values())
         self.assertIn("switch (__pc)", body)
         self.assertIn('__pc = "PARA-C"; continue FLOW;', body)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 步骤—：解析器段边界审计（Batch 5.2）
+#   ① SECTION 检测：连续段/停用行/COPY 边界/入口代码
+#   ② 段落提取：类段名/空段落/EXIT-only
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _parse_src(src: str):
+    """从源码字符串解析 COBOL 程序（临时文件）。"""
+    import tempfile, os
+    from parser.cobol_parser import parse
+    fd, path = tempfile.mkstemp(suffix=".cob")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(src)
+        return parse(path)
+    finally:
+        os.unlink(path)
+
+
+def _parse_fixture(name: str):
+    """从 tests/fixtures/ 目录解析 fixture。"""
+    from pathlib import Path
+    from parser.cobol_parser import parse
+    fixture = Path(__file__).parent / "tests" / "fixtures" / name
+    return parse(str(fixture))
+
+
+class TestSectionBoundary(unittest.TestCase):
+    """Batch 5.2：解析器段边界检测（SECTION 识别、停用行规避、入口代码）。"""
+
+    def test_consecutive_sections(self):
+        """连续 SECTION（中间无段落）全部被识别。"""
+        src = (
+            "       IDENTIFICATION DIVISION.\n"
+            "       PROGRAM-ID. TCONSEC.\n"
+            "       DATA DIVISION.\n"
+            "       WORKING-STORAGE SECTION.\n"
+            "       01 WSAA-X PIC X(01).\n"
+            "       PROCEDURE DIVISION.\n"
+            "       1000-FIRST SECTION.\n"
+            "           MOVE 'A' TO WSAA-X.\n"
+            "       2000-SECOND SECTION.\n"
+            "           MOVE 'B' TO WSAA-X.\n"
+            "       3000-THIRD SECTION.\n"
+            "           MOVE 'C' TO WSAA-X.\n"
+        )
+        prog = _parse_src(src)
+        names = [s.name.upper() for s in prog.sections]
+        self.assertIn("1000-FIRST", names)
+        self.assertIn("2000-SECOND", names)
+        self.assertIn("3000-THIRD", names)
+        self.assertEqual(3, len(prog.sections), "三个连续 SECTION 应全部识别")
+
+    def test_section_name_with_special_chars(self):
+        """SECTION 名含连字符和数字，正确解析。"""
+        src = (
+            "       IDENTIFICATION DIVISION.\n"
+            "       PROGRAM-ID. TNAMES.\n"
+            "       DATA DIVISION.\n"
+            "       WORKING-STORAGE SECTION.\n"
+            "       01 WSAA-X PIC X(01).\n"
+            "       PROCEDURE DIVISION.\n"
+            "       1000-A SECTION.\n"
+            "           MOVE 'A' TO WSAA-X.\n"
+            "       ZZ-999 SECTION.\n"
+            "           MOVE 'Z' TO WSAA-X.\n"
+        )
+        prog = _parse_src(src)
+        names = {s.name.upper() for s in prog.sections}
+        self.assertIn("1000-A", names)
+        self.assertIn("ZZ-999", names)
+
+    def test_entry_code_before_first_section(self):
+        """PROCEDURE DIVISION 与首 SECTION 间的代码捕获为 __ENTRY。"""
+        src = (
+            "       IDENTIFICATION DIVISION.\n"
+            "       PROGRAM-ID. TENTRY.\n"
+            "       DATA DIVISION.\n"
+            "       WORKING-STORAGE SECTION.\n"
+            "       01 WSAA-X PIC X(10).\n"
+            "       PROCEDURE DIVISION.\n"
+            "           MOVE 'ENTRY' TO WSAA-X.\n"
+            "           PERFORM 1000-DONE.\n"
+            "       1000-DONE SECTION.\n"
+            "           GOBACK.\n"
+        )
+        prog = _parse_src(src)
+        sec_names = [s.name.upper() for s in prog.sections]
+        self.assertIn("__ENTRY", sec_names, "入口代码应捕获为 __ENTRY 段")
+        entry = next(s for s in prog.sections if s.name.upper() == "__ENTRY__" or s.name == "__ENTRY")
+        entry = next((s for s in prog.sections if s.name.upper() == "__ENTRY"), None)
+        self.assertIsNotNone(entry, "入口段名应为 __ENTRY")
+        if entry:
+            code = "\n".join(entry.lines)
+            self.assertIn("ENTRY", code.upper())
+            self.assertIn("1000-DONE", code.upper())
+
+    def test_no_entry_code_with_immediate_section(self):
+        """PROCEDURE DIVISION 后紧跟 SECTION → 无 __ENTRY 段。"""
+        src = (
+            "       IDENTIFICATION DIVISION.\n"
+            "       PROGRAM-ID. TNONE.\n"
+            "       DATA DIVISION.\n"
+            "       WORKING-STORAGE SECTION.\n"
+            "       01 WSAA-X PIC X(01).\n"
+            "       PROCEDURE DIVISION.\n"
+            "       1000-START SECTION.\n"
+            "           MOVE 'A' TO WSAA-X.\n"
+        )
+        prog = _parse_src(src)
+        has_entry = any(s.name.upper() == "__ENTRY" for s in prog.sections)
+        self.assertFalse(has_entry, "首 SECTION 紧跟 PROCEDURE DIVISION → 不应有 __ENTRY")
+
+    def test_section_after_empty_line(self):
+        """SECTION 前有空行仍正常识别。"""
+        src = (
+            "       IDENTIFICATION DIVISION.\n"
+            "       PROGRAM-ID. TEMPTY.\n"
+            "       DATA DIVISION.\n"
+            "       WORKING-STORAGE SECTION.\n"
+            "       01 WSAA-X PIC X(01).\n"
+            "       PROCEDURE DIVISION.\n"
+            "       1000-MAIN SECTION.\n"
+            "           MOVE 'A' TO WSAA-X.\n"
+            "\n"
+            "       2000-NEXT SECTION.\n"
+            "           MOVE 'B' TO WSAA-X.\n"
+        )
+        prog = _parse_src(src)
+        names = [s.name.upper() for s in prog.sections]
+        self.assertIn("2000-NEXT", names)
+        self.assertGreaterEqual(len(prog.sections), 2)
+
+    def test_fixture_section_boundary_integrity(self):
+        """section_boundary.cob 解析正确：段数/入口/同名变量/命名正确。"""
+        prog = _parse_fixture("section_boundary.cob")
+        names = [s.name.upper() for s in prog.sections]
+        self.assertIn("__ENTRY", names, "入口代码应捕获为 __ENTRY")
+        self.assertIn("1000-MAIN", names)
+        self.assertIn("2000-NEXT", names)
+        self.assertIn("3000-LAST", names)
+        self.assertEqual(4, len(prog.sections), "应有 4 个段（含 __ENTRY）")
+        # WORKING-STORAGE 段/变量不被误判为过程段
+        ws_names = {v.name.upper() for v in prog.working_storage}
+        self.assertIn("1000-MAIN", ws_names, "变量名 1000-MAIN 在 WS 中")
+        self.assertIn("WSAA-DATA", ws_names)
+        self.assertIn("WSAA-FLAG", ws_names)
+
+    def test_fixture_entry_code_content(self):
+        """section_boundary.cob 的 __ENTRY 段含入口代码。"""
+        prog = _parse_fixture("section_boundary.cob")
+        entry = next((s for s in prog.sections if s.name.upper() == "__ENTRY"), None)
+        self.assertIsNotNone(entry)
+        if entry:
+            code = "\n".join(entry.lines)
+            self.assertIn("OK", code.upper(), "__ENTRY 应包含入口代码")
+
+    def test_comment_lines_do_not_affect_section_count(self):
+        """注释行内的 SECTION 字样不影响段计数。"""
+        src = (
+            "       IDENTIFICATION DIVISION.\n"
+            "       PROGRAM-ID. TCOMM.\n"
+            "      * 1000-MAIN SECTION is the main processing unit.\n"
+            "       DATA DIVISION.\n"
+            "       WORKING-STORAGE SECTION.\n"
+            "       01 WSAA-X PIC X(01).\n"
+            "       PROCEDURE DIVISION.\n"
+            "       1000-MAIN SECTION.\n"
+            "           EXIT.\n"
+        )
+        prog = _parse_src(src)
+        names = [s.name.upper() for s in prog.sections]
+        self.assertEqual(1, len(prog.sections))
+        self.assertEqual(["1000-MAIN"], names)
+
+
+class TestParagraphExtraction(unittest.TestCase):
+    """Batch 5.2：段落提取边界条件。"""
+
+    def _get_paragraphs(self, src: str) -> list[tuple[str | None, list[str]]]:
+        """从 SECTION 代码提取段落。"""
+        from translator.segmenter import split_paragraphs
+        prog = _parse_src(src)
+        if not prog.sections:
+            return []
+        # 取第一个 SECTION 的行
+        sec_lines = []
+        for s in prog.sections:
+            if s.name.upper() != "__ENTRY":
+                sec_lines = s.lines
+                break
+        if not sec_lines:
+            sec_lines = prog.sections[0].lines
+        return split_paragraphs(sec_lines)
+
+    def test_paragraph_name_with_hyphen(self):
+        """段落名含连字符正确提取。"""
+        src = (
+            "       IDENTIFICATION DIVISION.\n"
+            "       PROGRAM-ID. TPARA.\n"
+            "       DATA DIVISION.\n"
+            "       WORKING-STORAGE SECTION.\n"
+            "       01 WSAA-X PIC X(01).\n"
+            "       PROCEDURE DIVISION.\n"
+            "       1000-MAIN SECTION.\n"
+            "       1000-EXIT.\n"
+            "           EXIT.\n"
+            "       2000-NEXT-PARA.\n"
+            "           MOVE 'A' TO WSAA-X.\n"
+        )
+        paras = self._get_paragraphs(src)
+        labels = [p[0] for p in paras]
+        self.assertIn("1000-EXIT", labels)
+        self.assertIn("2000-NEXT-PARA", labels)
+
+    def test_consecutive_paragraphs_preserved(self):
+        """连续空段落不被丢弃。"""
+        src = (
+            "       IDENTIFICATION DIVISION.\n"
+            "       PROGRAM-ID. TCONP.\n"
+            "       DATA DIVISION.\n"
+            "       WORKING-STORAGE SECTION.\n"
+            "       01 WSAA-X PIC X(01).\n"
+            "       PROCEDURE DIVISION.\n"
+            "       1000-MAIN SECTION.\n"
+            "       PARA-A.\n"
+            "       PARA-B.\n"
+            "           MOVE 'B' TO WSAA-X.\n"
+            "       PARA-C.\n"
+            "           EXIT.\n"
+        )
+        paras = self._get_paragraphs(src)
+        labels = [p[0] for p in paras]
+        # PARA-A 有 label 但无 body；PARA-B 有 label 和 body
+        self.assertIn("PARA-A", labels)
+        self.assertIn("PARA-B", labels)
+        self.assertIn("PARA-C", labels)
+        # 至少 3 个标签
+        self.assertGreaterEqual(len(labels), 3)
+
+    def test_exit_only_paragraph(self):
+        """EXIT-only 段落正确提取。"""
+        src = (
+            "       IDENTIFICATION DIVISION.\n"
+            "       PROGRAM-ID. TEXIT.\n"
+            "       DATA DIVISION.\n"
+            "       WORKING-STORAGE SECTION.\n"
+            "       01 WSAA-X PIC X(01).\n"
+            "       PROCEDURE DIVISION.\n"
+            "       1000-MAIN SECTION.\n"
+            "       EXIT-PARA.\n"
+            "           EXIT.\n"
+        )
+        paras = self._get_paragraphs(src)
+        labels = [p[0] for p in paras]
+        self.assertIn("EXIT-PARA", labels)
+        # 验证 EXIT 在 body 中
+        for label, body in paras:
+            if label == "EXIT-PARA":
+                self.assertTrue(any("EXIT" in ln.upper() for ln in body))
 
 
 if __name__ == "__main__":

@@ -80,6 +80,14 @@ SUITES: dict[str, list[list[str]]] = {
             "-v",
         ),
     ],
+    "logic": [
+        _py("-m", "unittest", "tests.test_logician", "-v"),
+        _py(
+            "scripts/generate_logic_doc.py",
+            "--cob", "tests/fixtures/minimal.cob",
+            "--out-dir", "output/logic-doc",
+        ),
+    ],
 }
 
 SUITES["all"] = [

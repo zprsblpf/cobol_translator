@@ -31,7 +31,7 @@ class TestCheckScriptSuites(unittest.TestCase):
     def test_suite_names_are_stable(self):
         from scripts import check
 
-        self.assertEqual(set(check.SUITES), {"quick", "leaf", "asg", "all"})
+        self.assertEqual(set(check.SUITES), {"quick", "leaf", "asg", "logic", "all"})
 
     def test_all_suite_preserves_legacy_gate_order(self):
         from scripts import check

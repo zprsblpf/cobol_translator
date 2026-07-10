@@ -1,3 +1,9 @@
+"""
+T10-T12 控制流翻译测试（ASG visitor + translator.leaf.control）。
+
+覆盖 IF/EVALUATE/GO TO 等控制流语句的 ASG visitor 渲染和
+legacy rules 逐字符一致性比对。
+"""
 import unittest
 from types import SimpleNamespace
 
