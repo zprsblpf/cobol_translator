@@ -1,0 +1,15 @@
+rule_id: LEAF.INSPECT.001
+verb: INSPECT
+translator: translator.leaf.inspect.translate_inspect
+status: deterministic
+supported:
+  - pattern: INSPECT <source> TALLYING <counter> FOR CHARACTERS
+  - pattern: INSPECT <source> TALLYING <counter> FOR ALL <needle>
+  - pattern: INSPECT <source> REPLACING ALL <needle> BY <replacement>
+  - pattern: INSPECT <source> REPLACING FIRST <needle> BY <replacement>
+  - pattern: INSPECT <source> REPLACING LEADING <needle> BY <replacement>
+unsupported:
+  - BEFORE/AFTER scoped inspection
+  - CONVERTING
+  - multiple TALLYING or REPLACING clauses in one statement
+fallback: return_unmatched

@@ -45,7 +45,6 @@ def translate_leaf_stmt(tokens: list[str], ctx: LeafCtx) -> tuple[list[str], boo
 
 
 __all__ = ["LeafCtx", "translate_move", "translate_condition", "translate_perform_loop",
-           "translate_call", "translate_string", "translate_unstring", "translate_inspect", "translate_search",
-           "translate_assign", "translate_arith", "translate_arith_assign",
+           "translate_call", "translate_string", "translate_unstring", "translate_inspect", "translate_search", "translate_assign", "translate_arith", "translate_arith_assign",
            "translate_control", "translate_evaluate", "evaluate_case_label",
            "translate_leaf_stmt"]

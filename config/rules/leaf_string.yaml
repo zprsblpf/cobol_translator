@@ -1,0 +1,13 @@
+rules:
+  - rule_id: LEAF.STRING.SIMPLE.001
+    verb: STRING
+    status: supported
+    description: STRING sources DELIMITED BY SIZE/SPACE/literal INTO target.
+  - rule_id: LEAF.STRING.POINTER.001
+    verb: STRING
+    status: unsupported
+    description: STRING WITH POINTER requires pointer update and overflow semantics.
+  - rule_id: LEAF.STRING.OVERFLOW.001
+    verb: STRING
+    status: unsupported
+    description: STRING ON OVERFLOW / NOT ON OVERFLOW requires capacity checks.

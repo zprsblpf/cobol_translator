@@ -14,6 +14,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent.parent
+SUITES = ("quick", "leaf", "asg", "logic", "deterministic", "all")
 
 
 def _py(*args: str) -> list[str]:
@@ -21,116 +22,121 @@ def _py(*args: str) -> list[str]:
     return [sys.executable, *args]
 
 
-SUITES: dict[str, list[list[str]]] = {
-    "quick": [
-        _py("-m", "py_compile", "main.py", "test_smoke.py", "scripts/deterministic_report.py"),
-        _py("-m", "unittest", "test_smoke", "-v"),
-        _py("-m", "unittest", "test_t16_deterministic_report", "-v"),
-        _py(
-            "main.py",
-            "tests/fixtures/minimal.cob",
-            "--parse-only",
-        ),
-    ],
-    "leaf": [
-        _py(
-            "-m",
-            "unittest",
-            "test_translation.TestLeafMoveExtract",
-            "test_translation.TestLeafCondExtract",
-            "test_translation.TestLeafLoopExtract",
-            "test_translation.TestLeafCallExtract",
-            "test_translation.TestLeafArithExtract",
-            "test_translation.TestLeafStringExtract",
-            "test_translation.TestLeafUnstringExtract",
-            "test_translation.TestLeafInspectExtract",
-            "test_translation.TestLeafSearchExtract",
-            "test_translation.TestUnifiedLeafEntry",
-            "test_t13_t14_ws_views",
-            "-v",
-        ),
-    ],
-    "asg": [
-        _py(
-            "-m",
-            "unittest",
-            "test_translation.TestAsgBuild",
-            "test_translation.TestAsgMoveVisitor",
-            "test_translation.TestAsgIfVisitor",
-            "test_translation.TestAsgPerformVisitor",
-            "test_translation.TestAsgCallVisitor",
-            "test_translation.TestAsgLeafArithVisitor",
-            "test_translation.TestAsgControlVisitor",
-            "test_translation.TestAsgSectionVisitorFlow",
-            "test_translation.TestAsgSectionVisitorPerformTarget",
-            "test_translation.TestDiffAsgVsLegacy",
-            "test_translation.TestDiffAsgVsLegacyLeafFallback",
-            "test_translation.TestDiffAsgVsLegacyVerbMatrix",
-            "test_translation.TestDiffAsgVsLegacyIf",
-            "test_translation.TestDiffAsgVsLegacyPerform",
-            "test_translation.TestDiffAsgVsLegacyPerformCall",
-            "test_translation.TestDiffAsgVsLegacyFlow",
-            "test_translation.TestDiffAsgVsLegacyIo",
-            "test_translation.TestDiffAsgVsLegacyCall",
-            "test_translation.TestDiffAsgVsLegacyArith",
-            "test_translation.TestDiffAsgVsLegacyControl",
-            "test_translation.TestDiffAsgVsLegacySection",
-            "test_translation.TestMainlineSectionViaAsg",
-            "test_t10_t12_control_flow",
-            "-v",
-        ),
-    ],
-    "logic": [
-        _py("-m", "unittest", "tests.test_logician", "-v"),
-        _py(
-            "scripts/generate_logic_doc.py",
-            "--cob", "tests/fixtures/minimal.cob",
-            "--out-dir", "output/logic-doc",
-        ),
-    ],
-}
+def py_compile_command() -> list[str]:
+    return [
+        sys.executable,
+        "-m",
+        "py_compile",
+        "main.py",
+        "test_smoke.py",
+        "scripts/check.py",
+    ]
 
-SUITES["all"] = [
-    _py("-m", "py_compile", "main.py", "test_smoke.py"),
-    _py("-m", "unittest", "-v"),
-    _py(
+
+def smoke_command() -> list[str]:
+    return [sys.executable, "-m", "unittest", "-v", "test_smoke"]
+
+
+def minimal_parse_command() -> list[str]:
+    return [
+        sys.executable,
         "main.py",
         "tests/fixtures/minimal.cob",
         "--parse-only",
-    ),
-    _py(
-        "scripts/translate_skeleton.py",
-        "--in",
-        "tests/fixtures/minimal.cob",
-        "--out",
-        "output/check/Minismoke.java",
-    ),
-    _py(
-        "main.py",
-        "tests/fixtures/minimal.cob",
-        "--no-llm",
-        "--output",
-        "output/check-main",
-    ),
-]
+    ]
 
 
-def run(args: list[str]) -> int:
-    print("$ " + " ".join(args), flush=True)
-    return subprocess.call(args, cwd=ROOT)
+def deterministic_commands() -> list[list[str]]:
+    return [
+        [
+            sys.executable,
+            "scripts/translate_skeleton.py",
+            "--in",
+            "tests/fixtures/minimal.cob",
+            "--out",
+            "output/check/Minismoke.java",
+        ],
+        [
+            sys.executable,
+            "main.py",
+            "tests/fixtures/minimal.cob",
+            "--no-llm",
+            "--output",
+            "output/check-main",
+        ],
+    ]
+
+
+def filtered_unittest_command(patterns: list[str]) -> list[str]:
+    command = [sys.executable, "-m", "unittest", "-v"]
+    for pattern in patterns:
+        command.extend(["-k", pattern])
+    command.append("test_translation")
+    return command
+
+
+def logic_commands() -> list[list[str]]:
+    return [
+        [sys.executable, "-m", "unittest", "tests.test_logician", "-v"],
+        [
+            sys.executable,
+            "scripts/generate_logic_doc.py",
+            "--cob", "tests/fixtures/minimal.cob",
+            "--out-dir", "output/logic-doc",
+        ],
+    ]
+
+
+def suite_commands(suite: str) -> list[list[str]]:
+    commands_by_suite = {
+        "quick": [
+            py_compile_command(),
+            smoke_command(),
+            minimal_parse_command(),
+        ],
+        "leaf": [
+            filtered_unittest_command(
+                [
+                    "test_translation.TestLeaf*",
+                    "test_translation.TestUnifiedLeafEntry.*",
+                ]
+            )
+        ],
+        "asg": [
+            filtered_unittest_command(
+                [
+                    "test_translation.TestAsg*",
+                    "test_translation.TestDiffAsgVsLegacy*",
+                ]
+            )
+        ],
+        "logic": logic_commands(),
+        "deterministic": deterministic_commands(),
+    }
+    commands_by_suite["all"] = [
+        py_compile_command(),
+        [sys.executable, "-m", "unittest", "-v"],
+        minimal_parse_command(),
+        *deterministic_commands(),
+    ]
+    return commands_by_suite[suite]
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--suite",
+        choices=SUITES,
+        default="all",
+        help="Focused check suite to run. Defaults to all.",
+    )
+    return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Run project verification checks.")
-    parser.add_argument(
-        "--suite",
-        choices=sorted(SUITES),
-        default="all",
-        help="Verification suite to run.",
-    )
-    args = parser.parse_args(argv)
+    args = parse_args(argv)
 
-    for cmd in SUITES[args.suite]:
+    for cmd in suite_commands(args.suite):
         code = run(cmd)
         if code:
             return code

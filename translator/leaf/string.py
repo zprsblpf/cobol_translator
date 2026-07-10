@@ -2,9 +2,14 @@ from __future__ import annotations
 
 from translator.leaf.context import LeafCtx
 from translator.leaf.expr import _lvalue, _operand
+from translator.unsupported import unsupported_comment
 
 
-_UNSUPPORTED = {"WITH", "ON", "NOT"}
+_COMPLEX_RULES = {
+    "WITH": ("LEAF.STRING.POINTER.001", "WITH POINTER is not yet deterministic"),
+    "ON": ("LEAF.STRING.OVERFLOW.001", "ON OVERFLOW is not yet deterministic"),
+    "NOT": ("LEAF.STRING.OVERFLOW.001", "NOT ON OVERFLOW is not yet deterministic"),
+}
 
 
 def _before_delimiter(source: str, delimiter: str) -> str:
@@ -26,8 +31,9 @@ def translate_string(tokens: list[str], ctx: LeafCtx) -> tuple[list[str], bool]:
     if not tokens or tokens[0].upper() != "STRING":
         return [], False
     u = [t.upper() for t in tokens]
-    if any(t in _UNSUPPORTED for t in u):
-        return [], False
+    for token, (rule_id, reason) in _COMPLEX_RULES.items():
+        if token in u:
+            return [unsupported_comment(rule_id, "leaf", " ".join(tokens), reason)], True
     if "INTO" not in u:
         return [], False
     into_i = u.index("INTO")
